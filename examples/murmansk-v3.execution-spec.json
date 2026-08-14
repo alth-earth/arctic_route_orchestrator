@@ -1,0 +1,11 @@
+{
+  "schema_version": "orchestrator.execution-spec.v1",
+  "run_id": "run-00000000-0000-4000-8000-000000000168",
+  "scenario_id": "murmansk_dikson_july_2026_retrospective_v1",
+  "generation_id": 0,
+  "input_revision": 0,
+  "generated_at": "2026-08-14T00:00:00Z",
+  "planning_contract": "cd.four-layer-route-plan-set.v3",
+  "max_snap_km": 150.0,
+  "replan_after_hours": 6
+}

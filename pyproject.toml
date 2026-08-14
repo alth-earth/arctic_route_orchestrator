@@ -1,0 +1,59 @@
+[project]
+name = "arctic-route-orchestrator"
+version = "0.1.0"
+description = "A-B-C public-boundary orchestration and auditable run reports"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "arctic-route-contracts>=0.3,<0.4",
+    "arctic-route-data>=0.4.2,<0.5",
+    "arctic-route-risk>=0.2,<0.3",
+    "arctic-route-planning>=0.4,<0.5",
+]
+
+[tool.uv.sources]
+arctic-route-contracts = { path = "../arctic_route_contracts", editable = true }
+arctic-route-data = { path = "../work_package_a", editable = true }
+arctic-route-risk = { path = "../work_package_b", editable = true }
+arctic-route-planning = { path = "../work_package_c", editable = true }
+
+[project.scripts]
+arctic-route-orchestrator = "arctic_route_orchestrator.cli:main"
+
+[dependency-groups]
+dev = [
+    "jsonschema>=4.23,<5",
+    "pytest>=8.3,<10",
+    "ruff>=0.11,<1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arctic_route_orchestrator"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: public A-B-C orchestration acceptance",
+    "real_artifact: requires an external complete A DatasetBundle v2",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = [
+    ".mamba-env",
+    ".uv-cache",
+    ".uv-python",
+    ".venv",
+    "data",
+    "output",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["RUF001"]

@@ -1,0 +1,350 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arctic-route.local/schemas/orchestrator/run-report-v1.schema.json",
+  "title": "A-B-C successful run report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "error_code",
+    "scientific_status",
+    "navigation_use",
+    "planning_contract",
+    "identity",
+    "digests",
+    "a_input",
+    "b_output",
+    "endpoint_mapping",
+    "routes",
+    "replanning",
+    "performance",
+    "environment",
+    "warnings",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "orchestrator.run-report.v1"
+    },
+    "status": {
+      "const": "success"
+    },
+    "error_code": {
+      "type": "null"
+    },
+    "scientific_status": {
+      "const": "demo_unvalidated"
+    },
+    "navigation_use": {
+      "const": "prohibited"
+    },
+    "planning_contract": {
+      "enum": [
+        "cd.route-plan.v2",
+        "cd.four-layer-route-plan-set.v3"
+      ]
+    },
+    "identity": {
+      "$ref": "#/$defs/identity"
+    },
+    "digests": {
+      "$ref": "#/$defs/digests"
+    },
+    "a_input": {
+      "$ref": "#/$defs/aInput"
+    },
+    "b_output": {
+      "$ref": "#/$defs/bOutput"
+    },
+    "endpoint_mapping": {
+      "type": "object"
+    },
+    "routes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initial", "replanned"],
+      "properties": {
+        "initial": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/route"}
+        },
+        "replanned": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/route"}
+        }
+      }
+    },
+    "replanning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trigger_time",
+        "observation_time",
+        "current_route_waypoint",
+        "triggered",
+        "reasons",
+        "published"
+      ],
+      "properties": {
+        "trigger_time": {"$ref": "#/$defs/timestamp"},
+        "observation_time": {"$ref": "#/$defs/timestamp"},
+        "current_route_waypoint": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["longitude", "latitude", "eta"],
+          "properties": {
+            "longitude": {"type": "number"},
+            "latitude": {"type": "number"},
+            "eta": {"$ref": "#/$defs/timestamp"}
+          }
+        },
+        "triggered": {"const": true},
+        "reasons": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string"}
+        },
+        "published": {"const": true}
+      }
+    },
+    "performance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timings_seconds",
+        "process_peak_rss_bytes"
+      ],
+      "properties": {
+        "timings_seconds": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"type": "number", "minimum": 0}
+        },
+        "process_peak_rss_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["python", "prefix", "packages", "lock_sha256"],
+      "properties": {
+        "python": {"type": "string", "minLength": 1},
+        "prefix": {"type": "string", "minLength": 1},
+        "packages": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "arctic_route_contracts",
+            "work_package_a",
+            "work_package_b",
+            "work_package_c"
+          ],
+          "properties": {
+            "arctic_route_contracts": {"type": "string"},
+            "work_package_a": {"type": "string"},
+            "work_package_b": {"type": "string"},
+            "work_package_c": {"type": "string"}
+          }
+        },
+        "lock_sha256": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "null"],
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    }
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "scenario_id",
+        "corridor_id",
+        "vessel_profile_id",
+        "generation_id",
+        "initial_input_revision",
+        "replanned_input_revision",
+        "as_of_time",
+        "simulation_start",
+        "simulation_end",
+        "orchestrator_generated_at"
+      ],
+      "properties": {
+        "run_id": {"type": "string", "pattern": "^run-"},
+        "scenario_id": {"type": "string", "minLength": 1},
+        "corridor_id": {"type": "string", "minLength": 1},
+        "vessel_profile_id": {"type": "string", "minLength": 1},
+        "generation_id": {"type": "integer", "minimum": 0},
+        "initial_input_revision": {"type": "integer", "minimum": 0},
+        "replanned_input_revision": {"type": "integer", "minimum": 1},
+        "as_of_time": {"$ref": "#/$defs/timestamp"},
+        "simulation_start": {"$ref": "#/$defs/timestamp"},
+        "simulation_end": {"$ref": "#/$defs/timestamp"},
+        "orchestrator_generated_at": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "digests": {
+      "type": "object",
+      "required": [
+        "dataset_bundle_id",
+        "dataset_bundle_digest",
+        "config_digest",
+        "model_config_digest",
+        "planner_config_digest",
+        "full_risk_commit_id",
+        "full_risk_content_digest",
+        "suffix_risk_commit_id",
+        "suffix_risk_content_digest",
+        "initial_route_semantic_identity",
+        "replanned_route_semantic_identity"
+      ],
+      "properties": {
+        "dataset_bundle_id": {"type": "string", "pattern": "^a-bundle-"},
+        "dataset_bundle_digest": {"$ref": "#/$defs/digest"},
+        "config_digest": {"$ref": "#/$defs/digest"},
+        "model_config_digest": {"$ref": "#/$defs/digest"},
+        "planner_config_digest": {"$ref": "#/$defs/digest"},
+        "full_risk_commit_id": {"type": "string", "minLength": 1},
+        "full_risk_content_digest": {"$ref": "#/$defs/digest"},
+        "suffix_risk_commit_id": {"type": "string", "minLength": 1},
+        "suffix_risk_content_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "aInput": {
+      "type": "object",
+      "required": [
+        "bundle_id",
+        "bundle_digest",
+        "run_id",
+        "corridor_id",
+        "horizon_hours",
+        "requested_data_types",
+        "record_count",
+        "generation_id",
+        "knowledge_as_of",
+        "source_records"
+      ],
+      "properties": {
+        "bundle_id": {"type": "string"},
+        "bundle_digest": {"$ref": "#/$defs/digest"},
+        "run_id": {"type": "string"},
+        "corridor_id": {"type": "string"},
+        "horizon_hours": {"const": 168},
+        "requested_data_types": {
+          "type": "array",
+          "minItems": 12,
+          "maxItems": 12,
+          "uniqueItems": true,
+          "items": {"type": "string"}
+        },
+        "record_count": {"type": "integer", "minimum": 12},
+        "generation_id": {"type": "integer", "minimum": 0},
+        "knowledge_as_of": {"$ref": "#/$defs/timestamp"},
+        "source_records": {
+          "type": "array",
+          "minItems": 12,
+          "items": {
+            "type": "object",
+            "required": [
+              "data_id",
+              "data_type",
+              "issue_time",
+              "valid_time",
+              "source",
+              "version",
+              "quality_flag",
+              "checksum",
+              "source_snapshot_id"
+            ],
+            "properties": {
+              "data_id": {"type": "string"},
+              "data_type": {"type": "string"},
+              "issue_time": {"$ref": "#/$defs/timestamp"},
+              "valid_time": {"$ref": "#/$defs/timestamp"},
+              "source": {"type": "string"},
+              "version": {"type": "string"},
+              "quality_flag": {"type": "string"},
+              "checksum": {"$ref": "#/$defs/digest"},
+              "source_snapshot_id": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    "bOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "full_frame_count",
+        "suffix_frame_count",
+        "first_risk_id",
+        "last_risk_id"
+      ],
+      "properties": {
+        "full_frame_count": {"const": 169},
+        "suffix_frame_count": {"const": 163},
+        "first_risk_id": {"type": "string", "pattern": "^risk-sha256-[0-9a-f]{64}$"},
+        "last_risk_id": {"type": "string", "pattern": "^risk-sha256-[0-9a-f]{64}$"}
+      }
+    },
+    "route": {
+      "type": "object",
+      "required": [
+        "plan_id",
+        "planning_layer",
+        "objective_mode",
+        "plan_kind",
+        "input_revision",
+        "destination_reached",
+        "layer_goal_reached",
+        "waypoint_count",
+        "source_risk_id_count",
+        "metrics"
+      ],
+      "properties": {
+        "plan_id": {"type": "string", "minLength": 1},
+        "planning_layer": {"type": ["string", "null"]},
+        "objective_mode": {"enum": ["fastest", "low_risk", "recommended"]},
+        "plan_kind": {"enum": ["initial", "replanned"]},
+        "input_revision": {"type": "integer", "minimum": 0},
+        "destination_reached": {"type": "boolean"},
+        "layer_goal_reached": {"type": "boolean"},
+        "waypoint_count": {"type": "integer", "minimum": 2},
+        "source_risk_id_count": {"type": "integer", "minimum": 1},
+        "metrics": {
+          "type": "object",
+          "required": ["eta_hours", "hard_constraint_violations"],
+          "properties": {
+            "eta_hours": {"type": "number", "minimum": 0},
+            "hard_constraint_violations": {"const": 0}
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+.mamba-env/
+.mamba-root/
+.venv/
+.uv-cache/
+.uv-python/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+.coverage
+htmlcov/
+output/
+data/
+

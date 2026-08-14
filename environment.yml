@@ -1,0 +1,10 @@
+name: arctic-route-orchestrator
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - uv>=0.12,<0.13
+  - eccodes>=2.42,<3
+  - libnetcdf>=4.9,<5
+  - hdf5>=1.14,<2
+
