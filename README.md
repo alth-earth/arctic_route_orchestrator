@@ -15,7 +15,10 @@
 - 严格 A 制品接收门和跨包运行骨架已实现。
 - 2026-08-14 formal-shape 长运行只到 B full/suffix 和 C v2 初始三目标；重规划未形成
   最终 output，v3 未开始，且夹具不是实际下载数据。
-- 标准 `make check` 因没有可发现的 Python 3.13 前缀失败，当前没有标准环境通过证据。
+- 编排器自己的 Mamba+uv 标准环境已创建：Python 3.13.15、uv 0.12.4，且已生成并纳入
+  `uv.lock`；A、B、C 的既有标准环境不受此次补齐影响。静态检查、8 个非集成测试、lock/sync
+  检查和 CLI 帮助均通过；两项集成测试在 24 分 49 秒后因性能预算未设定而人工中断，故完整
+  `make check` 尚未通过。
 - 成功报告仍为 `demo_unvalidated`，并明确 `navigation_use=prohibited`。
 
 ## 接手顺序
@@ -38,5 +41,13 @@ make sync
 make check
 ```
 
+若首次同步时构建隔离无法取得 hatchling 元数据，可先在该项目 `.venv` 安装已缓存的
+`hatchling`/`editables`，再执行 `UV_NO_BUILD_ISOLATION=1 make sync`；这不是改用其他项目
+环境，本次修复已按此方式完成同步。
+
 环境门禁修复后仍须分阶段运行 v2、重规划和 v3；不要直接重启无心跳、无阶段超时的完整
 长用例。
+
+编排器不拥有正式环境数据或模型权重；运行时通过 `--bundle/--run-context/--a-data-root/
+--b-config/--c-config-root/--contracts-config-root/--risk-store-root/--output-dir` 参数
+引用外部制品（源自：arctic_route_orchestrator_handoff_归档_20260815.md）。
