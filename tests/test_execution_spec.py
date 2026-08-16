@@ -20,6 +20,7 @@ def test_execution_spec_strict_round_trip(tmp_path) -> None:
         planning_contract="cd.route-plan.v2",
         max_snap_km=150.0,
         replan_after_hours=6,
+        per_stage_timeout_seconds=900.0,
     )
     path = tmp_path / "execution-spec.json"
     path.write_text(json.dumps(expected.to_document()), encoding="utf-8")
@@ -39,6 +40,7 @@ def test_execution_spec_rejects_extra_fields(tmp_path) -> None:
         "planning_contract": "cd.route-plan.v2",
         "max_snap_km": 150.0,
         "replan_after_hours": 6,
+        "per_stage_timeout_seconds": 900.0,
         "latest": True,
     }
     path.write_text(json.dumps(document), encoding="utf-8")

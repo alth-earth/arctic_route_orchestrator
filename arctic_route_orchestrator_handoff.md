@@ -31,8 +31,8 @@ GeoJSON 和校验清单。D 未来只读这些完整制品。
 | 包元数据 | 0.1.0；不在本轮擅自改版本 |
 | intake/公共编排骨架 | 已实现 |
 | 环境 | Python 3.13.15 + uv 0.12.4，`uv.lock` 已生成 |
-| 非集成门禁 | Ruff、8 tests、lock/sync/CLI 通过 |
-| 集成长运行 | 两项测试 24 分 49 秒后人工中断；需阶段预算和心跳 |
+| 非集成门禁 | Ruff、11 tests（含 stage-report 单元测试）、lock/sync/CLI 通过 |
+| 集成长运行 | 阶段报告/超时/失败报告已实现；v2/v3 完整成功路径仍未收口（详见实测记录） |
 | 挑战杯完整链 | 待完成 D 展示和两次断网演示 |
 
 已完成清单（源自：arctic_route_orchestrator_handoff_归档_20260815.md）：
@@ -50,7 +50,9 @@ GeoJSON 和校验清单。D 未来只读这些完整制品。
 | 工程及 formal-shape fixture 测试 | `tests/` |
 | 长运行证据与下一次手册 | `docs/INCIDENT_2026-08-14_LONG_INTEGRATION_RUN.md` |
 
-当前 intake 固定 exact 168 h 是主走廊 MVP 验收门，不是共享系统所有走廊的永久时域规则。
+2026-08-15 起 intake 改为按 RunContext/Scenario 校验走廊与时域：bundle corridor 必须等于
+RunContext corridor，窗口必须是完整请求窗（`minimum_required_end == requested_end`），
+数据画像仍为恰好 12 类必需层。主走廊 168 h 不再是硬编码前提。
 
 ## 4. 当前主线
 
@@ -66,7 +68,37 @@ B suffix commit → C replan
 atomic output/report/checksums → D
 ```
 
-v2 三目标 + 重规划是比赛主线；v3 四层可在性能允许时作为增强，不能留下部分整组。
+v3 四层 × 三目标（12 路线整组）+ 重规划是比赛主线（2026-08-15 确认）；v2 三目标为强制
+后备。任何整组运行都必须原子发布，不能留下部分整组。
+
+验证拆分约定：日常先跑 `make smoke`（快速非集成门禁）与 `make integration-v2`（v2 完整/
+后备）；v3 完整成功路径独立用 `make integration-v3` 验证并作为 8/20 门槛；不要在同一
+pytest 参数化用例中串行跑完 v2+v3 的初始/重规划（避免 30 次串行搜索）。
+
+### 4.1 可观测性改动（2026-08-15）
+
+为满足“阶段落盘 + 安全超时 + 失败保留报告”，本轮新增：
+
+- `ExecutionSpec.per_stage_timeout_seconds`（默认 900 s，execution-spec v1 必需字段）；
+- 每个阶段（initialization/b_build/endpoint_mapping/c_initial_planning/b_suffix_commit/
+  c_replanning/output_publication）记录开始时刻、耗时与状态；
+- 单阶段超时抛 `stage_timeout` 错误；失败/超时时把已完成阶段与错误写入
+  `run-stage-report.json`（原子写入，成功后亦随 output 目录发布）；
+- 失败报告字段：`status`（completed/failed）、`error_code`、`error_message`、`stages[]`。
+
+验证：Ruff 与 11 项非集成测试通过（含 stage-report 单元测试）；完整集成测试待小窗/子代理
+执行后记录。
+
+集成测试实测记录（2026-08-15，本机两次尝试）：
+
+- 第一次（`per_stage_timeout_seconds=900`）：v2 在 `c_replanning` 阶段触发 `stage_timeout`，
+  失败报告正确落盘（`run-stage-report.json`，status=failed，已完成阶段
+  initialization/b_build/endpoint_mapping/c_initial_planning）——验证了超时与失败报告机制；
+- 第二次（集成测试改用 `per_stage_timeout_seconds=3600`，仅测试放宽）：fixture 与 B
+  full/suffix commit 完成，运行在 `c_initial_planning`（性能瓶颈阶段）持续超过 1 小时后被
+  人工中断，未产生代码失败；
+- 结论：**失败报告/超时机制已实机验证**；v2/v3 完整成功路径尚未在本机跑通，需在更长会话或
+  可用子代理通道下完成，或改用小窗/低节点 smoke 后补录。
 
 ## 5. 未完成与待办
 

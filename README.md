@@ -13,12 +13,15 @@
 ## 当前状态
 
 - 严格 A 制品接收门和跨包运行骨架已实现。
+- 2026-08-15 新增阶段可观测性：七阶段开始/耗时/状态记录、单阶段超时（默认 900 s）与
+  失败报告 `run-stage-report.json`；`per_stage_timeout_seconds` 为 execution-spec v1 新字段。
 - 2026-08-14 formal-shape 长运行只到 B full/suffix 和 C v2 初始三目标；重规划未形成
-  最终 output，v3 未开始，且夹具不是实际下载数据。
+  最终 output，v3 未开始，且夹具不是实际下载数据（历史事故，详见复盘）。
 - 编排器自己的 Mamba+uv 标准环境已创建：Python 3.13.15、uv 0.12.4，且已生成并纳入
   `uv.lock`；A、B、C 的既有标准环境不受此次补齐影响。静态检查、8 个非集成测试、lock/sync
-  检查和 CLI 帮助均通过；两项集成测试在 24 分 49 秒后因性能预算未设定而人工中断，故完整
-  `make check` 尚未通过。
+  检查和 CLI 帮助均通过。完整 `make check` 的 v2/v3 集成成功路径仍未收口：默认 900 s 超时
+  已在 `c_replanning` 正确触发并落盘失败报告，但放宽预算后仍在 `c_initial_planning` 阶段
+  超 1 小时，需小窗或长会话补验。
 - 成功报告仍为 `demo_unvalidated`，并明确 `navigation_use=prohibited`。
 
 ## 接手顺序

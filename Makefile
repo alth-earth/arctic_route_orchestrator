@@ -6,7 +6,7 @@ export UV_PYTHON_INSTALL_DIR ?= $(CURDIR)/.uv-python
 export UV_PYTHON_DOWNLOADS ?= never
 export ECCODES_DIR ?= $(MAMBA_PREFIX)
 
-.PHONY: env-create env-update lock sync lint test integration check clean
+.PHONY: env-create env-update lock sync lint test smoke integration integration-v2 integration-v3 check clean
 
 env-create:
 	mamba env create --root-prefix $(MAMBA_ROOT_PREFIX) --prefix $(MAMBA_PREFIX) -f environment.yml --yes
@@ -29,6 +29,19 @@ test:
 integration:
 	$(UV) run --locked pytest -m integration
 
+smoke:
+	$(UV) run --locked ruff check src tests
+	$(UV) run --locked pytest -m "not integration and not real_artifact"
+	$(UV) lock --check --python "$(if $(wildcard $(MAMBA_PREFIX)/bin/python),$(MAMBA_PREFIX)/bin/python,python3)"
+	$(UV) sync --check --python "$(if $(wildcard $(MAMBA_PREFIX)/bin/python),$(MAMBA_PREFIX)/bin/python,python3)"
+	$(UV) run --locked arctic-route-orchestrator --help
+
+integration-v2:
+	$(UV) run --locked pytest -m integration -k "cd.route-plan.v2"
+
+integration-v3:
+	$(UV) run --locked pytest -m integration -k "cd.four-layer-route-plan-set.v3"
+
 check: lint test integration
 	$(UV) lock --check --python "$(if $(wildcard $(MAMBA_PREFIX)/bin/python),$(MAMBA_PREFIX)/bin/python,python3)"
 	$(UV) sync --check --python "$(if $(wildcard $(MAMBA_PREFIX)/bin/python),$(MAMBA_PREFIX)/bin/python,python3)"
@@ -36,4 +49,3 @@ check: lint test integration
 
 clean:
 	rm -rf .venv .pytest_cache .ruff_cache .coverage htmlcov
-

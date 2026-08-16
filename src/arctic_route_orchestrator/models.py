@@ -29,6 +29,7 @@ _FIELDS = frozenset(
         "planning_contract",
         "max_snap_km",
         "replan_after_hours",
+        "per_stage_timeout_seconds",
     }
 )
 
@@ -46,6 +47,7 @@ class ExecutionSpec:
     planning_contract: str
     max_snap_km: float = 150.0
     replan_after_hours: int = 6
+    per_stage_timeout_seconds: float = 900.0
 
     def __post_init__(self) -> None:
         for name in ("schema_version", "run_id", "scenario_id", "planning_contract"):
@@ -98,6 +100,21 @@ class ExecutionSpec:
             raise OrchestrationError(
                 "execution_spec_invalid", "replan_after_hours must be a positive integer"
             )
+        if (
+            isinstance(self.per_stage_timeout_seconds, bool)
+            or not isinstance(self.per_stage_timeout_seconds, int | float)
+            or not math.isfinite(self.per_stage_timeout_seconds)
+            or self.per_stage_timeout_seconds <= 0
+        ):
+            raise OrchestrationError(
+                "execution_spec_invalid",
+                "per_stage_timeout_seconds must be finite and positive",
+            )
+        object.__setattr__(
+            self,
+            "per_stage_timeout_seconds",
+            float(self.per_stage_timeout_seconds),
+        )
 
     @classmethod
     def from_path(cls, path: str | Path) -> ExecutionSpec:
@@ -137,6 +154,7 @@ class ExecutionSpec:
                 planning_contract=value["planning_contract"],
                 max_snap_km=value["max_snap_km"],
                 replan_after_hours=value["replan_after_hours"],
+                per_stage_timeout_seconds=value["per_stage_timeout_seconds"],
             )
         except (TypeError, ValueError) as exc:
             raise OrchestrationError(
@@ -154,6 +172,7 @@ class ExecutionSpec:
             "planning_contract": self.planning_contract,
             "max_snap_km": self.max_snap_km,
             "replan_after_hours": self.replan_after_hours,
+            "per_stage_timeout_seconds": self.per_stage_timeout_seconds,
         }
 
 

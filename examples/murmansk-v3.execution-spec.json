@@ -7,5 +7,6 @@
   "generated_at": "2026-08-14T00:00:00Z",
   "planning_contract": "cd.four-layer-route-plan-set.v3",
   "max_snap_km": 150.0,
-  "replan_after_hours": 6
+  "replan_after_hours": 6,
+  "per_stage_timeout_seconds": 900
 }

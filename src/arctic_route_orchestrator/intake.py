@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +21,6 @@ from arctic_route_data.sources import LocalArchiveSource
 
 from arctic_route_orchestrator.errors import ArtifactIntakeError
 
-PRIMARY_CORRIDOR_ID = "offshore_murmansk_to_offshore_dikson"
 FORMAL_REQUIRED_TYPES = frozenset(
     {
         "land_sea_mask",
@@ -139,9 +138,11 @@ class ArtifactIntake:
             raise ArtifactIntakeError(
                 "a_artifact_invalid", "bundle or RunContext failed semantic parsing"
             ) from exc
-        if bundle.corridor_id != PRIMARY_CORRIDOR_ID:
+        if bundle.corridor_id != run_context.corridor_id:
             raise ArtifactIntakeError(
-                "a_artifact_corridor_mismatch", f"expected {PRIMARY_CORRIDOR_ID}"
+                "a_artifact_corridor_mismatch",
+                f"bundle corridor {bundle.corridor_id} differs from "
+                f"RunContext {run_context.corridor_id}",
             )
         if set(bundle.requested_data_types) != FORMAL_REQUIRED_TYPES:
             missing = sorted(FORMAL_REQUIRED_TYPES - set(bundle.requested_data_types))
@@ -173,12 +174,9 @@ class ArtifactIntake:
         horizon_hours = int(
             (bundle.requested_end - bundle.requested_start).total_seconds() // 3600
         )
-        if (
-            bundle.requested_end - bundle.requested_start != timedelta(hours=168)
-            or bundle.minimum_required_end != bundle.requested_end
-        ):
+        if bundle.minimum_required_end != bundle.requested_end:
             raise ArtifactIntakeError(
-                "a_artifact_window_mismatch", "primary bundle must be an exact 168-hour window"
+                "a_artifact_window_mismatch", "bundle must be a complete requested window"
             )
         if scenario_id is not None and run_context.scenario_id != scenario_id:
             raise ArtifactIntakeError(

@@ -13,7 +13,8 @@
     "generated_at",
     "planning_contract",
     "max_snap_km",
-    "replan_after_hours"
+    "replan_after_hours",
+    "per_stage_timeout_seconds"
   ],
   "properties": {
     "schema_version": {
@@ -53,6 +54,10 @@
     "replan_after_hours": {
       "type": "integer",
       "minimum": 1
+    },
+    "per_stage_timeout_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0
     }
   }
 }

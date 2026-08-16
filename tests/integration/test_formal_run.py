@@ -286,6 +286,10 @@ def test_formal_archive_to_b_to_c_and_six_hour_replan(
             planning_contract=planning_contract,
             max_snap_km=150.0,
             replan_after_hours=6,
+            # Integration fixture is intentionally full-scale; allow 60 min per
+            # stage so the test exercises success paths, not the production 900s
+            # timeout that already failed fast in the failure-report test.
+            per_stage_timeout_seconds=3600.0,
         ),
         RunPaths(
             bundle_path=bundle_path,
@@ -321,6 +325,20 @@ def test_formal_archive_to_b_to_c_and_six_hour_replan(
     assert result.report["replanning"]["triggered"]
     assert result.report["replanning"]["published"]
     assert (output_dir / "checksums.json").is_file()
+    stage_report = json.loads(
+        (output_dir / "run-stage-report.json").read_text(encoding="utf-8")
+    )
+    assert stage_report["schema_version"] == "orchestrator.stage-report.v1"
+    assert stage_report["status"] == "completed"
+    assert {record["stage"] for record in stage_report["stages"]} == {
+        "initialization",
+        "b_build",
+        "endpoint_mapping",
+        "c_initial_planning",
+        "b_suffix_commit",
+        "c_replanning",
+        "output_publication",
+    }
     assert (output_dir / "routes" / route_directory).is_dir()
     other = "v3" if route_directory == "v2" else "v2"
     assert not (output_dir / "routes" / other).exists()

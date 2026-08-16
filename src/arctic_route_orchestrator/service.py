@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import platform
 import resource
 import sys
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -75,9 +77,13 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
     stage = "initialization"
     started = time.perf_counter()
     timings: dict[str, float] = {}
+    stage_records: list[dict[str, Any]] = []
+    stage_started_at = datetime.now(UTC)
+    stage_report_path = paths.output_dir / "run-stage-report.json"
     unsubscribe = None
     try:
         stage_started = time.perf_counter()
+        stage_started_at = datetime.now(UTC)
         configuration = load_configuration(
             paths.c_config_root,
             spec.scenario_id,
@@ -95,9 +101,21 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
         )
         _require_configuration_identity(configuration, intake.run_context)
         timings["configuration_and_a_intake_seconds"] = time.perf_counter() - stage_started
+        _append_stage_record(
+            stage_records=stage_records,
+            spec=spec,
+            stage=stage,
+            started_at=stage_started_at,
+            duration_seconds=timings["configuration_and_a_intake_seconds"],
+            status="completed",
+        )
+        _check_stage_timeout(
+            spec, timings["configuration_and_a_intake_seconds"], stage,
+        )
 
         stage = "b_build"
         stage_started = time.perf_counter()
+        stage_started_at = datetime.now(UTC)
         risk_configuration = load_risk_build_configuration(paths.b_config_path)
         envelope = BInputEnvelope.from_prepared_window(
             run_context=intake.run_context,
@@ -125,15 +143,36 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
         unsubscribe = store.bind_generation_authority(spec.run_id, intake.clock)
         full_commit = store.publish_window(frames)
         timings["b_build_and_full_commit_seconds"] = time.perf_counter() - stage_started
+        _append_stage_record(
+            stage_records=stage_records,
+            spec=spec,
+            stage=stage,
+            started_at=stage_started_at,
+            duration_seconds=timings["b_build_and_full_commit_seconds"],
+            status="completed",
+        )
+        _check_stage_timeout(
+            spec, timings["b_build_and_full_commit_seconds"], stage,
+        )
 
         stage = "endpoint_mapping"
         stage_started = time.perf_counter()
+        stage_started_at = datetime.now(UTC)
         endpoint_mapping = map_corridor_endpoints(
             configuration,
             frames[0],
             max_adjustment_km=spec.max_snap_km,
         )
         timings["endpoint_mapping_seconds"] = time.perf_counter() - stage_started
+        _append_stage_record(
+            stage_records=stage_records,
+            spec=spec,
+            stage=stage,
+            started_at=stage_started_at,
+            duration_seconds=timings["endpoint_mapping_seconds"],
+            status="completed",
+        )
+        _check_stage_timeout(spec, timings["endpoint_mapping_seconds"], stage)
 
         initial_request = _planning_request(
             configuration=configuration,
@@ -156,6 +195,17 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
             planning_contract=spec.planning_contract,
         )
         timings["c_initial_planning_seconds"] = time.perf_counter() - stage_started
+        _append_stage_record(
+            stage_records=stage_records,
+            spec=spec,
+            stage=stage,
+            started_at=stage_started_at,
+            duration_seconds=timings["c_initial_planning_seconds"],
+            status="completed",
+        )
+        _check_stage_timeout(
+            spec, timings["c_initial_planning_seconds"], stage,
+        )
         _require_planning_traceability(
             spec.planning_contract,
             initial,
@@ -181,8 +231,19 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
         if current_node == endpoint_mapping.goal.node:
             raise OrchestrationError(
                 "replan_not_materializable", "voyage reached the goal before the 6 h trigger"
-            )
+        )
         timings["b_suffix_commit_seconds"] = time.perf_counter() - stage_started
+        _append_stage_record(
+            stage_records=stage_records,
+            spec=spec,
+            stage=stage,
+            started_at=stage_started_at,
+            duration_seconds=timings["b_suffix_commit_seconds"],
+            status="completed",
+        )
+        _check_stage_timeout(
+            spec, timings["b_suffix_commit_seconds"], stage,
+        )
 
         replan_request = _planning_request(
             configuration=configuration,
@@ -213,6 +274,15 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
             planning_contract=spec.planning_contract,
         )
         timings["c_replanning_seconds"] = time.perf_counter() - stage_started
+        _append_stage_record(
+            stage_records=stage_records,
+            spec=spec,
+            stage=stage,
+            started_at=stage_started_at,
+            duration_seconds=timings["c_replanning_seconds"],
+            status="completed",
+        )
+        _check_stage_timeout(spec, timings["c_replanning_seconds"], stage)
         _require_planning_traceability(
             spec.planning_contract,
             replanning.batch
@@ -222,6 +292,7 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
         )
 
         stage = "output_publication"
+        stage_started_at = datetime.now(UTC)
         timings["total_execution_seconds"] = time.perf_counter() - started
         documents: dict[str, dict[str, Any]] = {
             "dataset-bundle.json": intake.prepared_window.dataset_bundle.to_dict(),
@@ -255,13 +326,34 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
         )
         documents["run-report.json"] = report
         output_dir, checksums = publish_output_directory(paths.output_dir, documents)
+        stage_records.append(
+            {
+                "schema_version": "orchestrator.stage-record.v1",
+                "run_id": spec.run_id,
+                "stage": stage,
+                "started_at": stage_started_at.isoformat(),
+                "duration_seconds": round(
+                    max(0.0, timings["total_execution_seconds"] - sum(timings.values())),
+                    3,
+                ),
+                "status": "completed",
+            }
+        )
+        _write_stage_report(stage_report_path, spec, stage_records, "completed")
         return FormalRunResult(output_dir=output_dir, report=report, checksums=checksums)
-    except OrchestrationError:
+    except OrchestrationError as exc:
+        _write_stage_report(
+            stage_report_path, spec, stage_records, "failed", exc.code, str(exc),
+        )
         raise
     except Exception as exc:
-        raise OrchestrationError(
+        error = OrchestrationError(
             f"{stage}_failed", f"{type(exc).__name__}: {exc}"
-        ) from exc
+        )
+        _write_stage_report(
+            stage_report_path, spec, stage_records, "failed", error.code, str(error),
+        )
+        raise error from exc
     finally:
         if unsubscribe is not None:
             unsubscribe()
@@ -283,6 +375,64 @@ def _execute_initial(*, ingress, request, planning_contract: str):
         "routes/v3/initial.geojson": four_layer_route_plan_set_to_geojson(plan_set),
     }
     return outcome, plan_set.recommended, documents
+
+
+def _append_stage_record(
+    *,
+    stage_records: list[dict[str, Any]],
+    spec: ExecutionSpec,
+    stage: str,
+    started_at: datetime,
+    duration_seconds: float,
+    status: str,
+) -> None:
+    stage_records.append(
+        {
+            "schema_version": "orchestrator.stage-record.v1",
+            "run_id": spec.run_id,
+            "stage": stage,
+            "started_at": started_at.isoformat(),
+            "duration_seconds": round(float(duration_seconds), 3),
+            "status": status,
+        }
+    )
+
+
+def _check_stage_timeout(spec: ExecutionSpec, duration_seconds: float, stage: str) -> None:
+    if duration_seconds > spec.per_stage_timeout_seconds:
+        raise OrchestrationError(
+            "stage_timeout",
+            f"stage '{stage}' exceeded {spec.per_stage_timeout_seconds:.0f}s timeout",
+        )
+
+
+def _write_stage_report(
+    path: Path,
+    spec: ExecutionSpec,
+    stage_records: list[dict[str, Any]],
+    status: str,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    if path.exists():
+        return
+    document = {
+        "schema_version": "orchestrator.stage-report.v1",
+        "run_id": spec.run_id,
+        "status": status,
+        "per_stage_timeout_seconds": spec.per_stage_timeout_seconds,
+        "error_code": error_code,
+        "error_message": error_message,
+        "stages": stage_records,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staging = path.with_suffix(path.suffix + ".tmp")
+    staging.write_text(
+        json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    os.replace(staging, path)
 
 
 def _execute_replan(
