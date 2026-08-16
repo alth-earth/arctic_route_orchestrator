@@ -2,6 +2,15 @@
 
 ## Unreleased - 2026-08-15
 
+## Unreleased - 2026-08-16（RC1）
+
+- 新增真正可中断 per-stage timeout：`stage_worker.py`（隔离 worker 执行正式链）+
+  `timeout_runner.py`（parent watchdog，按心跳逐阶段 wall-clock 超时，SIGTERM→宽限→
+  SIGKILL，无孤儿，TIMEOUT 报告含 elapsed/timeout/last_progress）；CLI `run` 切换；
+  3 项单测覆盖正常/超时/失败路径。
+- `execute_formal_run` 增加可选 heartbeat 钩子（默认关闭，行为不变）。
+- 完整 E2E 首次成功：mur/dikson v3 四层 + 6h 重规划（r6），r7 复现业务级一致。
+
 - 创建项目内 Mamba Python 3.13.15 + uv 0.12.4 环境并生成 `uv.lock`；该环境修复不改变包版本。
 - 新增阶段可观测性：`ExecutionSpec.per_stage_timeout_seconds`（默认 900 s）、七阶段
   开始/耗时/状态记录、单阶段超时抛 `stage_timeout`，失败或超时原子落盘

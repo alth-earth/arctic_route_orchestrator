@@ -12,7 +12,8 @@ from arctic_route_orchestrator import __version__
 from arctic_route_orchestrator.errors import OrchestrationError
 from arctic_route_orchestrator.intake import ArtifactIntake
 from arctic_route_orchestrator.models import ExecutionSpec
-from arctic_route_orchestrator.service import RunPaths, execute_formal_run
+from arctic_route_orchestrator.service import RunPaths
+from arctic_route_orchestrator.timeout_runner import run_with_timeout
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
             response = {"ok": True, **asdict(result.report)}
         else:
             spec = ExecutionSpec.from_path(args.execution_spec)
-            result = execute_formal_run(
+            result = run_with_timeout(
                 spec,
                 RunPaths(
                     bundle_path=args.bundle,

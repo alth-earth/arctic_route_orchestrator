@@ -7,6 +7,9 @@
 
 # A–B–C 编排器项目交接
 
+> Status: CURRENT — RC1（2026-08-16）。v3 四层 + 6h 重规划已跑通（r6/r7）；
+> 可中断 worker timeout 已实现并单测；worker 模式全链冒烟为 pre-demo 必做。
+
 ## 1. 目标与边界
 
 编排器只经公共合同/API 接收 A 冻结制品，触发 B 风险窗口、C 规划/重规划并输出报告、JSON、

@@ -71,10 +71,17 @@ class FormalRunResult:
     checksums: dict[str, str]
 
 
-def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
+def execute_formal_run(
+    spec: ExecutionSpec,
+    paths: RunPaths,
+    *,
+    heartbeat: Callable[[dict[str, Any]], None] | None = None,
+) -> FormalRunResult:
     """Execute one immutable v2 or v3 run and its six-hour suffix replan."""
 
     stage = "initialization"
+    if heartbeat is not None:
+        heartbeat({"event": "stage_start", "stage": stage})
     started = time.perf_counter()
     timings: dict[str, float] = {}
     stage_records: list[dict[str, Any]] = []
@@ -109,11 +116,21 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
             duration_seconds=timings["configuration_and_a_intake_seconds"],
             status="completed",
         )
+        if heartbeat is not None:
+            heartbeat(
+                {
+                    "event": "stage_done",
+                    "stage": stage,
+                    "duration_seconds": timings["configuration_and_a_intake_seconds"],
+                }
+            )
         _check_stage_timeout(
             spec, timings["configuration_and_a_intake_seconds"], stage,
         )
 
         stage = "b_build"
+        if heartbeat is not None:
+            heartbeat({"event": "stage_start", "stage": stage})
         stage_started = time.perf_counter()
         stage_started_at = datetime.now(UTC)
         risk_configuration = load_risk_build_configuration(paths.b_config_path)
@@ -151,11 +168,21 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
             duration_seconds=timings["b_build_and_full_commit_seconds"],
             status="completed",
         )
+        if heartbeat is not None:
+            heartbeat(
+                {
+                    "event": "stage_done",
+                    "stage": stage,
+                    "duration_seconds": timings["b_build_and_full_commit_seconds"],
+                }
+            )
         _check_stage_timeout(
             spec, timings["b_build_and_full_commit_seconds"], stage,
         )
 
         stage = "endpoint_mapping"
+        if heartbeat is not None:
+            heartbeat({"event": "stage_start", "stage": stage})
         stage_started = time.perf_counter()
         stage_started_at = datetime.now(UTC)
         endpoint_mapping = map_corridor_endpoints(
@@ -172,6 +199,14 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
             duration_seconds=timings["endpoint_mapping_seconds"],
             status="completed",
         )
+        if heartbeat is not None:
+            heartbeat(
+                {
+                    "event": "stage_done",
+                    "stage": stage,
+                    "duration_seconds": timings["endpoint_mapping_seconds"],
+                }
+            )
         _check_stage_timeout(spec, timings["endpoint_mapping_seconds"], stage)
 
         initial_request = _planning_request(
@@ -188,6 +223,8 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
         ingress = RiskSourcePlanningIngress(store, configuration=configuration)
 
         stage = "c_initial_planning"
+        if heartbeat is not None:
+            heartbeat({"event": "stage_start", "stage": stage})
         stage_started = time.perf_counter()
         initial, initial_plan, plan_documents = _execute_initial(
             ingress=ingress,
@@ -203,6 +240,14 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
             duration_seconds=timings["c_initial_planning_seconds"],
             status="completed",
         )
+        if heartbeat is not None:
+            heartbeat(
+                {
+                    "event": "stage_done",
+                    "stage": stage,
+                    "duration_seconds": timings["c_initial_planning_seconds"],
+                }
+            )
         _check_stage_timeout(
             spec, timings["c_initial_planning_seconds"], stage,
         )
@@ -213,6 +258,8 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
         )
 
         stage = "b_suffix_commit"
+        if heartbeat is not None:
+            heartbeat({"event": "stage_start", "stage": stage})
         stage_started = time.perf_counter()
         replan_time = intake.run_context.simulation_start + timedelta(
             hours=spec.replan_after_hours
@@ -241,6 +288,14 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
             duration_seconds=timings["b_suffix_commit_seconds"],
             status="completed",
         )
+        if heartbeat is not None:
+            heartbeat(
+                {
+                    "event": "stage_done",
+                    "stage": stage,
+                    "duration_seconds": timings["b_suffix_commit_seconds"],
+                }
+            )
         _check_stage_timeout(
             spec, timings["b_suffix_commit_seconds"], stage,
         )
@@ -266,6 +321,8 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
         )
 
         stage = "c_replanning"
+        if heartbeat is not None:
+            heartbeat({"event": "stage_start", "stage": stage})
         stage_started = time.perf_counter()
         replanning, _, replan_documents = _execute_replan(
             ingress=ingress,
@@ -282,6 +339,14 @@ def execute_formal_run(spec: ExecutionSpec, paths: RunPaths) -> FormalRunResult:
             duration_seconds=timings["c_replanning_seconds"],
             status="completed",
         )
+        if heartbeat is not None:
+            heartbeat(
+                {
+                    "event": "stage_done",
+                    "stage": stage,
+                    "duration_seconds": timings["c_replanning_seconds"],
+                }
+            )
         _check_stage_timeout(spec, timings["c_replanning_seconds"], stage)
         _require_planning_traceability(
             spec.planning_contract,
