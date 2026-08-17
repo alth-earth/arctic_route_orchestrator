@@ -23,6 +23,8 @@
   **worker-mode full v3 E2E**（8 阶段 completed，业务结果与 r6 一致），并发现修复
   CLI 对 worker dict 结果的消费 bug；真实 C 超时冒烟 PASS
   （`scripts/real_c_timeout_worker.py`，四层 A* 45.2s 中断）。
+- Demo Engineering：`scripts/demo_live_worker.py` / `demo_live_runner.py`
+  提供现场真实小窗重规划（LIVE_COMPUTED，约 60s），由 D demo CLI 调用。
 
 ## 接手顺序
 

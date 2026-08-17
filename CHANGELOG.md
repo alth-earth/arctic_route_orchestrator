@@ -2,6 +2,9 @@
 
 ## Unreleased - 2026-08-17（RC2 development）
 
+- Demo Engineering：新增 `scripts/demo_live_worker.py`（真实小窗 replan，
+  输出 `d.live-result.v1` / LIVE_COMPUTED）与 `scripts/demo_live_runner.py`
+  （worker + watchdog 超时驱动，实测 57.6s ≤2min）。
 - B 完成后释放 `build_request/envelope`，endpoint mapping 后释放
   `PreparedWindow`（`replace(intake, prepared_window=None)`），C 阶段不再
   驻留 A 大帧；mur 全链峰值 RSS 4.18GB → 2.81GB、Tromsø 144h 1.40 → 0.97GB，
