@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased - 2026-08-18（Causal Replay Engine MVP，Strategy B）
+
+- 新增 replay 包：SimulationSnapshot/ReplayManifest 模型、两级 digest
+  （visible / B-relevant）、event-driven runner（tick → A visibility →
+  B reuse/recompute → suffix window → C policy → snapshot）、
+  C 语义路线完整性审计、机器 validation 与 `replay_inspect.py` CLI；
+- 新增 `causal_replay_preflight.py` 操作级 horizon 预检与
+  `causal_replay_mvp.py` 运行 CLI（checkpoint/heartbeat/原子发布/resume）；
+- 真实 Scenario B 因果回放：12h（13 snapshots/31s）、24h（25/91s）、
+  44h（45/317s）PASS（engine + validation）；determinism 13/13 snapshot
+  digest 与 manifest digest 一致（B generated_at 改用 knowledge 时刻）；
+- C 四层：因果风险窗 44h < 航线 ETA ~48h → 真实 PlanningHorizonExceeded
+  （v3 + v2 probe），记录 PLANNING-HORIZON ARCHITECTURE BLOCKER；
+  未修改 frozen retrospective 路径；测试：replay unit 21 + 既有 25。
+
 ## Unreleased - 2026-08-17（Route Geospatial Integrity）
 
 - 编排器核心无改动；D 新增 Route Geospatial Integrity gate

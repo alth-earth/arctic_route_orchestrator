@@ -32,6 +32,13 @@
   （`demo geo-integrity` + preflight 硬门），审计冻结 v3 制品与风险帧的
   路线地理完整性；修复 Viewer 双投影导致的视觉穿 LAND。编排器核心路径
   无改动，正式计算仍走 worker/watchdog。
+- Causal Replay Engine MVP（2026-08-18，Strategy B）：新增
+  `src/arctic_route_orchestrator/replay/`（models/digests/runner/
+  route_integrity/validation）+ `scripts/causal_replay_mvp.py` +
+  `scripts/replay_inspect.py` + `scripts/causal_replay_preflight.py`；
+  真实 Scenario B 12h/24h/44h 因果回放 PASS（engine），C 四层 =
+  PLANNING-HORIZON BLOCKER（诚实 fail-closed）；Strategy A 冻结路径不受
+  影响。详见 `CAUSAL_REPLAY_MVP_20260818.md`。
 
 ## 接手顺序
 
