@@ -25,6 +25,9 @@
   （`scripts/real_c_timeout_worker.py`，四层 A* 45.2s 中断）。
 - Demo Engineering：`scripts/demo_live_worker.py` / `demo_live_runner.py`
   提供现场真实小窗重规划（LIVE_COMPUTED，约 60s），由 D demo CLI 调用。
+- Demo Candidate 2：D `demo serve` 提供 `/api/live/start` 与
+  `/api/live/status`，Viewer 页面按钮可直接驱动上述 runner 并显示
+  elapsed/stage 进度；正式计算仍走同一 worker/watchdog 路径。
 
 ## 接手顺序
 

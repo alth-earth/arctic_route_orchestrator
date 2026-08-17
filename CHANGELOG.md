@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased - 2026-08-17（Demo Candidate 2）
+
+- Demo live runner 无核心变更；D `demo serve` 新增
+  `POST /api/live/start` / `GET /api/live/status`，可由 Viewer 页面按钮
+  直接驱动 `demo_live_runner.py`（真实 worker + watchdog），
+  实测 UI 触发 ≈56s、LIVE_COMPUTED、无重复进程（单飞守卫）。
+
 ## Unreleased - 2026-08-17（RC2 development）
 
 - Demo Engineering：新增 `scripts/demo_live_worker.py`（真实小窗 replan，
