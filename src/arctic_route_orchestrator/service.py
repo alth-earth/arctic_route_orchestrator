@@ -758,6 +758,10 @@ def _coverage_preflight(
             data_unavailable_nodes = int(np.count_nonzero(reasons == "DATA_UNAVAILABLE"))
             other_hard_nodes = int(np.count_nonzero(reasons == "OTHER"))
         unknown_navigable = int(np.count_nonzero(navigable & ~finite))
+        ice_free_counts = payload.attrs.get("ice_free_neutralized_input_counts", {})
+        ice_free_neutralized_nodes = int(
+            max(ice_free_counts.values(), default=0)
+        )
         if unknown_navigable:
             gate_passed = False
         summary = {
@@ -770,6 +774,7 @@ def _coverage_preflight(
             "other_hard_nodes": other_hard_nodes,
             "navigable_nodes": int(np.count_nonzero(navigable)),
             "unknown_navigable_nodes": unknown_navigable,
+            "ice_free_neutralized_nodes": ice_free_neutralized_nodes,
             "finite_coverage_percent": round(
                 100.0
                 * np.count_nonzero(navigable & finite)

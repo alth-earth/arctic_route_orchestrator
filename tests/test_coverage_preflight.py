@@ -57,6 +57,10 @@ def _frames():
     payload.attrs["missing_input_variable_counts"] = {
         "ocean_current_u": int(np.count_nonzero(hard))
     }
+    payload.attrs["ice_free_neutralized_input_counts"] = {
+        "ice_type": 3,
+        "ice_edge": 3,
+    }
     from dataclasses import replace
 
     frames = [replace(frames[0], payload=payload), frames[1]]
@@ -82,6 +86,7 @@ def test_preflight_passes_and_reports_reason_accounting() -> None:
     assert first["unknown_navigable_nodes"] == 0
     assert first["land_nodes"] == first["hard_nodes"]
     assert first["data_unavailable_nodes"] == 0
+    assert first["ice_free_neutralized_nodes"] == 3
     assert first["missing_input_variable_counts"]["ocean_current_u"] == first["hard_nodes"]
 
 

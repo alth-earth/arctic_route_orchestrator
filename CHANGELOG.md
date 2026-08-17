@@ -16,6 +16,10 @@
 - 集成 fixture 改用 RC1 实际 B 配置 `demo_unvalidated_smoke_grid_v4.json`
   （默认 0.75°×2.2° 网格与 corridor 2.2.0 终点允许区域无交点）；
   integration 阶段集合同步加入 coverage_preflight。
+- coverage preflight 每帧新增可选 `ice_free_neutralized_nodes`（取自 B 帧
+  `ice_free_neutralized_input_counts` attrs），旧文档无该字段仍可校验。
+- 新增 Scenario B regression：`scripts/rc2_second_scenario_regression.py`
+  （Tromsø 144h v3 + coverage + D + golden digest 校验）。
 - 测试：非集成 18 passed（含 coverage preflight 与 CLI 单测）。
 
 ## Unreleased - 2026-08-15

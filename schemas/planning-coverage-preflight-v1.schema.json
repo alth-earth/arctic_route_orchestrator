@@ -63,6 +63,7 @@
         "other_hard_nodes": {"type": "integer", "minimum": 0},
         "navigable_nodes": {"type": "integer", "minimum": 0},
         "unknown_navigable_nodes": {"type": "integer", "minimum": 0},
+        "ice_free_neutralized_nodes": {"type": "integer", "minimum": 0},
         "finite_coverage_percent": {"type": "number", "minimum": 0, "maximum": 100},
         "missing_input_variable_counts": {
           "type": "object",
