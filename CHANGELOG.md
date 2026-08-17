@@ -2,6 +2,16 @@
 
 ## Unreleased - 2026-08-17（RC2 development）
 
+- B 完成后释放 `build_request/envelope`，endpoint mapping 后释放
+  `PreparedWindow`（`replace(intake, prepared_window=None)`），C 阶段不再
+  驻留 A 大帧；mur 全链峰值 RSS 4.18GB → 2.81GB、Tromsø 144h 1.40 → 0.97GB，
+  业务输出不变。
+- 新增公平 objective 级并发 benchmark
+  `scripts/bench_equal_work_objectives.py`（serial/parallel/prototype 三模式，
+  同一风险窗相同工作量）：2-worker speedup ≈1.48×、合计峰值 <330MB、
+  业务输出与串行一致；prototype = EXPERIMENTAL / 正式路径串行。
+- `verified_build_snapshot` 深拷贝消除后，RC1/Scenario B 全链复跑验证
+  business regression 不变；Scenario B 144h r2 与 r1 digest/业务完全一致。
 - 新增 `coverage_preflight` 阶段：B full commit 后、endpoint mapping/C 前计算
   `planning-coverage-preflight.json`（schema v1），逐帧报告 total/hard/land/
   data_unavailable/navigable/unknown-navigable 与 missing_input_variable_counts；

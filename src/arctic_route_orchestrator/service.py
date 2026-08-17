@@ -10,7 +10,7 @@ import resource
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -108,6 +108,8 @@ def execute_formal_run(
             contracts_config_root=paths.contracts_config_root,
         )
         _require_configuration_identity(configuration, intake.run_context)
+        prepared_as_of_time = intake.prepared_window.as_of_time
+        dataset_bundle_document = intake.prepared_window.dataset_bundle.to_dict()
         timings["configuration_and_a_intake_seconds"] = time.perf_counter() - stage_started
         _append_stage_record(
             stage_records=stage_records,
@@ -139,7 +141,7 @@ def execute_formal_run(
             run_context=intake.run_context,
             prepared_window=intake.prepared_window,
             generation_id=spec.generation_id,
-            knowledge_as_of=intake.prepared_window.as_of_time,
+            knowledge_as_of=prepared_as_of_time,
         )
         bbox = configuration.corridor.data_bbox
         build_request = RiskBuildRequest(
@@ -148,6 +150,7 @@ def execute_formal_run(
             grid_config=risk_configuration.grid_config,
             model_config=risk_configuration.model_config,
         )
+        model_config_digest = build_request.model_config_digest
         frames = RiskBuildService(utc_now=lambda: spec.generated_at).build_window(
             build_request
         )
@@ -180,6 +183,7 @@ def execute_formal_run(
         _check_stage_timeout(
             spec, timings["b_build_and_full_commit_seconds"], stage,
         )
+        del envelope, build_request
 
         stage = "coverage_preflight"
         if heartbeat is not None:
@@ -239,14 +243,18 @@ def execute_formal_run(
                 }
             )
         _check_stage_timeout(spec, timings["endpoint_mapping_seconds"], stage)
+        # B is complete and only the compact risk store is needed downstream;
+        # release the large A-frame references (PreparedWindow + envelope)
+        # before C planning to avoid retaining gigabytes during the search.
+        intake = replace(intake, prepared_window=None)
 
         initial_request = _planning_request(
             configuration=configuration,
             run_context=intake.run_context,
-            model_config_digest=build_request.model_config_digest,
+            model_config_digest=model_config_digest,
             generation_id=spec.generation_id,
             input_revision=spec.input_revision,
-            as_of_time=intake.prepared_window.as_of_time,
+            as_of_time=prepared_as_of_time,
             start_time=intake.run_context.simulation_start,
             start=endpoint_mapping.start.node,
             goal=endpoint_mapping.goal.node,
@@ -334,10 +342,10 @@ def execute_formal_run(
         replan_request = _planning_request(
             configuration=configuration,
             run_context=intake.run_context,
-            model_config_digest=build_request.model_config_digest,
+            model_config_digest=model_config_digest,
             generation_id=spec.generation_id,
             input_revision=spec.input_revision + 1,
-            as_of_time=intake.prepared_window.as_of_time,
+            as_of_time=prepared_as_of_time,
             start_time=replan_time,
             start=current_node,
             goal=endpoint_mapping.goal.node,
@@ -391,7 +399,7 @@ def execute_formal_run(
         stage_started_at = datetime.now(UTC)
         timings["total_execution_seconds"] = time.perf_counter() - started
         documents: dict[str, dict[str, Any]] = {
-            "dataset-bundle.json": intake.prepared_window.dataset_bundle.to_dict(),
+            "dataset-bundle.json": dataset_bundle_document,
             "endpoint-mapping.json": endpoint_mapping.to_document(),
             "execution-spec.json": spec.to_document(),
             "risk/full-window-commit.json": _window_document(full_commit),
@@ -409,7 +417,8 @@ def execute_formal_run(
             spec=spec,
             intake=intake,
             configuration=configuration,
-            model_config_digest=build_request.model_config_digest,
+            model_config_digest=model_config_digest,
+            prepared_as_of_time=prepared_as_of_time,
             full_commit=full_commit,
             suffix_commit=suffix_commit,
             endpoint_mapping=endpoint_mapping,
@@ -819,6 +828,7 @@ def _run_report(
     intake: ArtifactIntake,
     configuration,
     model_config_digest: str,
+    prepared_as_of_time: datetime,
     full_commit,
     suffix_commit,
     endpoint_mapping,
@@ -850,7 +860,7 @@ def _run_report(
             "generation_id": spec.generation_id,
             "initial_input_revision": spec.input_revision,
             "replanned_input_revision": spec.input_revision + 1,
-            "as_of_time": _iso(intake.prepared_window.as_of_time),
+            "as_of_time": _iso(prepared_as_of_time),
             "simulation_start": _iso(intake.run_context.simulation_start),
             "simulation_end": _iso(intake.run_context.simulation_end),
             "orchestrator_generated_at": _iso(spec.generated_at),
