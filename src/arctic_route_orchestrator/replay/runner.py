@@ -30,7 +30,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from arctic_route_contracts import RunContext, load_run_context
+from arctic_route_contracts import (
+    RunContext,
+    configuration_digest,
+    load_run_context,
+)
 from arctic_route_data import (
     PartitionedABCache,
     SimulationClock,
@@ -182,12 +186,13 @@ class ReplayRunner:
     configuration: Any = None
 
     # revision state
-    data_revision = 0
-    b_input_revision = 0
-    risk_revision = 0
-    plan_revision = 0
+    data_revision: int = 0
+    b_input_revision: int = 0
+    risk_revision: int = 0
+    plan_revision: int = 0
 
     risk_commit: Any = None
+    window_commit: Any = None
     risk_valid_start: datetime | None = None
     risk_valid_end: datetime | None = None
     prediction_as_of: datetime | None = None
@@ -305,10 +310,11 @@ class ReplayRunner:
                     ReplayEvent(
                         type="B_REUSED",
                         simulation_time=_iso(tick),
-                        revision=self.risk_commit.commit_id,
+                        revision=self._window_identity(tick).commit_id,
                         observed=True,
                     )
                 )
+            self.window_commit = self._window_identity(tick)
             self._last_visible_digest = visible_digest
             self._last_relevant_digest = relevant_digest
             self._last_data_revision = self.data_revision
@@ -455,12 +461,13 @@ class ReplayRunner:
         store = PersistentRiskStore(self.paths.risk_store_root)
         store.bind_generation_authority(_replay_run_id(self.replay_id), SimulationClock(tick))
         self.risk_commit = store.publish_window(frames)
+        self.window_commit = self.risk_commit
         self.risk_store = store
         self.risk_valid_start = frames[0].valid_time
         self.risk_valid_end = frames[-1].valid_time
         self.prediction_as_of = tick
         self.risk_revision += 1
-        self.run_context = base_context
+        self.run_context = self._c_run_context(base_context)
         self.ingress = RiskSourcePlanningIngress(
             source=store,
             configuration=self.configuration,
@@ -473,6 +480,13 @@ class ReplayRunner:
 
     def _replay_run_context(self, bundle) -> RunContext:
         base = load_run_context(self.frozen_run_context_path)
+        digest = configuration_digest(
+            self.configuration.scenario,
+            self.configuration.corridor,
+            self.configuration.vessel,
+            dataset_bundle_id=bundle.bundle_id,
+            dataset_bundle_digest=bundle.bundle_digest,
+        )
         return replace(
             base,
             run_id=_replay_run_id(self.replay_id),
@@ -482,6 +496,30 @@ class ReplayRunner:
             simulation_end=self.replay_end,
             dataset_bundle_id=bundle.bundle_id,
             dataset_bundle_digest=bundle.bundle_digest,
+            config_digest=digest,
+        )
+
+    def _c_run_context(self, b_context: RunContext) -> RunContext:
+        """C requires the RunContext window to equal the scenario window."""
+
+        base = load_run_context(self.frozen_run_context_path)
+        return replace(
+            base,
+            run_id=b_context.run_id,
+            created_at=b_context.created_at,
+            dataset_bundle_id=b_context.dataset_bundle_id,
+            dataset_bundle_digest=b_context.dataset_bundle_digest,
+            config_digest=b_context.config_digest,
+        )
+
+    def _window_identity(self, tick: datetime):
+        if tick == self.replay_start or self.risk_commit is None:
+            return self.risk_commit
+        if self.window_commit is not None and self.window_commit.start == tick:
+            return self.window_commit
+        return self.risk_store.publish_suffix_window(
+            self.risk_commit.frames,
+            start=tick,
         )
 
     def _planning_tick(
@@ -625,7 +663,7 @@ class ReplayRunner:
             risk_provenance=ProvenanceKind.FORMAL,
             generation_id=0,
             input_revision=input_revision,
-            as_of_time=tick,
+            as_of_time=self.prediction_as_of or tick,
             start_time=tick,
             start=self.endpoint_mapping.start.node,
             goal=self.endpoint_mapping.goal.node,
@@ -664,10 +702,10 @@ class ReplayRunner:
         risk = RiskStateSummary(
             risk_revision=self.risk_revision,
             prediction_as_of=_iso(self.prediction_as_of) if self.prediction_as_of else "",
-            risk_valid_start=_iso(self.risk_valid_start) if self.risk_valid_start else None,
-            risk_valid_end=_iso(self.risk_valid_end) if self.risk_valid_end else None,
-            resource_identity=self.risk_commit.commit_id if self.risk_commit else None,
-            resource_digest=self.risk_commit.content_digest if self.risk_commit else None,
+            risk_valid_start=_iso(self.window_commit.start) if self.window_commit else None,
+            risk_valid_end=_iso(self.window_commit.end) if self.window_commit else None,
+            resource_identity=self.window_commit.commit_id if self.window_commit else None,
+            resource_digest=self.window_commit.content_digest if self.window_commit else None,
             presentation_horizons={
                 "0h": _iso(tick),
                 "+6h": _iso(tick + timedelta(hours=6)),
@@ -728,7 +766,6 @@ class ReplayRunner:
     def _restore_runtime(self, checkpoint: dict[str, Any]) -> None:
         """Re-attach committed risk store and C endpoints after a restart."""
 
-        from arctic_route_planning.contracts import RiskWindowQuery
         from arctic_route_risk.publishing.store import PersistentRiskStore
 
         commit_id = checkpoint.get("risk_commit_id")
@@ -739,19 +776,7 @@ class ReplayRunner:
                 self.paths.risk_store_root / "commits" / f"{commit_id}.json"
             ).read_text(encoding="utf-8")
         )
-        query = RiskWindowQuery(
-            start=datetime.fromisoformat(document["start"].replace("Z", "+00:00")).astimezone(UTC),
-            end=datetime.fromisoformat(document["end"].replace("Z", "+00:00")).astimezone(UTC),
-            interval=timedelta(seconds=int(document["interval_seconds"])),
-            run_id=str(document["run_id"]),
-            scenario_id=str(document["scenario_id"]),
-            corridor_id=str(document["corridor_id"]),
-            generation_id=int(document["generation_id"]),
-            vessel_profile_id=str(document["vessel_profile_id"]),
-            config_digest=str(document["config_digest"]),
-            model_config_digest=str(document["model_config_digest"]),
-            as_of=datetime.fromisoformat(document["as_of"].replace("Z", "+00:00")).astimezone(UTC),
-        )
+        query = _query_from_commit_document(document)
         store = PersistentRiskStore(self.paths.risk_store_root)
         store.bind_generation_authority(
             _replay_run_id(self.replay_id), SimulationClock(query.start)
@@ -759,6 +784,7 @@ class ReplayRunner:
         window = store.get_committed_window(query)
         self.risk_store = store
         self.risk_commit = window
+        self.window_commit = window
         self.risk_valid_start = window.start
         self.risk_valid_end = window.end
         self.prediction_as_of = window.as_of
@@ -802,3 +828,27 @@ def _replay_run_id(replay_id: str) -> str:
 def _corridor_bbox(configuration) -> tuple[float, float, float, float]:
     box = configuration.corridor.data_bbox
     return (float(box.west), float(box.south), float(box.east), float(box.north))
+
+
+def _query_from_commit_document(document: dict[str, Any]):
+    from arctic_route_planning.contracts import RiskWindowQuery
+
+    return RiskWindowQuery(
+        start=datetime.fromisoformat(
+            document["start"].replace("Z", "+00:00")
+        ).astimezone(UTC),
+        end=datetime.fromisoformat(document["end"].replace("Z", "+00:00")).astimezone(
+            UTC
+        ),
+        interval=timedelta(seconds=int(document["interval_seconds"])),
+        run_id=str(document["run_id"]),
+        scenario_id=str(document["scenario_id"]),
+        corridor_id=str(document["corridor_id"]),
+        generation_id=int(document["generation_id"]),
+        vessel_profile_id=str(document["vessel_profile_id"]),
+        config_digest=str(document["config_digest"]),
+        model_config_digest=str(document["model_config_digest"]),
+        as_of=datetime.fromisoformat(
+            document["as_of"].replace("Z", "+00:00")
+        ).astimezone(UTC),
+    )
