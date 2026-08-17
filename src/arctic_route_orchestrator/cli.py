@@ -73,10 +73,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             response = {
                 "ok": True,
-                "output_dir": str(result.output_dir),
-                "run_id": result.report["identity"]["run_id"],
-                "planning_contract": result.report["planning_contract"],
-                "digests": result.report["digests"],
+                "output_dir": str(result["output_dir"]),
+                "run_id": result["run_id"],
+                "planning_contract": result["planning_contract"],
+                "digests": result["digests"],
             }
     except OrchestrationError as exc:
         print(

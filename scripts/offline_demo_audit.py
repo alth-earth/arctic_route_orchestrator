@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import socket
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]  # /root/my_project
@@ -37,13 +37,13 @@ def main() -> int:
     report: dict[str, object] = {"ok": True, "checks": {}}
 
     # 1. Orchestrator CLI help (imports the whole demo stack).
-    import arctic_route_orchestrator  # noqa: F401
-
     from arctic_route_contracts import load_run_context
     from arctic_route_display.loader import load_v3_group
     from arctic_route_planning.contracts import HOURLY_RISK_INTERVAL, RiskWindowQuery
     from arctic_route_planning.risk import RiskSampler
     from arctic_route_risk import PersistentRiskStore
+
+    import arctic_route_orchestrator  # noqa: F401
 
     golden = ROOT / "work_package_a" / "data" / "output" / "golden"
 
@@ -95,7 +95,10 @@ def main() -> int:
     report["checks"]["b_risk_window"] = {"frames": len(window.frames)}
 
     # 4. C: risk sampling on the committed window.
-    from arctic_route_planning.contracts.codec import risk_frame_from_document, risk_frame_to_document
+    from arctic_route_planning.contracts.codec import (
+        risk_frame_from_document,
+        risk_frame_to_document,
+    )
 
     frames = tuple(risk_frame_from_document(risk_frame_to_document(f)) for f in window.frames)
     sampler = RiskSampler(frames, max_frame_gap=HOURLY_RISK_INTERVAL)

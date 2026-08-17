@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import sys
 import threading
@@ -24,7 +23,7 @@ from typing import Any
 
 from arctic_route_orchestrator.errors import OrchestrationError
 from arctic_route_orchestrator.models import ExecutionSpec
-from arctic_route_orchestrator.service import RunPaths, _write_stage_report
+from arctic_route_orchestrator.service import RunPaths
 
 
 class StageTimeoutError(OrchestrationError):
@@ -86,14 +85,15 @@ def run_with_timeout(
         spec_path.write_text(
             json.dumps(spec.to_document(), sort_keys=True), encoding="utf-8"
         )
-        worker_cmd_factory = lambda _result: [
-            sys.executable,
-            "-m",
-            "arctic_route_orchestrator.stage_worker",
-            str(spec_path),
-            paths_json,
-            str(_result),
-        ]
+        def worker_cmd_factory(_result: Path) -> list[str]:
+            return [
+                sys.executable,
+                "-m",
+                "arctic_route_orchestrator.stage_worker",
+                str(spec_path),
+                paths_json,
+                str(_result),
+            ]
     worker_cmd = worker_cmd_factory(result_path)
 
     heartbeat_events: list[dict[str, Any]] = []
@@ -132,11 +132,19 @@ def run_with_timeout(
     stage_started: float | None = None
     completed_stages: list[dict[str, Any]] = []
     started = time.monotonic()
+    debug = os.environ.get("ORCH_DEBUG_TIMEOUT") == "1"
 
     while proc.poll() is None:
         # consume heartbeat events
         while heartbeat_events:
             event = heartbeat_events.pop(0)
+            if debug:
+                print(
+                    f"[orch-debug] event={event.get('event')} stage={event.get('stage')} "
+                    f"backlog={len(heartbeat_events)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             if event.get("event") == "stage_start":
                 current_stage = event.get("stage")
                 stage_started = time.monotonic()
@@ -158,6 +166,13 @@ def run_with_timeout(
             and stage_started is not None
             and time.monotonic() - stage_started > spec.per_stage_timeout_seconds
         ):
+            if debug:
+                print(
+                    f"[orch-debug] FIRING timeout current={current_stage} "
+                    f"elapsed={time.monotonic() - stage_started:.1f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
             _terminate(proc, worker_cmd)
             _write_timeout_report(
                 spec=spec,
@@ -172,6 +187,15 @@ def run_with_timeout(
                 elapsed=time.monotonic() - stage_started,
                 timeout=spec.per_stage_timeout_seconds,
                 last_progress=_last_astar_line(stderr_lines),
+            )
+        if debug and current_stage is not None and stage_started is not None:
+            print(
+                f"[orch-debug] stage={current_stage} "
+                f"elapsed={time.monotonic() - stage_started:.1f}s "
+                f"timeout={spec.per_stage_timeout_seconds:.0f}s "
+                f"backlog={len(heartbeat_events)}",
+                file=sys.stderr,
+                flush=True,
             )
         time.sleep(0.25)
 

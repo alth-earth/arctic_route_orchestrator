@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from datetime import UTC, datetime
@@ -48,7 +47,8 @@ def _normal_worker(result_path: Path) -> list[str]:
         "import json,sys,time;"
         "print(json.dumps({'event':'stage_start','stage':'c_initial_planning'}), flush=True);"
         "time.sleep(0.2);"
-        "print(json.dumps({'event':'stage_done','stage':'c_initial_planning','duration_seconds':0.2}), flush=True);"
+        "print(json.dumps({'event':'stage_done','stage':'c_initial_planning',"
+        "'duration_seconds':0.2}), flush=True);"
         f"open({str(result_path)!r},'w').write(json.dumps({{'ok':True,'run_id':'x','planning_contract':'p','digests':{{}}}}));"
     )
     return [sys.executable, "-u", "-c", code]

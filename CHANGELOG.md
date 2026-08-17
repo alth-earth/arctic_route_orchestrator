@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased - 2026-08-17（RC2 development）
+
+- 新增 `coverage_preflight` 阶段：B full commit 后、endpoint mapping/C 前计算
+  `planning-coverage-preflight.json`（schema v1），逐帧报告 total/hard/land/
+  data_unavailable/navigable/unknown-navigable 与 missing_input_variable_counts；
+  gate 语义 = 每帧 unknown_navigable_nodes==0，失败在规划前报
+  `coverage_preflight_failed`；C 自身 RiskSamplingError fail-closed 保持不变。
+- 新增 RC1 golden 回归脚本 `scripts/rc1_golden_regression.py`：校验 r6/r7 的
+  initial/replanned layer-set 语义 digest 与 checksums。
+- 修复 CLI `run` 消费 worker 结果：`run_with_timeout` 返回 dict，CLI 原按
+  `FormalRunResult` 属性访问导致成功运行后报错；修复并新增 2 项 CLI 单测。
+- `timeout_runner` 增加 `ORCH_DEBUG_TIMEOUT=1` 环境变量调试输出（逐事件/逐阶段
+  elapsed），默认关闭，不影响正常行为。
+- 集成 fixture 改用 RC1 实际 B 配置 `demo_unvalidated_smoke_grid_v4.json`
+  （默认 0.75°×2.2° 网格与 corridor 2.2.0 终点允许区域无交点）；
+  integration 阶段集合同步加入 coverage_preflight。
+- 测试：非集成 18 passed（含 coverage preflight 与 CLI 单测）。
+
 ## Unreleased - 2026-08-15
 
 ## Unreleased - 2026-08-16（RC1）

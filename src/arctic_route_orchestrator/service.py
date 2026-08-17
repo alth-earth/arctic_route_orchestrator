@@ -9,6 +9,7 @@ import platform
 import resource
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -179,6 +180,36 @@ def execute_formal_run(
         _check_stage_timeout(
             spec, timings["b_build_and_full_commit_seconds"], stage,
         )
+
+        stage = "coverage_preflight"
+        if heartbeat is not None:
+            heartbeat({"event": "stage_start", "stage": stage})
+        stage_started = time.perf_counter()
+        stage_started_at = datetime.now(UTC)
+        coverage_preflight = _coverage_preflight(
+            spec=spec,
+            frames=frames,
+            expected_count=expected_count,
+            run_context=intake.run_context,
+        )
+        timings["coverage_preflight_seconds"] = time.perf_counter() - stage_started
+        _append_stage_record(
+            stage_records=stage_records,
+            spec=spec,
+            stage=stage,
+            started_at=stage_started_at,
+            duration_seconds=timings["coverage_preflight_seconds"],
+            status="completed",
+        )
+        if heartbeat is not None:
+            heartbeat(
+                {
+                    "event": "stage_done",
+                    "stage": stage,
+                    "duration_seconds": timings["coverage_preflight_seconds"],
+                }
+            )
+        _check_stage_timeout(spec, timings["coverage_preflight_seconds"], stage)
 
         stage = "endpoint_mapping"
         if heartbeat is not None:
@@ -365,6 +396,7 @@ def execute_formal_run(
             "execution-spec.json": spec.to_document(),
             "risk/full-window-commit.json": _window_document(full_commit),
             "risk/suffix-window-commit.json": _window_document(suffix_commit),
+            "planning-coverage-preflight.json": coverage_preflight,
             "run-context.json": run_context_to_dict(intake.run_context),
             "source-records.json": {
                 "schema_version": "orchestrator.source-records.v1",
@@ -692,6 +724,90 @@ def _window_document(window) -> dict[str, Any]:
     }
 
 
+def _coverage_preflight(
+    *,
+    spec: ExecutionSpec,
+    frames,
+    expected_count: int,
+    run_context,
+) -> dict[str, Any]:
+    """Fail-closed planning coverage gate computed from committed risk frames.
+
+    The gate requires zero ``unknown_navigable_nodes`` on every frame.  This
+    only makes the problem visible earlier; C's own ``RiskSamplingError``
+    fail-closed behaviour is intentionally unchanged.
+    """
+
+    frame_summaries: list[dict[str, Any]] = []
+    worst: dict[str, Any] | None = None
+    gate_passed = True
+    for index, frame in enumerate(frames):
+        payload = frame.payload
+        latitude = np.asarray(payload.coords["latitude"].values, dtype=float)
+        longitude = np.asarray(payload.coords["longitude"].values, dtype=float)
+        hard = np.asarray(payload["hard_mask"].values, dtype=bool)
+        risk = np.asarray(payload["risk_score"].values, dtype=float)
+        finite = np.isfinite(risk)
+        navigable = ~hard
+        land_nodes = 0
+        data_unavailable_nodes = 0
+        other_hard_nodes = 0
+        if "hard_reason" in payload.data_vars:
+            reasons = np.asarray(payload["hard_reason"].values)
+            land_nodes = int(np.count_nonzero(reasons == "LAND"))
+            data_unavailable_nodes = int(np.count_nonzero(reasons == "DATA_UNAVAILABLE"))
+            other_hard_nodes = int(np.count_nonzero(reasons == "OTHER"))
+        unknown_navigable = int(np.count_nonzero(navigable & ~finite))
+        if unknown_navigable:
+            gate_passed = False
+        summary = {
+            "frame_index": index,
+            "valid_time": _iso(frame.valid_time),
+            "total_nodes": int(latitude.size * longitude.size),
+            "hard_nodes": int(np.count_nonzero(hard)),
+            "land_nodes": land_nodes,
+            "data_unavailable_nodes": data_unavailable_nodes,
+            "other_hard_nodes": other_hard_nodes,
+            "navigable_nodes": int(np.count_nonzero(navigable)),
+            "unknown_navigable_nodes": unknown_navigable,
+            "finite_coverage_percent": round(
+                100.0
+                * np.count_nonzero(navigable & finite)
+                / max(1, int(np.count_nonzero(navigable))),
+                4,
+            ),
+            "missing_input_variable_counts": dict(
+                payload.attrs.get("missing_input_variable_counts", {})
+            ),
+        }
+        frame_summaries.append(summary)
+        if worst is None or unknown_navigable > worst["unknown_navigable_nodes"]:
+            worst = summary
+    document = {
+        "schema_version": "orchestrator.planning-coverage-preflight.v1",
+        "run_id": spec.run_id,
+        "scenario_id": spec.scenario_id,
+        "corridor_id": run_context.corridor_id,
+        "generation_id": spec.generation_id,
+        "input_revision": spec.input_revision,
+        "frames_expected": expected_count,
+        "frames_checked": len(frame_summaries),
+        "gate_passed": gate_passed,
+        "gate_semantics": (
+            "unknown_navigable_nodes must equal 0 on every frame; "
+            "C fail-closed RiskSamplingError remains active"
+        ),
+        "worst_frame": worst,
+        "frames": frame_summaries,
+    }
+    if not gate_passed:
+        raise OrchestrationError(
+            "coverage_preflight_failed",
+            "unknown-navigable nodes remain on the risk window; refusing to plan",
+        )
+    return document
+
+
 def _run_report(
     *,
     spec: ExecutionSpec,
@@ -712,6 +828,8 @@ def _run_report(
         spec.planning_contract,
         replanning.batch if spec.planning_contract == "cd.route-plan.v2" else replanning.outcome,
     )
+    a_input = asdict(intake.report)
+    a_input["requested_data_types"] = list(a_input["requested_data_types"])
     return {
         "schema_version": "orchestrator.run-report.v1",
         "status": "success",
@@ -746,7 +864,7 @@ def _run_report(
             "replanned_route_semantic_identity": replanned_identity,
         },
         "a_input": {
-            **asdict(intake.report),
+            **a_input,
             "source_records": [asdict(record) for record in intake.source_records],
         },
         "b_output": {

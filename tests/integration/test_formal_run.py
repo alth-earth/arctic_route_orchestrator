@@ -37,7 +37,7 @@ B_CONFIG = (
     / "work_package_b"
     / "configs"
     / "models"
-    / "demo_unvalidated_v2.json"
+    / "demo_unvalidated_smoke_grid_v4.json"
 )
 SCENARIO_ID = "murmansk_dikson_july_2026_retrospective_v1"
 CORRIDOR_ID = "offshore_murmansk_to_offshore_dikson"
@@ -333,6 +333,7 @@ def test_formal_archive_to_b_to_c_and_six_hour_replan(
     assert {record["stage"] for record in stage_report["stages"]} == {
         "initialization",
         "b_build",
+        "coverage_preflight",
         "endpoint_mapping",
         "c_initial_planning",
         "b_suffix_commit",

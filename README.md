@@ -19,8 +19,10 @@
   CLI `run` 已切换；单测覆盖。
 - A* 心跳：`C_ASTAR_PROGRESS_SECONDS`（30s 示例见 r6/r7 日志）。
 - 成功报告仍为 `demo_unvalidated`，并明确 `navigation_use=prohibited`。
-- 验证边界：r6/r7 完整 E2E 由旧内联路径产生；**worker-mode full RC1 E2E = NOT RUN**
-  （pre-demo 必做）。
+- 验证边界：r6/r7 完整 E2E 由旧内联路径产生；RC2 已用真实 RC1 冻结 bundle 跑通
+  **worker-mode full v3 E2E**（8 阶段 completed，业务结果与 r6 一致），并发现修复
+  CLI 对 worker dict 结果的消费 bug；真实 C 超时冒烟 PASS
+  （`scripts/real_c_timeout_worker.py`，四层 A* 45.2s 中断）。
 
 ## 接手顺序
 
