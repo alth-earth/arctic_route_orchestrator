@@ -171,7 +171,9 @@ class SimulationSnapshot:
 
     def with_digest(self) -> SimulationSnapshot:
         document = self.to_dict()
-        digest = replay_semantic_digest(document)
+        digest = replay_semantic_digest(
+            {key: value for key, value in document.items() if key != "snapshot_digest"}
+        )
         return replace(self, snapshot_digest=digest)
 
 

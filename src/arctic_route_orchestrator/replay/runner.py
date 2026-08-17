@@ -205,6 +205,7 @@ class ReplayRunner:
         "full_voyage",
     )
     planning_blockers: tuple[str, ...] = ()
+    _route_integrity: dict[str, Any] | None = None
     events: list[ReplayEvent] = field(default_factory=list)
     snapshots: list[dict[str, Any]] = field(default_factory=list)
     _model_config_digest: str = ""
@@ -379,8 +380,8 @@ class ReplayRunner:
             snapshots=tuple(self.snapshots),
             events=tuple(self.events),
             resources={
-                "risk_store": str(self.paths.risk_store_root),
-                "snapshots": str(self.paths.snapshots_dir),
+                "risk_store": "risk-store",
+                "snapshots": "snapshots",
             },
             provenance={
                 "runner": "arctic_route_orchestrator.replay.runner",
@@ -457,7 +458,7 @@ class ReplayRunner:
             model_config=risk_configuration.model_config,
         )
         self._model_config_digest = request.model_config_digest
-        frames = RiskBuildService(utc_now=lambda: datetime.now(UTC)).build_window(request)
+        frames = RiskBuildService(utc_now=lambda: tick).build_window(request)
         store = PersistentRiskStore(self.paths.risk_store_root)
         store.bind_generation_authority(_replay_run_id(self.replay_id), SimulationClock(tick))
         self.risk_commit = store.publish_window(frames)
@@ -564,6 +565,7 @@ class ReplayRunner:
             prepared = self.ingress.prepare(request)
             outcome = prepared.execute_four_layer()
             self.current_plan = outcome.plan_set.recommended
+            self._audit_and_attach_route()
             self.plan_revision = 1
             self.supported_layers = (
                 "executable_0_6h",
@@ -582,7 +584,11 @@ class ReplayRunner:
                 )
             )
         except Exception as exc:  # fail-closed: classify, never fake success
-            self.planning_blockers = (f"{type(exc).__name__}: {exc}",)
+            v2_blocker = self._probe_v2(tick)
+            self.planning_blockers = (
+                f"{type(exc).__name__}: {exc}",
+                *(v2_blocker,),
+            )
             self.unsupported_layers = (
                 "executable_0_6h",
                 "rolling_0_24h",
@@ -613,12 +619,15 @@ class ReplayRunner:
             if outcome.decision.triggered and outcome.outcome is not None:
                 self.plan_revision += 1
                 self.current_plan = outcome.outcome.plan_set.recommended
+                self._audit_and_attach_route()
                 events.append(
                     ReplayEvent(
                         type="REPLAN_TRIGGERED",
                         simulation_time=_iso(tick),
                         revision=str(self.plan_revision),
-                        description=",".join(reason.value for reason in outcome.decision.reasons),
+                        description=",".join(
+                            reason.value for reason in outcome.decision.reasons
+                        ),
                         observed=True,
                     )
                 )
@@ -649,6 +658,28 @@ class ReplayRunner:
                     description=str(exc)[:300],
                     observed=True,
                 )
+            )
+
+    def _probe_v2(self, tick: datetime) -> str | None:
+        """Independent second C-API probe (v2 batch) for honest evidence."""
+
+        try:
+            request = self._planning_request(tick, input_revision=0)
+            prepared = self.ingress.prepare(request)
+            prepared.execute()
+            return None
+        except Exception as exc:
+            return f"v2 probe: {type(exc).__name__}: {exc}"
+
+    def _audit_and_attach_route(self) -> None:
+        from arctic_route_orchestrator.replay.route_integrity import audit_route
+
+        integrity = audit_route(self.current_plan, self.risk_commit.frames)
+        self._route_integrity = integrity
+        if integrity["status"] != "PASS":
+            self.planning_blockers = (
+                *self.planning_blockers,
+                f"route integrity FAIL: {integrity['violations'][:3]}",
             )
 
     def _planning_request(self, tick: datetime, *, input_revision: int) -> ServicePlanningRequest:
