@@ -28,6 +28,10 @@
 - Demo Candidate 2：D `demo serve` 提供 `/api/live/start` 与
   `/api/live/status`，Viewer 页面按钮可直接驱动上述 runner 并显示
   elapsed/stage 进度；正式计算仍走同一 worker/watchdog 路径。
+- Route Geospatial Integrity（2026-08-17）：D 侧新增机器 gate
+  （`demo geo-integrity` + preflight 硬门），审计冻结 v3 制品与风险帧的
+  路线地理完整性；修复 Viewer 双投影导致的视觉穿 LAND。编排器核心路径
+  无改动，正式计算仍走 worker/watchdog。
 
 ## 接手顺序
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased - 2026-08-17（Route Geospatial Integrity）
+
+- 编排器核心无改动；D 新增 Route Geospatial Integrity gate
+  （`demo geo-integrity` + preflight 硬门），对冻结 v3 制品与 committed
+  risk frames 做 waypoint/edge/角切/时间映射/投影一致性机器审计；
+  Viewer 双投影 bug 在 D 侧修复，路线与格子共用同一地理投影。
+
 ## Unreleased - 2026-08-17（Demo Candidate 2）
 
 - Demo live runner 无核心变更；D `demo serve` 新增
