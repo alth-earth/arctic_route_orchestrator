@@ -15,6 +15,21 @@
   （v3 + v2 probe），记录 PLANNING-HORIZON ARCHITECTURE BLOCKER；
   未修改 frozen retrospective 路径；测试：replay unit 21 + 既有 25。
 
+## Unreleased - 2026-08-18 第二轮（Causal Planning Horizon Resolution）
+
+- 三窗口解耦：`risk_forecast_end`（77h，08-18T15:00Z）独立于
+  `replay_end`；规划场景 horizon 用 corridor 对齐值（96h），C 查询
+  maximum_elapsed 限制在 risk forecast end；
+- `--v2-only`：v3 four-layer 失败时 v2 complete-route fallback 并正式
+  集成（replan input_revision 严格递增、REPLAN_TRIGGERED/ROUTE_CHANGED）；
+- 真实 12h 集成回放：13 snapshots、plan_revision 1→13、B build 1 次 +
+  reuse 12、route integrity 13×3 全 PASS、validation PASS；
+- determinism：13/13 snapshot digest + manifest digest 一致，
+  generated_at（墙钟）允许不同（语义 digest 排除 resource/route 身份）；
+- 性能：12h≈36–38min、peak RSS≈824MB、C 规划占耗时 ≥95%；
+- v3 four-layer = main_corridor contract-edge blocker（cap 无余量），
+  本轮不改 C，记录为 TD-32。
+
 ## Unreleased - 2026-08-17（Route Geospatial Integrity）
 
 - 编排器核心无改动；D 新增 Route Geospatial Integrity gate

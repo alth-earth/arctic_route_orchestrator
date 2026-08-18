@@ -39,6 +39,11 @@
   真实 Scenario B 12h/24h/44h 因果回放 PASS（engine），C 四层 =
   PLANNING-HORIZON BLOCKER（诚实 fail-closed）；Strategy A 冻结路径不受
   影响。详见 `CAUSAL_REPLAY_MVP_20260818.md`。
+- Causal Planning Horizon Resolution（2026-08-18 第二轮）：replay /
+  risk forecast / planning 三窗口解耦（77h causal forecast）；
+  `--v2-only` 提供 v2 complete-route 真实规划并集成 12h 回放
+  （plan_revision 1→13、route integrity PASS）；v3 four-layer =
+  main_corridor contract-edge blocker（待 C 合同 proposal）。
 
 ## 接手顺序
 
