@@ -32,6 +32,7 @@ from typing import Any
 
 from arctic_route_contracts import (
     RunContext,
+    canonical_sha256,
     configuration_digest,
     load_run_context,
 )
@@ -42,6 +43,7 @@ from arctic_route_data import (
 )
 from arctic_route_data.causal_replay import (
     REQUIRED_FORMAL_DATA_TYPES,
+    STATIC_TYPES,
     SourceRecord,
     load_manifest_records,
 )
@@ -166,6 +168,7 @@ class ReplayRunner:
     corridor_id: str
     replay_start: datetime
     replay_end: datetime
+    risk_forecast_end: datetime | None = None
     tick_cadence_hours: int
     a_data_root: Path
     manifest_path: Path
@@ -197,6 +200,7 @@ class ReplayRunner:
     risk_valid_end: datetime | None = None
     prediction_as_of: datetime | None = None
     current_plan: Any = None
+    current_plan_set: Any = None
     supported_layers: tuple[str, ...] = ()
     unsupported_layers: tuple[str, ...] = (
         "executable_0_6h",
@@ -231,6 +235,15 @@ class ReplayRunner:
             self.c_config_root,
             self.scenario_id,
             shared_config_root=self.contracts_config_root,
+        )
+        self.risk_forecast_end = self.risk_forecast_end or _common_causal_valid_end(
+            self.records,
+            self.replay_start,
+        )
+        self.configuration = _replay_configuration(
+            self.configuration,
+            replay_start=self.replay_start,
+            forecast_end=self.risk_forecast_end,
         )
         start_index = 0
         if resume and self.paths.checkpoint_path.is_file():
@@ -427,9 +440,8 @@ class ReplayRunner:
         clock = SimulationClock(tick)
         cache = PartitionedABCache(max_memory_mb=self.cache_memory_mb)
         work = WorkPackageA(source=source, clock=clock, cache=cache)
-        horizon_hours = int(
-            (self.replay_end - tick).total_seconds() // 3600
-        )
+        forecast_end = self.risk_forecast_end or self.replay_end
+        horizon_hours = int((forecast_end - tick).total_seconds() // 3600)
         prepared = work.prepare_window_for_b(
             route_id=self.corridor_id,
             data_types=sorted(REQUIRED_FORMAL_DATA_TYPES),
@@ -448,7 +460,7 @@ class ReplayRunner:
             generation_id=0,
             knowledge_as_of=tick,
             requested_start=tick,
-            requested_end=self.replay_end,
+            requested_end=forecast_end,
         )
         risk_configuration = load_risk_build_configuration(str(self.b_config_path))
         request = RiskBuildRequest(
@@ -458,7 +470,7 @@ class ReplayRunner:
             model_config=risk_configuration.model_config,
         )
         self._model_config_digest = request.model_config_digest
-        frames = RiskBuildService(utc_now=lambda: tick).build_window(request)
+        frames = RiskBuildService(utc_now=lambda: datetime.now(UTC)).build_window(request)
         store = PersistentRiskStore(self.paths.risk_store_root)
         store.bind_generation_authority(_replay_run_id(self.replay_id), SimulationClock(tick))
         self.risk_commit = store.publish_window(frames)
@@ -468,7 +480,7 @@ class ReplayRunner:
         self.risk_valid_end = frames[-1].valid_time
         self.prediction_as_of = tick
         self.risk_revision += 1
-        self.run_context = self._c_run_context(base_context)
+        self.run_context = base_context
         self.ingress = RiskSourcePlanningIngress(
             source=store,
             configuration=self.configuration,
@@ -481,8 +493,9 @@ class ReplayRunner:
 
     def _replay_run_context(self, bundle) -> RunContext:
         base = load_run_context(self.frozen_run_context_path)
+        scenario = self.configuration.scenario
         digest = configuration_digest(
-            self.configuration.scenario,
+            scenario,
             self.configuration.corridor,
             self.configuration.vessel,
             dataset_bundle_id=bundle.bundle_id,
@@ -494,23 +507,11 @@ class ReplayRunner:
             created_at=datetime.now(UTC),
             scenario_mode=base.scenario_mode,
             simulation_start=self.replay_start,
-            simulation_end=self.replay_end,
+            simulation_end=self.risk_forecast_end or self.replay_end,
+            scenario_digest=canonical_sha256(scenario),
             dataset_bundle_id=bundle.bundle_id,
             dataset_bundle_digest=bundle.bundle_digest,
             config_digest=digest,
-        )
-
-    def _c_run_context(self, b_context: RunContext) -> RunContext:
-        """C requires the RunContext window to equal the scenario window."""
-
-        base = load_run_context(self.frozen_run_context_path)
-        return replace(
-            base,
-            run_id=b_context.run_id,
-            created_at=b_context.created_at,
-            dataset_bundle_id=b_context.dataset_bundle_id,
-            dataset_bundle_digest=b_context.dataset_bundle_digest,
-            config_digest=b_context.config_digest,
         )
 
     def _window_identity(self, tick: datetime):
@@ -536,6 +537,12 @@ class ReplayRunner:
                 plan_revision=self.plan_revision,
                 planning_as_of=_iso(tick),
                 departure_time=_iso(tick),
+                planning_valid_start=_iso(tick),
+                planning_valid_end=(
+                    _iso(self.risk_forecast_end)
+                    if self.risk_forecast_end
+                    else None
+                ),
                 unsupported_layers=self.unsupported_layers,
                 blockers=("RISK_NOT_READY",),
             )
@@ -554,6 +561,12 @@ class ReplayRunner:
             plan_revision=self.plan_revision,
             planning_as_of=_iso(tick),
             departure_time=_iso(tick),
+            planning_valid_start=_iso(tick),
+            planning_valid_end=(
+                _iso(self.risk_forecast_end)
+                if self.risk_forecast_end
+                else None
+            ),
             supported_layers=self.supported_layers,
             unsupported_layers=self.unsupported_layers,
             blockers=self.planning_blockers,
@@ -564,6 +577,7 @@ class ReplayRunner:
         try:
             prepared = self.ingress.prepare(request)
             outcome = prepared.execute_four_layer()
+            self.current_plan_set = outcome.plan_set
             self.current_plan = outcome.plan_set.recommended
             self._audit_and_attach_route()
             self.plan_revision = 1
@@ -618,6 +632,7 @@ class ReplayRunner:
             outcome = prepared.replan_four_layer_if_needed(request, observation)
             if outcome.decision.triggered and outcome.outcome is not None:
                 self.plan_revision += 1
+                self.current_plan_set = outcome.outcome.plan_set
                 self.current_plan = outcome.outcome.plan_set.recommended
                 self._audit_and_attach_route()
                 events.append(
@@ -674,12 +689,25 @@ class ReplayRunner:
     def _audit_and_attach_route(self) -> None:
         from arctic_route_orchestrator.replay.route_integrity import audit_route
 
-        integrity = audit_route(self.current_plan, self.risk_commit.frames)
-        self._route_integrity = integrity
-        if integrity["status"] != "PASS":
+        plans = []
+        plan_set = getattr(self, "current_plan_set", None)
+        if plan_set is not None:
+            for bundle in plan_set.layers:
+                for _objective, plan in bundle.plans.items():
+                    plans.append(plan)
+        else:
+            plans.append(self.current_plan)
+        audits = [audit_route(plan, self.risk_commit.frames) for plan in plans]
+        overall = "PASS" if all(item["status"] == "PASS" for item in audits) else "FAIL"
+        self._route_integrity = {
+            "status": overall,
+            "routes": audits,
+        }
+        if overall != "PASS":
             self.planning_blockers = (
                 *self.planning_blockers,
-                f"route integrity FAIL: {integrity['violations'][:3]}",
+                "route integrity FAIL: "
+                f"{[a['status'] for a in audits if a['status'] != 'PASS'][:3]}",
             )
 
     def _planning_request(self, tick: datetime, *, input_revision: int) -> ServicePlanningRequest:
@@ -698,7 +726,7 @@ class ReplayRunner:
             start_time=tick,
             start=self.endpoint_mapping.start.node,
             goal=self.endpoint_mapping.goal.node,
-            maximum_elapsed=self.replay_end - tick,
+            maximum_elapsed=None,
         )
 
     def _snapshot(
@@ -859,6 +887,42 @@ def _replay_run_id(replay_id: str) -> str:
 def _corridor_bbox(configuration) -> tuple[float, float, float, float]:
     box = configuration.corridor.data_bbox
     return (float(box.west), float(box.south), float(box.east), float(box.north))
+
+
+def _common_causal_valid_end(
+    records: tuple[SourceRecord, ...],
+    knowledge_as_of: datetime,
+) -> datetime:
+    """Largest valid end supported by every required dynamic type at the
+    knowledge cutoff (static layers use prior-support and never cap)."""
+
+    visible = tuple(
+        record for record in records if record.issue_time <= knowledge_as_of
+    )
+    dynamic_types = REQUIRED_FORMAL_DATA_TYPES - STATIC_TYPES
+    ends: list[datetime] = []
+    for data_type in sorted(dynamic_types):
+        valid_times = [
+            record.valid_time
+            for record in visible
+            if record.data_type == data_type
+        ]
+        if valid_times:
+            ends.append(max(valid_times))
+    return min(ends) if ends else knowledge_as_of
+
+
+def _replay_configuration(configuration, *, replay_start: datetime, forecast_end: datetime):
+    hours = int((forecast_end - replay_start).total_seconds() // 3600)
+    if (forecast_end - replay_start) != timedelta(hours=hours):
+        raise ValueError("risk forecast end must align to whole hours from replay start")
+    scenario = replace(
+        configuration.scenario,
+        simulation_start=replay_start,
+        simulation_end=forecast_end,
+        horizon_hours=hours,
+    )
+    return replace(configuration, scenario=scenario)
 
 
 def _query_from_commit_document(document: dict[str, Any]):

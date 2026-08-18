@@ -32,6 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replay-start", default="2026-08-15T10:00:00Z")
     parser.add_argument("--replay-end", default=None)
     parser.add_argument("--window-hours", type=int, default=12)
+    parser.add_argument("--risk-forecast-end", default=None)
     parser.add_argument("--tick-hours", type=int, default=1)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
@@ -87,6 +88,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.replay_end
         else replay_start + timedelta(hours=args.window_hours)
     )
+    risk_forecast_end = (
+        _parse_utc(args.risk_forecast_end)
+        if args.risk_forecast_end
+        else None
+    )
     output_root = args.output_root / args.replay_id
     runner = ReplayRunner(
         replay_id=args.replay_id,
@@ -94,6 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         corridor_id=args.corridor_id,
         replay_start=replay_start,
         replay_end=replay_end,
+        risk_forecast_end=risk_forecast_end,
         tick_cadence_hours=args.tick_hours,
         a_data_root=args.a_data_root,
         manifest_path=args.manifest,

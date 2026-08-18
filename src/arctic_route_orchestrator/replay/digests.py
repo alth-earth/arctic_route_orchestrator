@@ -25,6 +25,13 @@ _WALL_CLOCK_FIELDS = frozenset(
         "elapsed_seconds",
         "compute_ms",
         "duration_seconds",
+        # Provenance-derived identities that embed wall-clock (e.g. B frame
+        # generated_at) must not leak into the semantic digest.
+        "resource_identity",
+        "resource_digest",
+        "commit_id",
+        "content_digest",
+        "revision",
     }
 )
 

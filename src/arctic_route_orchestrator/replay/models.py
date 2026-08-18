@@ -93,6 +93,8 @@ class PlanningStateSummary:
     plan_revision: int
     planning_as_of: str
     departure_time: str
+    planning_valid_start: str | None = None
+    planning_valid_end: str | None = None
     supported_layers: tuple[str, ...] = ()
     unsupported_layers: tuple[str, ...] = ()
     blockers: tuple[str, ...] = ()
@@ -103,6 +105,8 @@ class PlanningStateSummary:
             "plan_revision": self.plan_revision,
             "planning_as_of": self.planning_as_of,
             "departure_time": self.departure_time,
+            "planning_valid_start": self.planning_valid_start,
+            "planning_valid_end": self.planning_valid_end,
             "supported_layers": list(self.supported_layers),
             "unsupported_layers": list(self.unsupported_layers),
             "blockers": list(self.blockers),
