@@ -34,8 +34,16 @@ def validate_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         violations.append("planning_as_of > knowledge_as_of")
     if snapshot["scenario_mode"] != "causal_replay":
         violations.append("scenario_mode != causal_replay")
-    if snapshot["ship_state"].get("status") != "DEFERRED":
-        violations.append("ship_state must be DEFERRED in v1")
+    ship_status = snapshot["ship_state"].get("status")
+    if ship_status not in ("DEFERRED", "ACTIVE", "ARRIVED"):
+        violations.append("ship_state.status is not DEFERRED/ACTIVE/ARRIVED")
+    if ship_status != "DEFERRED":
+        if "navigation_state_revision" not in snapshot["ship_state"]:
+            violations.append("active ship_state lacks navigation_state_revision")
+        if "accepted_plan_revision" not in snapshot["ship_state"]:
+            violations.append("active ship_state lacks accepted_plan_revision")
+        if "executed_until" not in snapshot["ship_state"]:
+            violations.append("active ship_state lacks executed_until")
     expected = replay_semantic_digest(
         {key: value for key, value in snapshot.items() if key != "snapshot_digest"}
     )
@@ -56,6 +64,8 @@ def validate_replay(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     previous_time: datetime | None = None
     previous_index: int | None = None
     previous_revisions: dict[str, int] = {}
+    previous_nav: dict[str, Any] | None = None
+    previous_position: tuple[float, float] | None = None
     for snapshot in snapshots:
         result = validate_snapshot(snapshot)
         violations.extend(
@@ -72,6 +82,13 @@ def validate_replay(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
             "b_input": snapshot["visibility"]["b_input_revision"],
             "risk": snapshot["risk"]["risk_revision"],
             "plan": snapshot["planning"]["plan_revision"],
+            "risk_window": snapshot["risk"].get("risk_window_revision", 0),
+            "observation_sequence": snapshot["planning"].get(
+                "observation_sequence", 0
+            ),
+            "navigation": snapshot["ship_state"].get(
+                "navigation_state_revision", 0
+            ),
         }
         for name, value in revisions.items():
             if (
@@ -80,6 +97,42 @@ def validate_replay(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
             ):
                 violations.append(f"{name}_revision moved backwards")
         previous_revisions = revisions
+        ship = snapshot["ship_state"]
+        if ship.get("status") != "DEFERRED":
+            if (
+                previous_nav is not None
+                and ship.get("accepted_plan_revision", 0)
+                < previous_nav.get("accepted_plan_revision", 0)
+            ):
+                violations.append("accepted_plan_revision moved backwards")
+            previous_count = (
+                len(previous_nav.get("completed_track", ()))
+                if previous_nav is not None
+                else 0
+            )
+            current_count = len(ship.get("completed_track", ()))
+            if current_count < previous_count:
+                violations.append("completed_track shrank (history rewrote)")
+            position = ship.get("current_position")
+            if position and previous_position:
+                delta_km = _haversine_km(
+                    previous_position,
+                    (position["longitude"], position["latitude"]),
+                )
+                if delta_km > 80.0:
+                    violations.append(
+                        f"navigation teleport candidate: {delta_km:.1f} km in one tick"
+                    )
+        if ship.get("status") != "DEFERRED":
+            previous_position = (
+                (ship["current_position"]["longitude"], ship["current_position"]["latitude"])
+                if ship.get("current_position")
+                else None
+            )
+            previous_nav = ship
+        else:
+            previous_nav = None
+            previous_position = None
         previous_time = current_time
         previous_index = snapshot["snapshot_index"]
     return {
@@ -112,3 +165,17 @@ def validate_manifest(manifest: dict[str, Any], snapshots: list[dict[str, Any]])
         "status": "PASS" if not violations else "FAIL",
         "violations": violations,
     }
+
+
+def _haversine_km(start: tuple[float, float], end: tuple[float, float]) -> float:
+    import math
+
+    lon1, lat1 = (math.radians(value) for value in start)
+    lon2, lat2 = (math.radians(value) for value in end)
+    delta_lat = lat2 - lat1
+    delta_lon = lon2 - lon1
+    a = (
+        math.sin(delta_lat / 2.0) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2.0) ** 2
+    )
+    return 2.0 * 6_371.0088 * math.asin(min(1.0, math.sqrt(a)))

@@ -82,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--max-snap-km", type=float, default=30.0)
     parser.add_argument("--cache-memory-mb", type=float, default=2048.0)
+    parser.add_argument("--planning-workers", type=int, default=1)
     args = parser.parse_args(argv)
 
     replay_start = _parse_utc(args.replay_start)
@@ -114,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         frozen_run_context_path=args.frozen_run_context,
         max_snap_km=args.max_snap_km,
         cache_memory_mb=args.cache_memory_mb,
+        planning_workers=args.planning_workers,
     )
 
     def progress(item: dict) -> None:

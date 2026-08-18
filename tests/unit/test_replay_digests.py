@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 from arctic_route_data.causal_replay import SourceRecord
+from arctic_route_planning.adapters.fixture import FixtureRiskSource
+from arctic_route_planning.config import load_configuration
+from arctic_route_planning.development import create_development_run_context
 
 from arctic_route_orchestrator.replay.digests import (
     b_relevant_input_digest,
     replay_semantic_digest,
+    risk_semantic_digest,
+    route_semantic_digest,
     visible_record_set_digest,
 )
 
@@ -148,3 +154,120 @@ def test_semantic_digest_excludes_wall_clock() -> None:
     assert replay_semantic_digest(base) == replay_semantic_digest(other)
     changed = {"simulation_time": "2026-08-15T11:00:00Z", "plan": "abc"}
     assert replay_semantic_digest(base) != replay_semantic_digest(changed)
+
+
+def _synthetic_frames():
+    config = load_configuration(
+        "/root/my_project/work_package_c/configs",
+        "tromso_isfjorden_july_2026_retrospective_v1",
+    )
+    fixture = FixtureRiskSource(
+        scenario=config.scenario,
+        corridor=config.corridor,
+        vessel=config.vessel,
+        run_context=create_development_run_context(config, source_kind="synthetic"),
+        frame_count=2,
+        shape=(5, 7),
+    )
+    return tuple(fixture.frames)
+
+
+def test_risk_semantic_digest_changes_with_business_mutation() -> None:
+    frames = _synthetic_frames()
+    original = risk_semantic_digest(frames)
+    mutated = replace(
+        frames[0],
+        risk_id=f"{frames[0].risk_id}-revision",
+        generated_at=frames[0].generated_at + timedelta(hours=1),
+    )
+    payload = dict(mutated.payload.data_vars)
+    payload["confidence"] = (
+        ("latitude", "longitude"),
+        (
+            mutated.payload["confidence"].values - 0.05
+        ).astype("float32"),
+    )
+    from xarray import Dataset
+
+    mutated = replace(
+        mutated,
+        payload=Dataset(
+            payload,
+            coords=mutated.payload.coords,
+            attrs=mutated.payload.attrs,
+        ),
+    )
+    # wall-clock generated_at alone must not change the digest
+    wall_clock_only = replace(frames[0], generated_at=frames[0].generated_at + timedelta(hours=2))
+    assert risk_semantic_digest((wall_clock_only, *frames[1:])) == original
+    assert risk_semantic_digest((mutated, *frames[1:])) != original
+
+
+class _MetricNamespace:
+    def __init__(self, **values) -> None:
+        self.__dict__.update(values)
+
+
+class _WaypointNamespace:
+    def __init__(self, longitude, latitude, eta) -> None:
+        self.longitude = longitude
+        self.latitude = latitude
+        self.eta = eta
+
+
+class _RouteNamespace:
+    def __init__(self, waypoints, metrics, **values) -> None:
+        self.waypoints = waypoints
+        self.metrics = metrics
+        self.__dict__.update(values)
+
+
+def _sample_route(*, waypoint_latitude=70.0):
+    eta0 = datetime(2026, 8, 15, 10, tzinfo=UTC)
+    eta1 = datetime(2026, 8, 15, 12, tzinfo=UTC)
+    metrics = _MetricNamespace(
+        distance_km=120.0,
+        eta_hours=2.0,
+        avg_risk=0.3,
+        max_risk=0.5,
+        integrated_risk_hours=0.6,
+        minimum_confidence=0.8,
+        hard_constraint_violations=0,
+        turn_count=2,
+        expanded_nodes=100,
+        objective_cost=3.2,
+    )
+    return _RouteNamespace(
+        (
+            _WaypointNamespace(12.0, 69.0, eta0),
+            _WaypointNamespace(14.0, waypoint_latitude, eta1),
+        ),
+        metrics,
+        objective_mode="recommended",
+        plan_kind="initial",
+        start_time=eta0,
+        as_of_time=eta0,
+        planning_layer="full_voyage",
+        destination_reached=True,
+        replan_reasons=(),
+    )
+
+
+def test_route_semantic_digest_mutation_sensitivity() -> None:
+    base = _sample_route()
+    wall_clock_identity = _RouteNamespace(
+        base.waypoints,
+        base.metrics,
+        objective_mode="recommended",
+        plan_kind="initial",
+        start_time=base.start_time,
+        as_of_time=base.as_of_time,
+        planning_layer="full_voyage",
+        destination_reached=True,
+        replan_reasons=(),
+        generated_at="wall-clock-A",
+        plan_id="route-id-A",
+    )
+    assert route_semantic_digest(base) == route_semantic_digest(wall_clock_identity)
+    mutated = _sample_route(waypoint_latitude=70.5)
+    assert route_semantic_digest(base) != route_semantic_digest(mutated)

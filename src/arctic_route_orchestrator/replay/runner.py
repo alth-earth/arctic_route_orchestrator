@@ -51,16 +51,21 @@ from arctic_route_data.causal_replay import (
 )
 from arctic_route_planning.config import load_configuration
 from arctic_route_planning.contracts import ProvenanceKind
+from arctic_route_planning.domain import ReplanReason
 from arctic_route_planning.endpoints import map_corridor_endpoints
+from arctic_route_planning.grid import RegularGrid, haversine_km
 from arctic_route_planning.ingress import RiskSourcePlanningIngress
 from arctic_route_planning.service import ServicePlanningRequest
 
 from arctic_route_orchestrator.replay.digests import (
     b_relevant_input_digest,
+    risk_semantic_digest,
+    route_semantic_digest,
     visible_record_set_digest,
 )
 from arctic_route_orchestrator.replay.models import (
     DataVisibilitySummary,
+    NavigationExecutionState,
     PlanningStateSummary,
     ReadinessSummary,
     ReplayEvent,
@@ -183,6 +188,7 @@ class ReplayRunner:
     max_snap_km: float = 30.0
     cache_memory_mb: float = 2048.0
     c_attempt_timeout_seconds: int = 900
+    planning_workers: int = 1
 
     records: tuple[SourceRecord, ...] = ()
     run_context: RunContext | None = None
@@ -198,6 +204,12 @@ class ReplayRunner:
     risk_revision: int = 0
     plan_revision: int = 0
     input_revision: int = 0
+    observation_sequence: int = 0
+    risk_window_revision: int = 0
+    navigation_state_revision: int = 0
+    risk_semantic_digest: str = ""
+    route_semantic_digests: dict[str, dict[str, str]] = field(default_factory=dict)
+    last_replan_reasons: tuple[str, ...] = ()
 
     risk_commit: Any = None
     window_commit: Any = None
@@ -225,7 +237,11 @@ class ReplayRunner:
     _last_visible_digest: str = ""
     _last_relevant_digest: str = ""
     _last_data_revision: int = 0
+    _last_window_identity: str = ""
     _initial_plan_attempted: bool = False
+    nav_state: NavigationExecutionState | None = None
+    _grid: Any = None
+    _hard_mask: Any = None
 
     def run(
         self,
@@ -332,6 +348,14 @@ class ReplayRunner:
                 )
                 events.append(
                     ReplayEvent(
+                        type="RISK_CONTENT_UPDATED",
+                        simulation_time=_iso(tick),
+                        revision=str(self.risk_revision),
+                        observed=True,
+                    )
+                )
+                events.append(
+                    ReplayEvent(
                         type="RISK_REVISION_CHANGED",
                         simulation_time=_iso(tick),
                         revision=str(self.risk_revision),
@@ -348,11 +372,27 @@ class ReplayRunner:
                     )
                 )
             self.window_commit = self._window_identity(tick)
+            if (
+                self.window_commit is not None
+                and self.window_commit.commit_id != self._last_window_identity
+            ):
+                self.risk_window_revision += 1
+                events.append(
+                    ReplayEvent(
+                        type="RISK_WINDOW_ADVANCED",
+                        simulation_time=_iso(tick),
+                        revision=str(self.risk_window_revision),
+                        description=self.window_commit.commit_id,
+                        observed=False,
+                    )
+                )
+                self._last_window_identity = self.window_commit.commit_id
             self._last_visible_digest = visible_digest
             self._last_relevant_digest = relevant_digest
             self._last_data_revision = self.data_revision
 
             planning = self._planning_tick(tick, index, events, progress=progress)
+            self._update_navigation(tick)
 
             snapshot = self._snapshot(
                 index=index,
@@ -432,14 +472,21 @@ class ReplayRunner:
             "data_revision": self.data_revision,
             "b_input_revision": self.b_input_revision,
             "risk_revision": self.risk_revision,
+            "risk_content_revision": self.risk_revision,
+            "risk_window_revision": self.risk_window_revision,
             "plan_revision": self.plan_revision,
+            "observation_sequence": self.observation_sequence,
+            "navigation_state_revision": self.navigation_state_revision,
             "risk_commit_id": self.risk_commit.commit_id if self.risk_commit else None,
             "risk_valid_start": _iso(self.risk_valid_start) if self.risk_valid_start else None,
             "risk_valid_end": _iso(self.risk_valid_end) if self.risk_valid_end else None,
+            "risk_semantic_digest": self.risk_semantic_digest,
             "supported_layers": list(self.supported_layers),
             "unsupported_layers": list(self.unsupported_layers),
             "planning_blockers": list(self.planning_blockers),
             "v2_probe_eta_hours": self.v2_probe_eta_hours,
+            "planning_workers": self.planning_workers,
+            "route_semantic_digests": self.route_semantic_digests,
             "events": [event.to_dict() for event in self.events],
             "total_elapsed_seconds": round(time.perf_counter() - started, 1),
             "peak_rss_mb": round(_rss_mb(), 1),
@@ -500,6 +547,9 @@ class ReplayRunner:
         self.risk_valid_end = frames[-1].valid_time
         self.prediction_as_of = tick
         self.risk_revision += 1
+        self.risk_window_revision += 1
+        self.risk_semantic_digest = risk_semantic_digest(frames)
+        self._last_window_identity = self.risk_commit.commit_id
         self.run_context = self._c_run_context(base_context)
         self.ingress = RiskSourcePlanningIngress(
             source=store,
@@ -606,6 +656,9 @@ class ReplayRunner:
                 if self._route_integrity is not None
                 else {}
             ),
+            observation_sequence=self.observation_sequence,
+            replan_reasons=self.last_replan_reasons,
+            route_semantic_digests=dict(self.route_semantic_digests),
         )
 
     def _attempt_initial_plan(self, tick: datetime, events: list[ReplayEvent]) -> None:
@@ -619,6 +672,7 @@ class ReplayRunner:
             self.current_plan_set = outcome.plan_set
             self.current_plan = outcome.plan_set.recommended
             self._audit_and_attach_route()
+            self._attach_route_digests()
             self.plan_revision = 1
             self.supported_layers = (
                 "executable_0_6h",
@@ -664,6 +718,7 @@ class ReplayRunner:
             self.plan_revision = 1
             self.plan_kind = "v2_complete_route_fallback"
             self._audit_and_attach_route()
+            self._attach_route_digests()
             self.supported_layers = ("full_voyage_complete_route",)
             self.unsupported_layers = (
                 "executable_0_6h",
@@ -709,11 +764,29 @@ class ReplayRunner:
             )
 
     def _attempt_replan(self, tick: datetime, events: list[ReplayEvent]) -> None:
-        self.input_revision += 1
-        request = self._planning_request(tick, input_revision=self.input_revision)
+        origin = self._origin_for_tick(tick)
+        if origin is None:
+            events.append(
+                ReplayEvent(
+                    type="PLAN_REUSED",
+                    simulation_time=_iso(tick),
+                    revision=str(self.plan_revision),
+                    description="vessel arrived; no further replan origin",
+                    observed=True,
+                )
+            )
+            self.last_replan_reasons = ()
+            return
+        self.observation_sequence += 1
+        self.input_revision = self.observation_sequence
+        request = self._planning_request(
+            tick,
+            input_revision=self.observation_sequence,
+            start=origin,
+        )
         observation = _observation(
             tick=tick,
-            data_revision=self.input_revision,
+            data_revision=self.observation_sequence,
             risk_revision=self.window_commit.commit_id,
             plan=self.current_plan,
         )
@@ -728,6 +801,7 @@ class ReplayRunner:
                     self.current_batch = outcome.batch
                     self.current_plan_set = None
                     self._audit_and_attach_route()
+                    self._attach_route_digests()
             else:
                 outcome = prepared.replan_four_layer_if_needed(observation)
                 triggered = outcome.decision.triggered and outcome.outcome is not None
@@ -736,15 +810,17 @@ class ReplayRunner:
                     self.current_plan_set = outcome.outcome.plan_set
                     self.current_plan = outcome.outcome.plan_set.recommended
                     self._audit_and_attach_route()
+                    self._attach_route_digests()
+            self.last_replan_reasons = _honest_replan_reasons(
+                outcome.decision.reasons, events
+            )
             if triggered:
                 events.append(
                     ReplayEvent(
                         type="REPLAN_TRIGGERED",
                         simulation_time=_iso(tick),
                         revision=str(self.plan_revision),
-                        description=",".join(
-                            reason.value for reason in outcome.decision.reasons
-                        ),
+                        description=",".join(self.last_replan_reasons),
                         observed=True,
                     )
                 )
@@ -762,6 +838,7 @@ class ReplayRunner:
                         type="PLAN_REUSED",
                         simulation_time=_iso(tick),
                         revision=str(self.plan_revision),
+                        description=",".join(self.last_replan_reasons),
                         observed=True,
                     )
                 )
@@ -831,7 +908,16 @@ class ReplayRunner:
                 f"{[a['status'] for a in audits if a['status'] != 'PASS'][:3]}",
             )
 
-    def _planning_request(self, tick: datetime, *, input_revision: int) -> ServicePlanningRequest:
+    def _planning_request(
+        self,
+        tick: datetime,
+        *,
+        input_revision: int,
+        start: tuple[int, int] | None = None,
+    ) -> ServicePlanningRequest:
+        origin = start if start is not None else self._origin_for_tick(tick)
+        if origin is None:
+            origin = self.endpoint_mapping.start.node
         return ServicePlanningRequest(
             run_context=self.run_context,
             scenario=self.configuration.scenario,
@@ -845,9 +931,386 @@ class ReplayRunner:
             input_revision=input_revision,
             as_of_time=self.prediction_as_of or tick,
             start_time=tick,
-            start=self.endpoint_mapping.start.node,
+            start=origin,
             goal=self.endpoint_mapping.goal.node,
             maximum_elapsed=self.risk_forecast_end - tick,
+        )
+
+    def _attach_route_digests(self) -> None:
+        digests: dict[str, dict[str, str]] = {}
+        if self.current_plan_set is not None:
+            for bundle in self.current_plan_set.layers:
+                layer = getattr(bundle.planning_layer, "value", None) or str(
+                    bundle.planning_layer
+                )
+                digests[layer] = {
+                    getattr(objective, "value", None) or str(objective): (
+                        route_semantic_digest(plan)
+                    )
+                    for objective, plan in bundle.plans.items()
+                }
+        elif self.current_batch is not None:
+            digests["full_voyage_complete_route"] = {
+                getattr(objective, "value", None) or str(objective): (
+                    route_semantic_digest(plan)
+                )
+                for objective, plan in self.current_batch.plans.items()
+            }
+        elif self.current_plan is not None:
+            digests["full_voyage_complete_route"] = {
+                "recommended": route_semantic_digest(self.current_plan)
+            }
+        self.route_semantic_digests = digests
+
+    def _origin_for_tick(self, tick: datetime) -> tuple[int, int] | None:
+        """Replan origin for the current simulation tick.
+
+        Same-vessel rule (v1): the origin is the last accepted-route waypoint
+        reached at or before ``tick``, snapped to the nearest navigable grid
+        node.  No arbitrary lon/lat start and no silent nearest-node teleport:
+        every snap is bounded by ``max_snap_km`` and reported in ship state.
+        Returns None when the vessel has arrived (no further replan origin).
+        """
+
+        if self.current_plan is None:
+            return self.endpoint_mapping.start.node
+        result = self._position_at(tick, self.current_plan)
+        node = result["current_node"]
+        if node is None or node == self.endpoint_mapping.goal.node:
+            return None
+        return node
+
+    def _position_at(self, tick: datetime, plan: Any) -> dict[str, Any]:
+        waypoints = tuple(plan.waypoints)
+        if not waypoints:
+            return {
+                "position": None,
+                "current_node": None,
+                "edge_progress": None,
+                "arrived": False,
+                "reached_index": -1,
+            }
+        reached = -1
+        for index, waypoint in enumerate(waypoints):
+            if waypoint.eta <= tick:
+                reached = index
+            else:
+                break
+        if reached == len(waypoints) - 1:
+            waypoint = waypoints[-1]
+            node, adjustment = self._snap_position(
+                waypoint.longitude, waypoint.latitude, tick
+            )
+            return {
+                "position": {
+                    "longitude": waypoint.longitude,
+                    "latitude": waypoint.latitude,
+                },
+                "current_node": node,
+                "edge_progress": 1.0,
+                "snap_adjustment_km": adjustment,
+                "arrived": True,
+                "reached_index": reached,
+            }
+        if reached < 0:
+            start = waypoints[0]
+            position = {
+                "longitude": start.longitude,
+                "latitude": start.latitude,
+            }
+            fraction = 0.0
+            index = 0
+        else:
+            start = waypoints[reached]
+            end = waypoints[reached + 1]
+            span = (end.eta - start.eta).total_seconds()
+            fraction = (
+                0.0
+                if span <= 0.0
+                else max(
+                    0.0,
+                    min(1.0, (tick - start.eta).total_seconds() / span),
+                )
+            )
+            position = {
+                "longitude": start.longitude
+                + (end.longitude - start.longitude) * fraction,
+                "latitude": start.latitude
+                + (end.latitude - start.latitude) * fraction,
+            }
+            index = reached
+        node, adjustment = self._snap_position(
+            position["longitude"], position["latitude"], tick
+        )
+        return {
+            "position": position,
+            "current_node": node,
+            "edge_progress": fraction,
+            "snap_adjustment_km": adjustment,
+            "arrived": False,
+            "reached_index": index,
+        }
+
+    def _snap_position(
+        self,
+        longitude: float,
+        latitude: float,
+        tick: datetime,
+    ) -> tuple[tuple[int, int], float]:
+        from arctic_route_planning.domain import GeoPoint
+
+        grid = self._ensure_grid()
+        frame = self._frame_at(tick)
+        hard_mask = frame.payload["hard_mask"].values
+        point = GeoPoint(longitude=longitude, latitude=latitude)
+        nearest = grid.nearest_node(point)
+        if grid.contains(nearest) and not bool(hard_mask[nearest]):
+            return nearest, haversine_km(point, grid.point(nearest))
+        cell_km = max(
+            1.0,
+            haversine_km(
+                grid.point((0, 0)),
+                grid.point((1, 0)),
+            )
+            if grid.shape[0] > 1
+            else 1.0,
+        )
+        max_rings = int(max(1.0, self.max_snap_km / cell_km) + 2)
+        best: tuple[float, tuple[int, int]] | None = None
+        for radius in range(1, max_rings + 1):
+            for row_offset in range(-radius, radius + 1):
+                for column_offset in range(-radius, radius + 1):
+                    if max(abs(row_offset), abs(column_offset)) != radius:
+                        continue
+                    candidate = (
+                        nearest[0] + row_offset,
+                        nearest[1] + column_offset,
+                    )
+                    if not grid.contains(candidate) or bool(hard_mask[candidate]):
+                        continue
+                    distance = haversine_km(point, grid.point(candidate))
+                    if distance <= self.max_snap_km and (
+                        best is None or distance < best[0]
+                    ):
+                        best = (distance, candidate)
+            if best is not None:
+                break
+        if best is None:
+            raise ValueError(
+                "nav_snap_failed: no navigable grid node within "
+                f"{self.max_snap_km:.1f} km of ({longitude}, {latitude})"
+            )
+        return best[1], best[0]
+
+    def _ensure_grid(self) -> RegularGrid:
+        if self._grid is None:
+            if self.risk_commit is None or not self.risk_commit.frames:
+                raise RuntimeError("risk window is required before navigation state")
+            frame = self.risk_commit.frames[0]
+            self._grid = RegularGrid.from_risk_frame(
+                frame,
+                allow_diagonal=self.configuration.planner.connectivity == 8,
+            )
+        return self._grid
+
+    def _frame_at(self, tick: datetime):
+        frames = self.risk_commit.frames
+        candidates = [frame for frame in frames if frame.valid_time <= tick]
+        return candidates[-1] if candidates else frames[0]
+
+    def _update_navigation(self, tick: datetime) -> None:
+        if self.current_plan is None:
+            self.nav_state = NavigationExecutionState(
+                status="DEFERRED",
+                navigation_state_revision=self.navigation_state_revision,
+                accepted_plan_revision=self.plan_revision,
+                accepted_plan_digest="",
+                executed_until=None,
+                current_position=None,
+                current_node=None,
+                edge_progress=None,
+            )
+            return
+        plan = self.current_plan
+        result = self._position_at(tick, plan)
+        waypoints = tuple(plan.waypoints)
+        reached = int(result["reached_index"])
+        completed_track = tuple(
+            {
+                "longitude": waypoint.longitude,
+                "latitude": waypoint.latitude,
+                "eta": _iso(waypoint.eta),
+            }
+            for waypoint in waypoints[: reached + 1]
+        )
+        position = result["position"]
+        remaining = self._remaining_distance_km(plan, tick, position)
+        previous = self.nav_state
+        delta = None
+        expected = None
+        if previous is not None and previous.current_position is not None and position:
+            from arctic_route_planning.domain import GeoPoint
+
+            previous_position = GeoPoint(
+                longitude=previous.current_position["longitude"],
+                latitude=previous.current_position["latitude"],
+            )
+            current_position = GeoPoint(
+                longitude=position["longitude"],
+                latitude=position["latitude"],
+            )
+            delta = haversine_km(previous_position, current_position)
+            previous_until = previous.executed_until
+            if previous_until:
+                expected = self._route_travel_km(
+                    plan,
+                    datetime.fromisoformat(
+                        previous_until.replace("Z", "+00:00")
+                    ).astimezone(UTC),
+                    tick,
+                )
+        arrived = bool(result["arrived"])
+        status = "ARRIVED" if arrived else "ACTIVE"
+        executed_until = (
+            _iso(waypoints[-1].eta) if arrived else _iso(tick)
+        )
+        self.navigation_state_revision += 1
+        self.nav_state = NavigationExecutionState(
+            status=status,
+            navigation_state_revision=self.navigation_state_revision,
+            accepted_plan_revision=self.plan_revision,
+            accepted_plan_digest=self._accepted_plan_digest(),
+            executed_until=executed_until,
+            current_position=position,
+            current_node=result["current_node"],
+            edge_progress=result["edge_progress"],
+            completed_track=completed_track,
+            remaining_distance_km=remaining,
+            snap_adjustment_km=result.get("snap_adjustment_km"),
+            last_distance_delta_km=delta,
+            expected_travel_km=expected,
+        )
+
+    def _remaining_distance_km(
+        self,
+        plan: Any,
+        tick: datetime,
+        position: dict[str, float] | None,
+    ) -> float:
+        if position is None:
+            return float(getattr(plan.metrics, "distance_km", 0.0))
+        from arctic_route_planning.domain import GeoPoint
+
+        remaining = 0.0
+        current = GeoPoint(
+            longitude=position["longitude"],
+            latitude=position["latitude"],
+        )
+        for waypoint in plan.waypoints:
+            if waypoint.eta <= tick:
+                continue
+            target = GeoPoint(
+                longitude=waypoint.longitude,
+                latitude=waypoint.latitude,
+            )
+            remaining += haversine_km(current, target)
+            current = target
+        return remaining
+
+    def _route_travel_km(
+        self,
+        plan: Any,
+        start_tick: datetime,
+        end_tick: datetime,
+    ) -> float:
+        from arctic_route_planning.domain import GeoPoint
+
+        if end_tick <= start_tick:
+            return 0.0
+        waypoints = tuple(plan.waypoints)
+        if not waypoints:
+            return 0.0
+
+        def point_at(tick: datetime):
+            reached = -1
+            for index, waypoint in enumerate(waypoints):
+                if waypoint.eta <= tick:
+                    reached = index
+                else:
+                    break
+            if reached < 0:
+                return (
+                    waypoints[0].longitude,
+                    waypoints[0].latitude,
+                )
+            if reached == len(waypoints) - 1:
+                return (
+                    waypoints[-1].longitude,
+                    waypoints[-1].latitude,
+                )
+            start = waypoints[reached]
+            end = waypoints[reached + 1]
+            span = (end.eta - start.eta).total_seconds()
+            fraction = (
+                0.0
+                if span <= 0.0
+                else max(0.0, min(1.0, (tick - start.eta).total_seconds() / span))
+            )
+            return (
+                start.longitude + (end.longitude - start.longitude) * fraction,
+                start.latitude + (end.latitude - start.latitude) * fraction,
+            )
+
+        a_lon, a_lat = point_at(start_tick)
+        b_lon, b_lat = point_at(end_tick)
+        start_index = -1
+        end_index = -1
+        for index, waypoint in enumerate(waypoints):
+            if waypoint.eta <= start_tick:
+                start_index = index
+            if waypoint.eta <= end_tick:
+                end_index = index
+            else:
+                break
+        if start_index == end_index:
+            return haversine_km(
+                GeoPoint(longitude=a_lon, latitude=a_lat),
+                GeoPoint(longitude=b_lon, latitude=b_lat),
+            )
+        total = haversine_km(
+            GeoPoint(longitude=a_lon, latitude=a_lat),
+            GeoPoint(
+                longitude=waypoints[start_index + 1].longitude,
+                latitude=waypoints[start_index + 1].latitude,
+            ),
+        )
+        for index in range(start_index + 1, end_index):
+            total += haversine_km(
+                GeoPoint(
+                    longitude=waypoints[index].longitude,
+                    latitude=waypoints[index].latitude,
+                ),
+                GeoPoint(
+                    longitude=waypoints[index + 1].longitude,
+                    latitude=waypoints[index + 1].latitude,
+                ),
+            )
+        total += haversine_km(
+            GeoPoint(
+                longitude=waypoints[end_index].longitude,
+                latitude=waypoints[end_index].latitude,
+            ),
+            GeoPoint(longitude=b_lon, latitude=b_lat),
+        )
+        return total
+
+    def _accepted_plan_digest(self) -> str:
+        if self.plan_kind == "v2_complete_route_fallback":
+            return self.route_semantic_digests.get(
+                "full_voyage_complete_route", {}
+            ).get("recommended", "")
+        return self.route_semantic_digests.get("full_voyage", {}).get(
+            "recommended", ""
         )
 
     def _snapshot(
@@ -881,11 +1344,14 @@ class ReplayRunner:
         planning_ready = "READY" if self.current_plan is not None else "NOT_READY"
         risk = RiskStateSummary(
             risk_revision=self.risk_revision,
+            risk_content_revision=self.risk_revision,
+            risk_window_revision=self.risk_window_revision,
             prediction_as_of=_iso(self.prediction_as_of) if self.prediction_as_of else "",
             risk_valid_start=_iso(self.window_commit.start) if self.window_commit else None,
             risk_valid_end=_iso(self.window_commit.end) if self.window_commit else None,
             resource_identity=self.window_commit.commit_id if self.window_commit else None,
             resource_digest=self.window_commit.content_digest if self.window_commit else None,
+            risk_semantic_digest=self.risk_semantic_digest,
             presentation_horizons={
                 "0h": _iso(tick),
                 "+6h": _iso(tick + timedelta(hours=6)),
@@ -900,6 +1366,11 @@ class ReplayRunner:
             planning_ready=planning_ready,
             blockers=self.planning_blockers,
         )
+        ship_state = (
+            self.nav_state.to_dict()
+            if self.nav_state is not None
+            else {"status": "DEFERRED"}
+        )
         snapshot = SimulationSnapshot(
             schema_version="orchestrator.replay-snapshot.v1",
             replay_id=self.replay_id,
@@ -913,6 +1384,7 @@ class ReplayRunner:
             planning=planning,
             readiness=readiness,
             events=tuple(events),
+            ship_state=ship_state,
         ).with_digest()
         self.events.extend(events)
         return snapshot
@@ -927,9 +1399,18 @@ class ReplayRunner:
                 "data_revision": self.data_revision,
                 "b_input_revision": self.b_input_revision,
                 "risk_revision": self.risk_revision,
-            "plan_revision": self.plan_revision,
-            "input_revision": self.input_revision,
-            "risk_commit_id": self.risk_commit.commit_id if self.risk_commit else None,
+                "risk_content_revision": self.risk_revision,
+                "risk_window_revision": self.risk_window_revision,
+                "plan_revision": self.plan_revision,
+                "observation_sequence": self.observation_sequence,
+                "navigation_state_revision": self.navigation_state_revision,
+                "input_revision": self.input_revision,
+                "risk_commit_id": self.risk_commit.commit_id if self.risk_commit else None,
+                "risk_semantic_digest": self.risk_semantic_digest,
+                "last_window_identity": self._last_window_identity,
+                "route_semantic_digests": self.route_semantic_digests,
+                "last_replan_reasons": list(self.last_replan_reasons),
+                "nav_state": self.nav_state.to_dict() if self.nav_state else None,
             },
         )
 
@@ -939,6 +1420,21 @@ class ReplayRunner:
         self.risk_revision = int(checkpoint.get("risk_revision", 0))
         self.plan_revision = int(checkpoint.get("plan_revision", 0))
         self.input_revision = int(checkpoint.get("input_revision", 0))
+        self.observation_sequence = int(checkpoint.get("observation_sequence", 0))
+        self.risk_window_revision = int(checkpoint.get("risk_window_revision", 0))
+        self.navigation_state_revision = int(
+            checkpoint.get("navigation_state_revision", 0)
+        )
+        self.risk_semantic_digest = str(checkpoint.get("risk_semantic_digest", ""))
+        self._last_window_identity = str(checkpoint.get("last_window_identity", ""))
+        self.route_semantic_digests = dict(
+            checkpoint.get("route_semantic_digests", {})
+        )
+        self.last_replan_reasons = tuple(
+            checkpoint.get("last_replan_reasons", ())
+        )
+        nav = checkpoint.get("nav_state")
+        self.nav_state = NavigationExecutionState.from_dict(nav) if nav else None
         self._last_visible_digest = ""
         self._last_relevant_digest = ""
         self._last_data_revision = 0
@@ -992,6 +1488,42 @@ def _observation(*, tick, data_revision, risk_revision, plan):
         route_avg_risk=plan.metrics.avg_risk,
         route_max_risk=plan.metrics.max_risk,
     )
+
+
+def _honest_replan_reasons(
+    reasons: tuple[ReplanReason, ...],
+    events: list[ReplayEvent],
+) -> tuple[str, ...]:
+    """Translate C's internal trigger reasons into replay-honest reasons.
+
+    C's ReplanTriggerEvaluator treats the monotonic planning observation
+    sequence and the per-tick suffix-window identity as ``data`` revisions.
+    Replay semantics distinguish:
+
+    * real A data revision (visible record set changed);
+    * real B risk content revision (risk frames rebuilt);
+    * window advance (suffix identity changed, content reused).
+
+    A ``DATA`` trigger caused only by the observation sequence or window
+    identity is therefore not surfaced as a data change.
+    """
+
+    data_changed = any(
+        event.type in ("DATA_REVISION_CHANGED", "DATA_BECAME_VISIBLE")
+        for event in events
+    )
+    content_changed = any(
+        event.type in ("RISK_REVISION_CHANGED", "RISK_CONTENT_UPDATED")
+        for event in events
+    )
+    mapped: list[str] = []
+    for reason in reasons:
+        value = getattr(reason, "value", None) or str(reason)
+        if value == "data" and not (data_changed or content_changed):
+            continue
+        if value not in mapped:
+            mapped.append(value)
+    return tuple(mapped)
 
 
 def _default_output_root(replay_id: str) -> Path:

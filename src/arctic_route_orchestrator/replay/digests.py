@@ -198,3 +198,143 @@ def replay_semantic_digest(document: dict[str, Any]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def risk_semantic_digest(frames: Iterable[Any]) -> str:
+    """Business-only digest of committed risk frames.
+
+    Includes every business field the planner can legally consume
+    (valid_time, as_of_time, model_version, provenance, source summaries,
+    coordinates and risk/confidence/hard payloads) and excludes wall-clock
+    provenance such as generated_at and risk_id (content-addressed identities
+    that embed generated_at).
+    """
+
+    payloads: list[Any] = []
+    for frame in frames:
+        document = _frame_business_document(frame)
+        payloads.append(document)
+    encoded = json.dumps(
+        payloads,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _frame_business_document(frame: Any) -> dict[str, Any]:
+    payload = frame.payload
+    variables = {}
+    for name in (
+        "risk_score",
+        "risk_level",
+        "confidence",
+        "hard_mask",
+        "hard_reason",
+        "environment_speed_factor",
+    ):
+        try:
+            values = payload[name].values
+        except (KeyError, AttributeError):
+            continue
+        variables[name] = values.tolist()
+    sources = []
+    for source in getattr(frame, "source_summary", ()) or ():
+        sources.append(
+            {
+                "data_id": getattr(source, "data_id", ""),
+                "data_type": getattr(source, "data_type", ""),
+                "issue_time": _iso_datetime(getattr(source, "issue_time", None)),
+                "valid_time": _iso_datetime(getattr(source, "valid_time", None)),
+                "quality": getattr(source, "quality_flag", ""),
+                "version": getattr(source, "version", ""),
+                "checksum": getattr(source, "checksum", ""),
+            }
+        )
+    return {
+        "valid_time": _iso_datetime(frame.valid_time),
+        "as_of_time": _iso_datetime(frame.as_of_time),
+        "model_version": getattr(frame, "model_version", ""),
+        "provenance": getattr(frame, "provenance", "").value
+        if hasattr(getattr(frame, "provenance", ""), "value")
+        else getattr(frame, "provenance", ""),
+        "variables": variables,
+        "sources": sources,
+    }
+
+
+def _iso_datetime(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "astimezone"):
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    return str(value)
+
+
+def route_semantic_digest(plan: Any) -> str:
+    """Business-only digest of one RoutePlan / RoutePlanV3.
+
+    Waypoints (lon/lat/eta), objective metrics, plan kind, replan reasons,
+    layer identity and focus windows are business semantics; generated_at,
+    plan_id, planning_request_id and other wall-clock identities are excluded.
+    """
+
+    metrics = getattr(plan, "metrics", None)
+    document = {
+        "objective": getattr(getattr(plan, "objective_mode", None), "value", None)
+        if hasattr(getattr(plan, "objective_mode", None), "value")
+        else getattr(plan, "objective_mode", None),
+        "plan_kind": getattr(getattr(plan, "plan_kind", None), "value", None)
+        if hasattr(getattr(plan, "plan_kind", None), "value")
+        else getattr(plan, "plan_kind", None),
+        "start_time": _iso_datetime(getattr(plan, "start_time", None)),
+        "as_of_time": _iso_datetime(getattr(plan, "as_of_time", None)),
+        "planning_layer": getattr(
+            getattr(plan, "planning_layer", None), "value", None
+        )
+        if hasattr(getattr(plan, "planning_layer", None), "value")
+        else getattr(plan, "planning_layer", None),
+        "focus_start_time": _iso_datetime(
+            getattr(plan, "focus_start_time", None)
+        ),
+        "focus_end_time": _iso_datetime(getattr(plan, "focus_end_time", None)),
+        "destination_reached": getattr(plan, "destination_reached", None),
+        "replan_reasons": [
+            reason.value if hasattr(reason, "value") else reason
+            for reason in getattr(plan, "replan_reasons", ())
+        ],
+        "waypoints": [
+            {
+                "longitude": float(waypoint.longitude),
+                "latitude": float(waypoint.latitude),
+                "eta": _iso_datetime(waypoint.eta),
+            }
+            for waypoint in getattr(plan, "waypoints", ())
+        ],
+        "metrics": {
+            "distance_km": float(metrics.distance_km),
+            "eta_hours": float(metrics.eta_hours),
+            "avg_risk": float(metrics.avg_risk),
+            "max_risk": float(metrics.max_risk),
+            "integrated_risk_hours": float(metrics.integrated_risk_hours),
+            "minimum_confidence": float(metrics.minimum_confidence),
+            "hard_constraint_violations": int(
+                metrics.hard_constraint_violations
+            ),
+            "turn_count": int(metrics.turn_count),
+            "expanded_nodes": int(metrics.expanded_nodes),
+            "objective_cost": float(metrics.objective_cost),
+        }
+        if metrics is not None
+        else None,
+    }
+    encoded = json.dumps(
+        document,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

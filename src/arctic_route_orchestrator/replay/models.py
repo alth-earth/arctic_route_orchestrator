@@ -30,15 +30,21 @@ class ReplayEvent:
 class RevisionState:
     data_revision: int
     b_input_revision: int
-    risk_revision: int
+    risk_content_revision: int
     plan_revision: int
+    risk_window_revision: int = 0
+    observation_sequence: int = 0
+    navigation_state_revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "data_revision": self.data_revision,
             "b_input_revision": self.b_input_revision,
-            "risk_revision": self.risk_revision,
+            "risk_content_revision": self.risk_content_revision,
+            "risk_window_revision": self.risk_window_revision,
+            "observation_sequence": self.observation_sequence,
             "plan_revision": self.plan_revision,
+            "navigation_state_revision": self.navigation_state_revision,
         }
 
 
@@ -75,15 +81,21 @@ class RiskStateSummary:
     resource_identity: str | None = None
     resource_digest: str | None = None
     presentation_horizons: dict[str, str] = field(default_factory=dict)
+    risk_content_revision: int = 0
+    risk_window_revision: int = 0
+    risk_semantic_digest: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "risk_revision": self.risk_revision,
+            "risk_content_revision": self.risk_content_revision,
+            "risk_window_revision": self.risk_window_revision,
             "prediction_as_of": self.prediction_as_of,
             "risk_valid_start": self.risk_valid_start,
             "risk_valid_end": self.risk_valid_end,
             "resource_identity": self.resource_identity,
             "resource_digest": self.resource_digest,
+            "risk_semantic_digest": self.risk_semantic_digest,
             "presentation_horizons": dict(self.presentation_horizons),
         }
 
@@ -99,6 +111,9 @@ class PlanningStateSummary:
     unsupported_layers: tuple[str, ...] = ()
     blockers: tuple[str, ...] = ()
     resources: dict[str, dict[str, Any]] = field(default_factory=dict)
+    observation_sequence: int = 0
+    replan_reasons: tuple[str, ...] = ()
+    route_semantic_digests: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,7 +126,92 @@ class PlanningStateSummary:
             "unsupported_layers": list(self.unsupported_layers),
             "blockers": list(self.blockers),
             "resources": self.resources,
+            "observation_sequence": self.observation_sequence,
+            "replan_reasons": list(self.replan_reasons),
+            "route_semantic_digests": {
+                layer: dict(objectives)
+                for layer, objectives in self.route_semantic_digests.items()
+            },
         }
+
+
+@dataclass(frozen=True, slots=True)
+class NavigationExecutionState:
+    """Executed vessel state for same-vessel causal replay (v1, replay-local).
+
+    v1 deliberately uses node-aligned replanning: the origin for a new plan is
+    the last accepted-route waypoint reached at or before simulation time,
+    snapped to the nearest navigable grid node within an explicit tolerance.
+    Edge interpolation is reported for presentation/provenance but never used
+    to teleport the replan origin.
+    """
+
+    status: str
+    navigation_state_revision: int
+    accepted_plan_revision: int
+    accepted_plan_digest: str
+    executed_until: str | None
+    current_position: dict[str, float] | None
+    current_node: tuple[int, int] | None
+    edge_progress: float | None
+    completed_track: tuple[dict[str, Any], ...] = ()
+    remaining_distance_km: float | None = None
+    snap_adjustment_km: float | None = None
+    last_distance_delta_km: float | None = None
+    expected_travel_km: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "navigation_state_revision": self.navigation_state_revision,
+            "accepted_plan_revision": self.accepted_plan_revision,
+            "accepted_plan_digest": self.accepted_plan_digest,
+            "executed_until": self.executed_until,
+            "current_position": dict(self.current_position)
+            if self.current_position
+            else None,
+            "current_node": list(self.current_node) if self.current_node else None,
+            "edge_progress": self.edge_progress,
+            "completed_track": list(self.completed_track),
+            "remaining_distance_km": self.remaining_distance_km,
+            "snap_adjustment_km": self.snap_adjustment_km,
+            "last_distance_delta_km": self.last_distance_delta_km,
+            "expected_travel_km": self.expected_travel_km,
+        }
+
+    @classmethod
+    def from_dict(cls, document: dict[str, Any]) -> NavigationExecutionState:
+        node = document.get("current_node")
+        return cls(
+            status=str(document.get("status", "DEFERRED")),
+            navigation_state_revision=int(
+                document.get("navigation_state_revision", 0)
+            ),
+            accepted_plan_revision=int(document.get("accepted_plan_revision", 0)),
+            accepted_plan_digest=str(document.get("accepted_plan_digest", "")),
+            executed_until=document.get("executed_until"),
+            current_position=(
+                {
+                    "longitude": float(document["current_position"]["longitude"]),
+                    "latitude": float(document["current_position"]["latitude"]),
+                }
+                if document.get("current_position")
+                else None
+            ),
+            current_node=(int(node[0]), int(node[1])) if node else None,
+            edge_progress=(
+                float(document["edge_progress"])
+                if document.get("edge_progress") is not None
+                else None
+            ),
+            completed_track=tuple(
+                dict(item) for item in document.get("completed_track", ())
+            ),
+            remaining_distance_km=document.get("remaining_distance_km"),
+            snap_adjustment_km=document.get("snap_adjustment_km"),
+            last_distance_delta_km=document.get("last_distance_delta_km"),
+            expected_travel_km=document.get("expected_travel_km"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
