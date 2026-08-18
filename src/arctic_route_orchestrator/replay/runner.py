@@ -383,7 +383,7 @@ class ReplayRunner:
                         type="RISK_WINDOW_ADVANCED",
                         simulation_time=_iso(tick),
                         revision=str(self.risk_window_revision),
-                        description=self.window_commit.commit_id,
+                        description="suffix window advanced",
                         observed=False,
                     )
                 )

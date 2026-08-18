@@ -152,8 +152,55 @@ def test_semantic_digest_excludes_wall_clock() -> None:
     base = {"simulation_time": "2026-08-15T10:00:00Z", "plan": "abc"}
     other = {"simulation_time": "2026-08-15T10:00:00Z", "plan": "abc", "generated_at": "x"}
     assert replay_semantic_digest(base) == replay_semantic_digest(other)
+    different_run = {
+        "simulation_time": "2026-08-15T10:00:00Z",
+        "plan": "abc",
+        "replay_id": "run-b",
+    }
+    assert replay_semantic_digest(base) == replay_semantic_digest(different_run)
     changed = {"simulation_time": "2026-08-15T11:00:00Z", "plan": "abc"}
     assert replay_semantic_digest(base) != replay_semantic_digest(changed)
+
+
+def test_semantic_digest_distinguishes_business_window_revision_not_identity() -> None:
+    base = {
+        "simulation_time": "2026-08-15T11:00:00Z",
+        "risk_window_revision": 2,
+        "events": [
+            {
+                "type": "RISK_WINDOW_ADVANCED",
+                "simulation_time": "2026-08-15T11:00:00Z",
+                "revision": "commit-a",
+                "description": "suffix window advanced",
+            }
+        ],
+    }
+    same_business = {
+        "simulation_time": "2026-08-15T11:00:00Z",
+        "risk_window_revision": 2,
+        "events": [
+            {
+                "type": "RISK_WINDOW_ADVANCED",
+                "simulation_time": "2026-08-15T11:00:00Z",
+                "revision": "commit-b",
+                "description": "suffix window advanced",
+            }
+        ],
+    }
+    changed_business = {
+        "simulation_time": "2026-08-15T11:00:00Z",
+        "risk_window_revision": 3,
+        "events": [
+            {
+                "type": "RISK_WINDOW_ADVANCED",
+                "simulation_time": "2026-08-15T11:00:00Z",
+                "revision": "commit-b",
+                "description": "suffix window advanced",
+            }
+        ],
+    }
+    assert replay_semantic_digest(base) == replay_semantic_digest(same_business)
+    assert replay_semantic_digest(base) != replay_semantic_digest(changed_business)
 
 
 def _synthetic_frames():

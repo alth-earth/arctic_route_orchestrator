@@ -30,6 +30,7 @@ _WALL_CLOCK_FIELDS = frozenset(
         # generated_at) must not leak into the semantic digest.
         "resource_identity",
         "resource_digest",
+        "replay_id",
         "commit_id",
         "content_digest",
         "revision",
