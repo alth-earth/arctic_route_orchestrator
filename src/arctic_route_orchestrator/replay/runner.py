@@ -204,6 +204,8 @@ class ReplayRunner:
     prediction_as_of: datetime | None = None
     current_plan: Any = None
     current_plan_set: Any = None
+    current_batch: Any = None
+    plan_kind: str = ""
     supported_layers: tuple[str, ...] = ()
     unsupported_layers: tuple[str, ...] = (
         "executable_0_6h",
@@ -597,6 +599,11 @@ class ReplayRunner:
             supported_layers=self.supported_layers,
             unsupported_layers=self.unsupported_layers,
             blockers=self.planning_blockers,
+            resources=(
+                {"route_integrity": self._route_integrity}
+                if self._route_integrity is not None
+                else {}
+            ),
         )
 
     def _attempt_initial_plan(self, tick: datetime, events: list[ReplayEvent]) -> None:
@@ -616,6 +623,7 @@ class ReplayRunner:
             )
             self.unsupported_layers = ()
             self.planning_blockers = ()
+            self.plan_kind = "v3_four_layer"
             events.append(
                 ReplayEvent(
                     type="PLAN_COMPUTED",
@@ -631,26 +639,60 @@ class ReplayRunner:
                 file=sys.stderr,
                 flush=True,
             )
-            v2_blocker = self._probe_v2(tick)
-            self.planning_blockers = (
-                f"{type(exc).__name__}: {exc}",
-                *(v2_blocker,),
-            )
-            self.unsupported_layers = (
-                "executable_0_6h",
-                "rolling_0_24h",
-                "main_corridor_24_72h",
-                "full_voyage",
-            )
-            events.append(
-                ReplayEvent(
-                    type="PLANNING_NOT_READY",
-                    simulation_time=_iso(tick),
-                    revision="0",
-                    description=self.planning_blockers[0][:300],
-                    observed=True,
+            v3_blocker = f"{type(exc).__name__}: {exc}"
+            try:
+                request_v2 = self._planning_request(tick, input_revision=0)
+                prepared_v2 = self.ingress.prepare(request_v2)
+                batch = prepared_v2.execute()
+                self.current_plan = batch.selected
+                self.current_batch = batch
+                self.current_plan_set = None
+                self._audit_and_attach_route()
+                self.plan_revision = 1
+                self.plan_kind = "v2_complete_route_fallback"
+                self.supported_layers = ("full_voyage_complete_route",)
+                self.unsupported_layers = (
+                    "executable_0_6h",
+                    "rolling_0_24h",
+                    "main_corridor_24_72h",
+                    "full_voyage_v3_four_layer",
                 )
-            )
+                self.planning_blockers = (
+                    "v3 four-layer blocked: " + v3_blocker,
+                    "v2 complete-route fallback engaged",
+                )
+                events.append(
+                    ReplayEvent(
+                        type="PLAN_COMPUTED",
+                        simulation_time=_iso(tick),
+                        revision=str(self.plan_revision),
+                        description="v2 complete-route fallback",
+                        observed=True,
+                    )
+                )
+            except Exception as v2_exc:
+                print(
+                    "[replay] v2 initial fallback failed:\n"
+                    + traceback.format_exc(limit=6),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.planning_blockers = (v3_blocker, f"v2: {v2_exc}")
+                self.unsupported_layers = (
+                    "executable_0_6h",
+                    "rolling_0_24h",
+                    "main_corridor_24_72h",
+                    "full_voyage",
+                )
+                events.append(
+                    ReplayEvent(
+                        type="PLANNING_NOT_READY",
+                        simulation_time=_iso(tick),
+                        revision="0",
+                        description=v3_blocker[:300],
+                        observed=True,
+                    )
+                )
 
     def _attempt_replan(self, tick: datetime, events: list[ReplayEvent]) -> None:
         request = self._planning_request(tick, input_revision=self.plan_revision)
@@ -662,12 +704,24 @@ class ReplayRunner:
         )
         try:
             prepared = self.ingress.prepare(request)
-            outcome = prepared.replan_four_layer_if_needed(request, observation)
-            if outcome.decision.triggered and outcome.outcome is not None:
-                self.plan_revision += 1
-                self.current_plan_set = outcome.outcome.plan_set
-                self.current_plan = outcome.outcome.plan_set.recommended
-                self._audit_and_attach_route()
+            if self.plan_kind == "v2_complete_route_fallback":
+                outcome = prepared.replan_if_needed(observation)
+                triggered = outcome.decision.triggered and outcome.batch is not None
+                if triggered:
+                    self.plan_revision += 1
+                    self.current_plan = outcome.batch.selected
+                    self.current_batch = outcome.batch
+                    self.current_plan_set = None
+                    self._audit_and_attach_route()
+            else:
+                outcome = prepared.replan_four_layer_if_needed(observation)
+                triggered = outcome.decision.triggered and outcome.outcome is not None
+                if triggered:
+                    self.plan_revision += 1
+                    self.current_plan_set = outcome.outcome.plan_set
+                    self.current_plan = outcome.outcome.plan_set.recommended
+                    self._audit_and_attach_route()
+            if triggered:
                 events.append(
                     ReplayEvent(
                         type="REPLAN_TRIGGERED",
@@ -741,6 +795,12 @@ class ReplayRunner:
             for bundle in plan_set.layers:
                 for _objective, plan in bundle.plans.items():
                     plans.append(plan)
+        elif self.plan_kind == "v2_complete_route_fallback":
+            batch = getattr(self, "current_batch", None)
+            if batch is not None:
+                plans.extend(batch.plans.values())
+            else:
+                plans.append(self.current_plan)
         else:
             plans.append(self.current_plan)
         audits = [audit_route(plan, self.risk_commit.frames) for plan in plans]
