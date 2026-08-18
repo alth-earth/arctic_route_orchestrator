@@ -57,6 +57,7 @@ from arctic_route_planning.grid import RegularGrid, haversine_km
 from arctic_route_planning.ingress import RiskSourcePlanningIngress
 from arctic_route_planning.service import ServicePlanningRequest
 
+from arctic_route_orchestrator.replay import parallel as replay_parallel
 from arctic_route_orchestrator.replay.digests import (
     b_relevant_input_digest,
     risk_semantic_digest,
@@ -635,9 +636,9 @@ class ReplayRunner:
             self._initial_plan_attempted = True
             if progress is not None:
                 progress({"stage": "C initial planning attempt", "tick": _iso(tick)})
-            self._attempt_initial_plan(tick, events)
+            self._run_planning(self._attempt_initial_plan, tick, events)
         elif self.current_plan is not None:
-            self._attempt_replan(tick, events)
+            self._run_planning(self._attempt_replan, tick, events)
         return PlanningStateSummary(
             plan_revision=self.plan_revision,
             planning_as_of=_iso(tick),
@@ -660,6 +661,20 @@ class ReplayRunner:
             replan_reasons=self.last_replan_reasons,
             route_semantic_digests=dict(self.route_semantic_digests),
         )
+
+    def _run_planning(self, operation, tick: datetime, events: list[ReplayEvent]) -> None:
+        if self.planning_workers <= 1:
+            operation(tick, events)
+            return
+        with replay_parallel.install(
+            workers=self.planning_workers,
+            risk_store_root=self.paths.risk_store_root,
+            c_config_root=self.c_config_root,
+            contracts_config_root=self.contracts_config_root,
+            max_snap_km=self.max_snap_km,
+            timeout_seconds=self.c_attempt_timeout_seconds,
+        ):
+            operation(tick, events)
 
     def _attempt_initial_plan(self, tick: datetime, events: list[ReplayEvent]) -> None:
         if self.v2_only:
@@ -794,8 +809,11 @@ class ReplayRunner:
             prepared = self.ingress.prepare(request)
             if self.plan_kind == "v2_complete_route_fallback":
                 outcome = prepared.replan_if_needed(observation)
-                triggered = outcome.decision.triggered and outcome.batch is not None
-                if triggered:
+                policy_triggered = (
+                    outcome.decision.triggered and outcome.batch is not None
+                )
+                published = policy_triggered and outcome.batch.published
+                if published:
                     self.plan_revision += 1
                     self.current_plan = outcome.batch.selected
                     self.current_batch = outcome.batch
@@ -804,13 +822,17 @@ class ReplayRunner:
                     self._attach_route_digests()
             else:
                 outcome = prepared.replan_four_layer_if_needed(observation)
-                triggered = outcome.decision.triggered and outcome.outcome is not None
-                if triggered:
+                policy_triggered = (
+                    outcome.decision.triggered and outcome.outcome is not None
+                )
+                published = policy_triggered and outcome.outcome.published
+                if published:
                     self.plan_revision += 1
                     self.current_plan_set = outcome.outcome.plan_set
                     self.current_plan = outcome.outcome.plan_set.recommended
                     self._audit_and_attach_route()
                     self._attach_route_digests()
+            triggered = published
             self.last_replan_reasons = _honest_replan_reasons(
                 outcome.decision.reasons, events
             )
@@ -838,7 +860,11 @@ class ReplayRunner:
                         type="PLAN_REUSED",
                         simulation_time=_iso(tick),
                         revision=str(self.plan_revision),
-                        description=",".join(self.last_replan_reasons),
+                        description=(
+                            "policy triggered; switch gate rejected candidate"
+                            if policy_triggered
+                            else ",".join(self.last_replan_reasons)
+                        ),
                         observed=True,
                     )
                 )

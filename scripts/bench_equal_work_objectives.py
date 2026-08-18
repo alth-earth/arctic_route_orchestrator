@@ -62,11 +62,20 @@ def _business_summary(result) -> dict[str, object]:
 
 
 def _run_objective(paths: dict[str, str], objective: ObjectiveMode) -> dict[str, object]:
-    commit = json.loads(
-        (Path(paths["commit_dir"]) / "risk" / "full-window-commit.json").read_text(
-            encoding="utf-8"
+    if paths.get("risk_store_root") and paths.get("commit_id"):
+        commit = json.loads(
+            (
+                Path(paths["risk_store_root"])
+                / "commits"
+                / f"{paths['commit_id']}.json"
+            ).read_text(encoding="utf-8")
         )
-    )
+    else:
+        commit = json.loads(
+            (Path(paths["commit_dir"]) / "risk" / "full-window-commit.json").read_text(
+                encoding="utf-8"
+            )
+        )
     configuration = load_configuration(
         paths["c_config_root"],
         commit["scenario_id"],
@@ -96,7 +105,7 @@ def _run_objective(paths: dict[str, str], objective: ObjectiveMode) -> dict[str,
     endpoint_mapping = map_corridor_endpoints(
         configuration,
         private_frames[0],
-        max_adjustment_km=150.0,
+        max_adjustment_km=float(paths.get("max_snap_km", "150.0")),
     )
     planner = TimeDependentAStar(
         grid,
@@ -129,29 +138,29 @@ def _serial(paths: dict[str, str]) -> dict[str, object]:
     started = time.monotonic()
     fastest = _run_objective(paths, ObjectiveMode.FASTEST)
     low_risk = _run_objective(paths, ObjectiveMode.LOW_RISK)
+    recommended = _run_objective(paths, ObjectiveMode.RECOMMENDED)
     usage = resource.getrusage(resource.RUSAGE_SELF)
     return {
         "mode": "serial",
         "wall_seconds": time.monotonic() - started,
         "cpu_seconds": usage.ru_utime + usage.ru_stime,
         "peak_rss_bytes": usage.ru_maxrss * 1024,
-        "results": [fastest, low_risk],
+        "results": [fastest, low_risk, recommended],
     }
 
 
 def _parallel(paths: dict[str, str]) -> dict[str, object]:
     script = Path(__file__).resolve()
-    commands = []
-    for objective in ("fastest", "low_risk"):
-        commands.append(
-            [
-                sys.executable,
-                str(script),
-                "child",
-                json.dumps(paths, sort_keys=True),
-                objective,
-            ]
-        )
+    commands = [
+        [
+            sys.executable,
+            str(script),
+            "child",
+            json.dumps(paths, sort_keys=True),
+            objective,
+        ]
+        for objective in ("fastest", "low_risk", "recommended")
+    ]
     started = time.monotonic()
     procs = [subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True) for cmd in commands]
     outputs: list[dict[str, object]] = []
@@ -172,20 +181,32 @@ def _parallel(paths: dict[str, str]) -> dict[str, object]:
 def _prototype(paths: dict[str, str]) -> dict[str, object]:
     """Explicit bounded two-worker prototype inside one parent process."""
 
+    return _prototype_n(paths, 2)
+
+
+def _prototype_n(paths: dict[str, str], workers: int) -> dict[str, object]:
+    """Explicit bounded N-worker prototype inside one parent process."""
+
     started = time.monotonic()
-    with ProcessPoolExecutor(max_workers=2) as executor:
+    objectives = (
+        ObjectiveMode.FASTEST,
+        ObjectiveMode.LOW_RISK,
+        ObjectiveMode.RECOMMENDED,
+    )
+    with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = [
-            executor.submit(_run_objective, paths, ObjectiveMode.FASTEST),
-            executor.submit(_run_objective, paths, ObjectiveMode.LOW_RISK),
+            executor.submit(_run_objective, paths, objective)
+            for objective in objectives
         ]
         outputs = [future.result() for future in futures]
     wall = time.monotonic() - started
     usage = resource.getrusage(resource.RUSAGE_SELF)
     return {
-        "mode": "prototype",
+        "mode": f"prototype_{workers}",
         "wall_seconds": wall,
         "cpu_seconds": usage.ru_utime + usage.ru_stime,
         "peak_rss_bytes": usage.ru_maxrss * 1024,
+        "workers": workers,
         "children": outputs,
     }
 
@@ -195,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     if len(args) < 2:
         print(
             "usage: bench_equal_work_objectives "
-            "<serial|parallel|prototype|child> <paths.json> [objective]"
+            "<serial|parallel|prototype|prototype-n|child> <paths.json> [objective]"
         )
         return 2
     mode, paths_json = args[0], args[1]
@@ -208,6 +229,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if mode == "prototype":
         print(json.dumps(_prototype(paths), sort_keys=True))
+        return 0
+    if mode == "prototype-n":
+        if len(args) < 3:
+            print("prototype-n requires a worker count")
+            return 2
+        print(
+            json.dumps(_prototype_n(paths, int(args[2])), sort_keys=True)
+        )
         return 0
     if mode == "child":
         objective = ObjectiveMode(args[2])

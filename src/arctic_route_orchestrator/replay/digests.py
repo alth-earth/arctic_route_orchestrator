@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
@@ -215,13 +216,31 @@ def risk_semantic_digest(frames: Iterable[Any]) -> str:
         document = _frame_business_document(frame)
         payloads.append(document)
     encoded = json.dumps(
-        payloads,
+        _json_safe(payloads),
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _json_safe(value: Any) -> Any:
+    """Deterministically encode NaN/Inf floats (JSON cannot hold them)."""
+
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "nan"
+        if math.isinf(value):
+            return "inf" if value > 0 else "-inf"
+        return value
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _frame_business_document(frame: Any) -> dict[str, Any]:
