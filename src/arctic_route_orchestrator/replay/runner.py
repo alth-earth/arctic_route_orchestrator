@@ -1161,13 +1161,15 @@ class ReplayRunner:
         result = self._position_at(tick, plan)
         waypoints = tuple(plan.waypoints)
         reached = int(result["reached_index"])
-        completed_track = tuple(
-            {
-                "longitude": waypoint.longitude,
-                "latitude": waypoint.latitude,
-                "eta": _iso(waypoint.eta),
-            }
-            for waypoint in waypoints[: reached + 1]
+        # Completed track is append-only execution history.  When a replan
+        # adopts a new route, only the future portion changes; waypoints
+        # already executed under the previous accepted plan stay immutable.
+        previous_track = (
+            self.nav_state.completed_track if self.nav_state is not None else ()
+        )
+        completed_track = merge_completed_track(
+            previous_track,
+            waypoints[: reached + 1],
         )
         position = result["position"]
         remaining = self._remaining_distance_km(plan, tick, position)
@@ -1550,6 +1552,36 @@ def _honest_replan_reasons(
         if value not in mapped:
             mapped.append(value)
     return tuple(mapped)
+
+
+def merge_completed_track(
+    previous: tuple[dict[str, Any], ...],
+    waypoints: tuple[Any, ...],
+) -> tuple[dict[str, Any], ...]:
+    """Append-only executed-history merge across plan adoptions."""
+
+    existing_keys = {
+        (item["longitude"], item["latitude"], item["eta"])
+        for item in previous
+    }
+    merged = list(previous)
+    for waypoint in waypoints:
+        key = (
+            waypoint.longitude,
+            waypoint.latitude,
+            _iso(waypoint.eta),
+        )
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        merged.append(
+            {
+                "longitude": waypoint.longitude,
+                "latitude": waypoint.latitude,
+                "eta": _iso(waypoint.eta),
+            }
+        )
+    return tuple(merged)
 
 
 def _default_output_root(replay_id: str) -> Path:

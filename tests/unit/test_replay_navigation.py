@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from arctic_route_planning.domain import ReplanReason
 
 from arctic_route_orchestrator.replay.digests import replay_semantic_digest
 from arctic_route_orchestrator.replay.models import NavigationExecutionState, ReplayEvent
-from arctic_route_orchestrator.replay.runner import _honest_replan_reasons
+from arctic_route_orchestrator.replay.runner import (
+    _honest_replan_reasons,
+    merge_completed_track,
+)
 from arctic_route_orchestrator.replay.validation import validate_replay
 
 
@@ -63,6 +68,29 @@ def test_honest_replan_reasons_keep_real_data_trigger() -> None:
     ]
     reasons = _honest_replan_reasons((ReplanReason.TIME, ReplanReason.DATA), events)
     assert set(reasons) == {"time", "data"}
+
+
+class _Waypoint:
+    def __init__(self, longitude, latitude, eta) -> None:
+        self.longitude = longitude
+        self.latitude = latitude
+        self.eta = eta
+
+
+def test_completed_track_is_append_only_across_plan_adoption() -> None:
+    previous = (
+        {"longitude": 12.0, "latitude": 69.0, "eta": "2026-08-15T10:00:00Z"},
+        {"longitude": 13.0, "latitude": 69.5, "eta": "2026-08-15T12:00:00Z"},
+    )
+    new_plan_waypoints = (
+        _Waypoint(14.0, 70.0, datetime(2026, 8, 15, 14, tzinfo=UTC)),
+        _Waypoint(15.0, 70.5, datetime(2026, 8, 15, 16, tzinfo=UTC)),
+    )
+    merged = merge_completed_track(previous, new_plan_waypoints)
+    assert len(merged) == 4
+    assert merged[:2] == previous
+    assert merged[2]["eta"] == "2026-08-15T14:00:00Z"
+    assert merged[3]["eta"] == "2026-08-15T16:00:00Z"
 
 
 def _snapshot(index: int, simulation_time: str, **overrides):
