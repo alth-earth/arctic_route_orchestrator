@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased - 2026-08-18 第三轮（Strategy B Semantic Hardening）
+
+- Revision 语义拆分：`data_revision` / `b_input_revision` /
+  `risk_content_revision` / `risk_window_revision` / `observation_sequence` /
+  `plan_revision` / `navigation_state_revision` 各自独立；replan reason
+  诚实翻译（observation_sequence 不再冒充 data_revision，suffix window
+  前移不再误报 DATA）；新增 `RISK_CONTENT_UPDATED` /
+  `RISK_WINDOW_ADVANCED` 事件；
+- Semantic digest 硬化：新增纯业务 `risk_semantic_digest`（NaN-safe）与
+  `route_semantic_digest`（waypoints + metrics + layer/focus），mutation
+  tests（wall-clock SAME / route 改 DIFFERENT / risk 改 DIFFERENT）；
+- NavigationExecutionState v1：node-aligned same-vessel replan origin、
+  显式 snap tolerance、completed-track 单调、无 teleport 校验、
+  RouteSwitchGate 拒绝候选不采纳；
+- 受控 objective 级并行 `replay/parallel.py`：单次 C request 三目标
+  ProcessPoolExecutor，tick/layer/B 严格串行，进程内 patch 退出恢复；
+  benchmark 1/2/3 worker = 157.2s / 100.9s / 80.5s（结果逐位一致）；
+- `scripts/v3_contract_experiment.py`：真实 77h 窗口复现旧 main_corridor
+  cap 失败并证明 72h 候选 cap 四层全 PASS（integrity PASS）；
+- 3h same-vessel v3 smoke：4 snapshots、validation PASS、RSS≈824MB；
+  12h 权威回放（v3 + 3 workers）：13 snapshots、2071.4s、plan_revision
+  1→6、replan 全 `time`、completed-track 单调、validation 全 PASS；
+- determinism：独立输出根复跑 13/13 snapshot digest + manifest digest
+  一致（replay_id 与窗口 commit id 已从 semantic digest 排除）；
+- 测试：replay unit 31 项通过，ruff 全绿。
+
 ## Unreleased - 2026-08-18（Causal Replay Engine MVP，Strategy B）
 
 - 新增 replay 包：SimulationSnapshot/ReplayManifest 模型、两级 digest
