@@ -21,7 +21,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
+import traceback
 from collections import Counter
 from collections.abc import Callable
 from contextlib import suppress
@@ -168,7 +170,6 @@ class ReplayRunner:
     corridor_id: str
     replay_start: datetime
     replay_end: datetime
-    risk_forecast_end: datetime | None = None
     tick_cadence_hours: int
     a_data_root: Path
     manifest_path: Path
@@ -176,6 +177,8 @@ class ReplayRunner:
     c_config_root: Path
     contracts_config_root: Path
     frozen_run_context_path: Path
+    risk_forecast_end: datetime | None = None
+    planning_horizon_hours: int | None = None
     max_snap_km: float = 30.0
     cache_memory_mb: float = 2048.0
     c_attempt_timeout_seconds: int = 900
@@ -209,6 +212,8 @@ class ReplayRunner:
         "full_voyage",
     )
     planning_blockers: tuple[str, ...] = ()
+    planning_valid_end: datetime | None = None
+    v2_probe_eta_hours: float | None = None
     _route_integrity: dict[str, Any] | None = None
     events: list[ReplayEvent] = field(default_factory=list)
     snapshots: list[dict[str, Any]] = field(default_factory=list)
@@ -240,10 +245,20 @@ class ReplayRunner:
             self.records,
             self.replay_start,
         )
+        forecast_hours = int(
+            (self.risk_forecast_end - self.replay_start).total_seconds() // 3600
+        )
+        self.planning_horizon_hours = self.planning_horizon_hours or (
+            _aligned_planning_hours(forecast_hours)
+        )
+        # Effective planning end is bounded by the causally-visible risk
+        # forecast; the aligned scenario horizon only satisfies the corridor
+        # contract (C's explicit maximum_elapsed stays inside risk coverage).
+        self.planning_valid_end = self.risk_forecast_end
         self.configuration = _replay_configuration(
             self.configuration,
             replay_start=self.replay_start,
-            forecast_end=self.risk_forecast_end,
+            planning_horizon_hours=self.planning_horizon_hours,
         )
         start_index = 0
         if resume and self.paths.checkpoint_path.is_file():
@@ -420,6 +435,7 @@ class ReplayRunner:
             "supported_layers": list(self.supported_layers),
             "unsupported_layers": list(self.unsupported_layers),
             "planning_blockers": list(self.planning_blockers),
+            "v2_probe_eta_hours": self.v2_probe_eta_hours,
             "events": [event.to_dict() for event in self.events],
             "total_elapsed_seconds": round(time.perf_counter() - started, 1),
             "peak_rss_mb": round(_rss_mb(), 1),
@@ -480,7 +496,7 @@ class ReplayRunner:
         self.risk_valid_end = frames[-1].valid_time
         self.prediction_as_of = tick
         self.risk_revision += 1
-        self.run_context = base_context
+        self.run_context = self._c_run_context(base_context)
         self.ingress = RiskSourcePlanningIngress(
             source=store,
             configuration=self.configuration,
@@ -514,6 +530,17 @@ class ReplayRunner:
             config_digest=digest,
         )
 
+    def _c_run_context(self, b_context: RunContext) -> RunContext:
+        """C requires the RunContext window to equal the replay scenario
+        (planning) window; B uses the narrower risk forecast window."""
+
+        return replace(
+            b_context,
+            simulation_end=(
+                self.replay_start + timedelta(hours=self.planning_horizon_hours)
+            ),
+        )
+
     def _window_identity(self, tick: datetime):
         if tick == self.replay_start or self.risk_commit is None:
             return self.risk_commit
@@ -539,8 +566,8 @@ class ReplayRunner:
                 departure_time=_iso(tick),
                 planning_valid_start=_iso(tick),
                 planning_valid_end=(
-                    _iso(self.risk_forecast_end)
-                    if self.risk_forecast_end
+                    _iso(self.planning_valid_end)
+                    if self.planning_valid_end
                     else None
                 ),
                 unsupported_layers=self.unsupported_layers,
@@ -563,8 +590,8 @@ class ReplayRunner:
             departure_time=_iso(tick),
             planning_valid_start=_iso(tick),
             planning_valid_end=(
-                _iso(self.risk_forecast_end)
-                if self.risk_forecast_end
+                _iso(self.planning_valid_end)
+                if self.planning_valid_end
                 else None
             ),
             supported_layers=self.supported_layers,
@@ -598,6 +625,12 @@ class ReplayRunner:
                 )
             )
         except Exception as exc:  # fail-closed: classify, never fake success
+            print(
+                "[replay] v3 initial planning failed:\n"
+                + traceback.format_exc(limit=10),
+                file=sys.stderr,
+                flush=True,
+            )
             v2_blocker = self._probe_v2(tick)
             self.planning_blockers = (
                 f"{type(exc).__name__}: {exc}",
@@ -664,6 +697,12 @@ class ReplayRunner:
                     )
                 )
         except Exception as exc:
+            print(
+                "[replay] v3 replan failed:\n"
+                + traceback.format_exc(limit=10),
+                file=sys.stderr,
+                flush=True,
+            )
             self.planning_blockers = (f"{type(exc).__name__}: {exc}",)
             events.append(
                 ReplayEvent(
@@ -681,9 +720,16 @@ class ReplayRunner:
         try:
             request = self._planning_request(tick, input_revision=0)
             prepared = self.ingress.prepare(request)
-            prepared.execute()
+            batch = prepared.execute()
+            self.v2_probe_eta_hours = float(batch.selected.metrics.eta_hours)
             return None
         except Exception as exc:
+            print(
+                "[replay] v2 probe failed:\n"
+                + traceback.format_exc(limit=6),
+                file=sys.stderr,
+                flush=True,
+            )
             return f"v2 probe: {type(exc).__name__}: {exc}"
 
     def _audit_and_attach_route(self) -> None:
@@ -726,7 +772,7 @@ class ReplayRunner:
             start_time=tick,
             start=self.endpoint_mapping.start.node,
             goal=self.endpoint_mapping.goal.node,
-            maximum_elapsed=None,
+            maximum_elapsed=self.risk_forecast_end - tick,
         )
 
     def _snapshot(
@@ -912,15 +958,27 @@ def _common_causal_valid_end(
     return min(ends) if ends else knowledge_as_of
 
 
-def _replay_configuration(configuration, *, replay_start: datetime, forecast_end: datetime):
-    hours = int((forecast_end - replay_start).total_seconds() // 3600)
-    if (forecast_end - replay_start) != timedelta(hours=hours):
-        raise ValueError("risk forecast end must align to whole hours from replay start")
+def _aligned_planning_hours(forecast_hours: int) -> int:
+    """Smallest corridor-aligned horizon (24h multiple, >=72) covering the
+    forecast hours, within the corridor policy bounds."""
+
+    hours = max(72, ((forecast_hours + 23) // 24) * 24)
+    if hours > 144:
+        raise ValueError("causal forecast horizon exceeds corridor policy maximum")
+    return hours
+
+
+def _replay_configuration(
+    configuration,
+    *,
+    replay_start: datetime,
+    planning_horizon_hours: int,
+):
     scenario = replace(
         configuration.scenario,
         simulation_start=replay_start,
-        simulation_end=forecast_end,
-        horizon_hours=hours,
+        simulation_end=replay_start + timedelta(hours=planning_horizon_hours),
+        horizon_hours=planning_horizon_hours,
     )
     return replace(configuration, scenario=scenario)
 
