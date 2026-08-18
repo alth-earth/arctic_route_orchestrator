@@ -179,6 +179,7 @@ class ReplayRunner:
     frozen_run_context_path: Path
     risk_forecast_end: datetime | None = None
     planning_horizon_hours: int | None = None
+    v2_only: bool = False
     max_snap_km: float = 30.0
     cache_memory_mb: float = 2048.0
     c_attempt_timeout_seconds: int = 900
@@ -196,6 +197,7 @@ class ReplayRunner:
     b_input_revision: int = 0
     risk_revision: int = 0
     plan_revision: int = 0
+    input_revision: int = 0
 
     risk_commit: Any = None
     window_commit: Any = None
@@ -607,6 +609,9 @@ class ReplayRunner:
         )
 
     def _attempt_initial_plan(self, tick: datetime, events: list[ReplayEvent]) -> None:
+        if self.v2_only:
+            self._run_v2_initial(tick, events, v3_blocker="v2-only mode")
+            return
         request = self._planning_request(tick, input_revision=0)
         try:
             prepared = self.ingress.prepare(request)
@@ -640,66 +645,76 @@ class ReplayRunner:
                 flush=True,
             )
             v3_blocker = f"{type(exc).__name__}: {exc}"
-            try:
-                request_v2 = self._planning_request(tick, input_revision=0)
-                prepared_v2 = self.ingress.prepare(request_v2)
-                batch = prepared_v2.execute()
-                self.current_plan = batch.selected
-                self.current_batch = batch
-                self.current_plan_set = None
-                self._audit_and_attach_route()
-                self.plan_revision = 1
-                self.plan_kind = "v2_complete_route_fallback"
-                self.supported_layers = ("full_voyage_complete_route",)
-                self.unsupported_layers = (
-                    "executable_0_6h",
-                    "rolling_0_24h",
-                    "main_corridor_24_72h",
-                    "full_voyage_v3_four_layer",
+            self._run_v2_initial(tick, events, v3_blocker=v3_blocker)
+
+    def _run_v2_initial(
+        self,
+        tick: datetime,
+        events: list[ReplayEvent],
+        *,
+        v3_blocker: str,
+    ) -> None:
+        try:
+            request_v2 = self._planning_request(tick, input_revision=0)
+            prepared_v2 = self.ingress.prepare(request_v2)
+            batch = prepared_v2.execute()
+            self.current_plan = batch.selected
+            self.current_batch = batch
+            self.current_plan_set = None
+            self.plan_revision = 1
+            self.plan_kind = "v2_complete_route_fallback"
+            self._audit_and_attach_route()
+            self.supported_layers = ("full_voyage_complete_route",)
+            self.unsupported_layers = (
+                "executable_0_6h",
+                "rolling_0_24h",
+                "main_corridor_24_72h",
+                "full_voyage_v3_four_layer",
+            )
+            self.planning_blockers = (
+                "v3 four-layer blocked: " + v3_blocker,
+                "v2 complete-route fallback engaged",
+            )
+            events.append(
+                ReplayEvent(
+                    type="PLAN_COMPUTED",
+                    simulation_time=_iso(tick),
+                    revision=str(self.plan_revision),
+                    description="v2 complete-route fallback",
+                    observed=True,
                 )
-                self.planning_blockers = (
-                    "v3 four-layer blocked: " + v3_blocker,
-                    "v2 complete-route fallback engaged",
+            )
+        except Exception as v2_exc:
+            print(
+                "[replay] v2 initial fallback failed:\n"
+                + traceback.format_exc(limit=6),
+                file=sys.stderr,
+                flush=True,
+            )
+            self.planning_blockers = (v3_blocker, f"v2: {v2_exc}")
+            self.unsupported_layers = (
+                "executable_0_6h",
+                "rolling_0_24h",
+                "main_corridor_24_72h",
+                "full_voyage",
+            )
+            events.append(
+                ReplayEvent(
+                    type="PLANNING_NOT_READY",
+                    simulation_time=_iso(tick),
+                    revision="0",
+                    description=v3_blocker[:300],
+                    observed=True,
                 )
-                events.append(
-                    ReplayEvent(
-                        type="PLAN_COMPUTED",
-                        simulation_time=_iso(tick),
-                        revision=str(self.plan_revision),
-                        description="v2 complete-route fallback",
-                        observed=True,
-                    )
-                )
-            except Exception as v2_exc:
-                print(
-                    "[replay] v2 initial fallback failed:\n"
-                    + traceback.format_exc(limit=6),
-                    file=sys.stderr,
-                    flush=True,
-                )
-                self.planning_blockers = (v3_blocker, f"v2: {v2_exc}")
-                self.unsupported_layers = (
-                    "executable_0_6h",
-                    "rolling_0_24h",
-                    "main_corridor_24_72h",
-                    "full_voyage",
-                )
-                events.append(
-                    ReplayEvent(
-                        type="PLANNING_NOT_READY",
-                        simulation_time=_iso(tick),
-                        revision="0",
-                        description=v3_blocker[:300],
-                        observed=True,
-                    )
-                )
+            )
 
     def _attempt_replan(self, tick: datetime, events: list[ReplayEvent]) -> None:
-        request = self._planning_request(tick, input_revision=self.plan_revision)
+        self.input_revision += 1
+        request = self._planning_request(tick, input_revision=self.input_revision)
         observation = _observation(
             tick=tick,
-            data_revision=self.data_revision,
-            risk_revision=self.risk_commit.commit_id,
+            data_revision=self.input_revision,
+            risk_revision=self.window_commit.commit_id,
             plan=self.current_plan,
         )
         try:
@@ -912,8 +927,9 @@ class ReplayRunner:
                 "data_revision": self.data_revision,
                 "b_input_revision": self.b_input_revision,
                 "risk_revision": self.risk_revision,
-                "plan_revision": self.plan_revision,
-                "risk_commit_id": self.risk_commit.commit_id if self.risk_commit else None,
+            "plan_revision": self.plan_revision,
+            "input_revision": self.input_revision,
+            "risk_commit_id": self.risk_commit.commit_id if self.risk_commit else None,
             },
         )
 
@@ -922,6 +938,7 @@ class ReplayRunner:
         self.b_input_revision = int(checkpoint.get("b_input_revision", 0))
         self.risk_revision = int(checkpoint.get("risk_revision", 0))
         self.plan_revision = int(checkpoint.get("plan_revision", 0))
+        self.input_revision = int(checkpoint.get("input_revision", 0))
         self._last_visible_digest = ""
         self._last_relevant_digest = ""
         self._last_data_revision = 0
