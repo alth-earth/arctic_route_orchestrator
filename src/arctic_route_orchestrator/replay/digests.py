@@ -32,6 +32,9 @@ _WALL_CLOCK_FIELDS = frozenset(
         "commit_id",
         "content_digest",
         "revision",
+        # Route plan IDs are content-addressed identities that may embed the
+        # wall-clock generated_at; business route content stays in the digest.
+        "route_id",
     }
 )
 

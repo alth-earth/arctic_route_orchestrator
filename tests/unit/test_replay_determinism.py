@@ -46,3 +46,11 @@ def test_semantic_digest_still_sensitive_to_business_content() -> None:
     changed = _document("c", "2026-08-18T00:00:00Z", "c")
     changed["simulation_time"] = "2026-08-15T11:00:00Z"
     assert replay_semantic_digest(base) != replay_semantic_digest(changed)
+
+
+def test_semantic_digest_ignores_route_identity() -> None:
+    first = _document("c", "2026-08-18T00:00:00Z", "c")
+    second = _document("c", "2026-08-18T00:00:00Z", "c")
+    first["route"] = {"route_id": "recommended-aaaa"}
+    second["route"] = {"route_id": "recommended-bbbb"}
+    assert replay_semantic_digest(first) == replay_semantic_digest(second)
