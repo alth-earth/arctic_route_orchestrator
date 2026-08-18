@@ -34,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--window-hours", type=int, default=12)
     parser.add_argument("--risk-forecast-end", default=None)
     parser.add_argument("--planning-horizon-hours", type=int, default=None)
+    parser.add_argument("--v2-only", action="store_true")
     parser.add_argument("--tick-hours", type=int, default=1)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
@@ -103,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         replay_end=replay_end,
         risk_forecast_end=risk_forecast_end,
         planning_horizon_hours=args.planning_horizon_hours,
+        v2_only=args.v2_only,
         tick_cadence_hours=args.tick_hours,
         a_data_root=args.a_data_root,
         manifest_path=args.manifest,
