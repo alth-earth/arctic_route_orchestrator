@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased - 2026-08-19（Strategy B Performance Hardening + Moving-Vessel Semantics）
+
+- Replan 成本审计：旧 12h = 13 candidate、6 accepted、7 rejected
+  （rejected ≈52% candidate 计算时间）；新增
+  `scripts/replay_performance_audit.py` 逐 tick 输出 candidate/accepted/
+  rejected/pre-gate skip compute 时间与船位/snap 统计；
+- Pre-planning gate（interval 版）：`--replan-min-interval-hours=2` 仅在
+  A/B 内容无变化且 accepted plan 未达间隔时跳过 C，任何
+  DATA/RISK-content 事件无条件放行（fail-closed，不替代 Switch Gate）；
+- 真实 12h 权威（v3 × 3 objectives、3 workers）：1306.8s（约 21.8min），
+  旧 2071.4s → speedup 1.59×，节省约 12.7min；C candidate 13→8、
+  rejected 7→2、pre-gate skip 5；业务轨迹与旧 12h 13/13 逐一一致
+  （plan_revision 1→6、route/risk digest 全等）；
+- Moving-vessel 语义：`NavigationExecutionState` 新增 current_edge_index、
+  current_segment_start/end_eta、effective_speed_knots、speed_source、
+  executed_distance_km、cumulative_travelled_km；validation 增加
+  stationary-vessel / cumulative 单调检查；
+- Determinism：独立输出根复跑（1264.8s），manifest semantic digest、
+  13/13 snapshot digest、risk/route digest 全部一致；wall-clock 允许不同；
+- 24h 扩展（optional）：1743.2s（约 29min）、25 snapshots、candidate 14、
+  accepted 12、rejected 2、skip 11、plan_revision 1→12、validation PASS，
+  12h 前缀与权威 12h 13/13 一致；
+- Persistent-pool + worker component cache 实验：单次 1-tick benchmark
+  percall 167.1s vs persistent 167.5s（无实质收益），默认保留 per-call，
+  persistent 作为显式 opt-in，避免无谓复杂度；
+- Tests：replay unit 34 项、C 142 项、ruff 全绿；RC1/RC2 frozen regression
+  仍 PASS。
+
 ## Unreleased - 2026-08-18 第三轮（Strategy B Semantic Hardening）
 
 - Revision 语义拆分：`data_revision` / `b_input_revision` /

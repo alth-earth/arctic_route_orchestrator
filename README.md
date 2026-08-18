@@ -44,6 +44,12 @@
   `--v2-only` 提供 v2 complete-route 真实规划并集成 12h 回放
   （plan_revision 1→13、route integrity PASS）；v3 four-layer =
   main_corridor contract-edge blocker（待 C 合同 proposal）。
+- Strategy B Performance Hardening（2026-08-19 第四轮）：replan
+  pre-planning gate（`--replan-min-interval-hours`）把 12h 从 2071.4s
+  降到 1306.8s（1.59×、≈21.8min），业务轨迹 13/13 一致、determinism
+  PASS；24h 扩展 1743.2s（≈29min）；Moving-vessel 字段与校验就绪。
+  新增 `scripts/replay_performance_audit.py`。详见
+  `STRATEGY_B_PERFORMANCE_HARDENING_20260819.md`。
 
 ## 接手顺序
 

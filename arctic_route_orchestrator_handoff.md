@@ -37,6 +37,7 @@ GeoJSON 和校验清单。D 未来只读这些完整制品。
 | 非集成门禁 | Ruff、11 tests（含 stage-report 单元测试）、lock/sync/CLI 通过 |
 | 集成长运行 | 阶段报告/超时/失败报告已实现；v2/v3 完整成功路径仍未收口（详见实测记录） |
 | 挑战杯完整链 | 待完成 D 展示和两次断网演示 |
+| Strategy B Causal Replay / Performance | PASS（2026-08-19）：12h=1306.8s（1.59×）、24h=1743.2s；pre-planning gate + moving-vessel 语义；详见 `../STRATEGY_B_PERFORMANCE_HARDENING_20260819.md` |
 
 已完成清单（源自：arctic_route_orchestrator_handoff_归档_20260815.md）：
 
