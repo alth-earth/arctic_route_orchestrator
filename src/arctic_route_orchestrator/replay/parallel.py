@@ -37,6 +37,8 @@ from arctic_route_planning.planners import (
 from arctic_route_planning.risk import RiskSampler
 from arctic_route_risk import PersistentRiskStore
 
+_WORKER_COMPONENT_CACHE: dict[str, dict[str, Any]] = {}
+
 
 def _parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
@@ -57,38 +59,63 @@ def _child_result(
             / f"{commit_id}.json"
         ).read_text(encoding="utf-8")
     )
-    configuration = load_configuration(
-        paths["c_config_root"],
-        commit["scenario_id"],
-        shared_config_root=Path(paths["contracts_config_root"]),
+    cache_key = (
+        f"{commit_id}:{commit.get('config_digest', '')}:"
+        f"{commit.get('model_config_digest', '')}:"
+        f"{paths['c_config_root']}:{paths['contracts_config_root']}"
     )
-    store = PersistentRiskStore(paths["risk_store_root"])
-    from arctic_route_planning.contracts import RiskWindowQuery
+    cached = _WORKER_COMPONENT_CACHE.get(cache_key)
+    if cached is None:
+        configuration = load_configuration(
+            paths["c_config_root"],
+            commit["scenario_id"],
+            shared_config_root=Path(paths["contracts_config_root"]),
+        )
+        from arctic_route_planning.contracts import RiskWindowQuery
 
-    query = RiskWindowQuery(
-        start=_parse_utc(commit["start"]),
-        end=_parse_utc(commit["end"]),
-        interval=timedelta(hours=1),
-        run_id=commit["run_id"],
-        scenario_id=commit["scenario_id"],
-        corridor_id=commit["corridor_id"],
-        generation_id=commit["generation_id"],
-        vessel_profile_id=commit["vessel_profile_id"],
-        config_digest=commit["config_digest"],
-        model_config_digest=commit["model_config_digest"],
-        as_of=_parse_utc(commit["as_of"]),
-    )
-    window = store.get_committed_window(query)
-    frames = tuple(window.frames)
-    sampler = RiskSampler(frames, max_frame_gap=timedelta(hours=1))
-    grid = RegularGrid.from_risk_frame(
-        frames[0],
-        allow_diagonal=configuration.planner.connectivity == 8,
-    )
+        query = RiskWindowQuery(
+            start=_parse_utc(commit["start"]),
+            end=_parse_utc(commit["end"]),
+            interval=timedelta(hours=1),
+            run_id=commit["run_id"],
+            scenario_id=commit["scenario_id"],
+            corridor_id=commit["corridor_id"],
+            generation_id=commit["generation_id"],
+            vessel_profile_id=commit["vessel_profile_id"],
+            config_digest=commit["config_digest"],
+            model_config_digest=commit["model_config_digest"],
+            as_of=_parse_utc(commit["as_of"]),
+        )
+        store = PersistentRiskStore(paths["risk_store_root"])
+        window = store.get_committed_window(query)
+        frames = tuple(window.frames)
+        sampler = RiskSampler(frames, max_frame_gap=timedelta(hours=1))
+        grid = RegularGrid.from_risk_frame(
+            frames[0],
+            allow_diagonal=configuration.planner.connectivity == 8,
+        )
+        vessel_model = VesselPerformanceModel.from_configuration(
+            configuration.vessel_model
+        )
+        cached = {
+            "configuration": configuration,
+            "query": query,
+            "frames": frames,
+            "sampler": sampler,
+            "grid": grid,
+            "vessel_model": vessel_model,
+        }
+        if len(_WORKER_COMPONENT_CACHE) >= 2:
+            _WORKER_COMPONENT_CACHE.clear()
+        _WORKER_COMPONENT_CACHE[cache_key] = cached
+    configuration = cached["configuration"]
+    frames = cached["frames"]
+    sampler = cached["sampler"]
+    grid = cached["grid"]
     planner = TimeDependentAStar(
         grid,
         sampler,
-        VesselPerformanceModel.from_configuration(configuration.vessel_model),
+        cached["vessel_model"],
         planner_config=configuration.planner,
     )
     plan_request = PlanningRequest(
@@ -212,12 +239,14 @@ class _ParallelObjectivePlanner:
         paths: dict[str, str],
         workers: int,
         timeout_seconds: int,
+        pool_mode: str = "persistent",
     ) -> None:
         self.serial = serial
         self.commit_id = commit_id
         self.paths = paths
         self.workers = workers
         self.timeout_seconds = timeout_seconds
+        self.pool_mode = pool_mode
 
     @property
     def risk_identity(self):
@@ -245,9 +274,9 @@ class _ParallelObjectivePlanner:
             "max_expansions": request.max_expansions,
         }
         ordered_objectives = tuple(objectives)
-        with ProcessPoolExecutor(
-            max_workers=min(self.workers, len(ordered_objectives))
-        ) as executor:
+        active_executor = _active_executor
+        if active_executor is not None and self.pool_mode == "persistent":
+            executor = active_executor
             futures = [
                 executor.submit(
                     _child_result,
@@ -262,6 +291,24 @@ class _ParallelObjectivePlanner:
                 future.result(timeout=self.timeout_seconds)
                 for future in futures
             ]
+        else:
+            with ProcessPoolExecutor(
+                max_workers=min(self.workers, len(ordered_objectives))
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        _child_result,
+                        self.paths,
+                        self.commit_id,
+                        request_fields,
+                        objective.value,
+                    )
+                    for objective in ordered_objectives
+                ]
+                documents = [
+                    future.result(timeout=self.timeout_seconds)
+                    for future in futures
+                ]
         results = {
             ObjectiveMode(document["objective"]): _result_from_dict(document)
             for document in documents
@@ -275,6 +322,8 @@ _original_private_planner = None
 _active_paths: dict[str, str] | None = None
 _active_workers = 1
 _active_timeout = 900
+_active_executor: ProcessPoolExecutor | None = None
+_active_pool_mode = "persistent"
 
 
 @contextlib.contextmanager
@@ -286,10 +335,13 @@ def install(
     contracts_config_root: str | Path,
     max_snap_km: float = 30.0,
     timeout_seconds: int = 900,
+    pool_mode: str = "persistent",
 ) -> Iterator[None]:
     """Temporarily route C objective searches through worker processes."""
 
-    global _original_private_planner, _active_paths, _active_workers, _active_timeout
+    global _original_private_planner
+    global _active_paths, _active_workers, _active_timeout
+    global _active_executor, _active_pool_mode
     from arctic_route_planning.ingress import PreparedRiskPlanning
 
     paths = {
@@ -309,13 +361,22 @@ def install(
             paths=dict(_active_paths or paths),
             workers=_active_workers,
             timeout_seconds=_active_timeout,
+            pool_mode=_active_pool_mode,
         )
 
     _active_paths = paths
     _active_workers = max(1, int(workers))
     _active_timeout = timeout_seconds
+    _active_pool_mode = pool_mode
     PreparedRiskPlanning._private_planner = _parallel_private_planner
+    executor = None
+    if pool_mode == "persistent":
+        executor = ProcessPoolExecutor(max_workers=max(1, int(workers)))
+        _active_executor = executor
     try:
         yield
     finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+            _active_executor = None
         PreparedRiskPlanning._private_planner = _original_private_planner

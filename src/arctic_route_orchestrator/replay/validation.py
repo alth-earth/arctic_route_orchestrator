@@ -66,6 +66,7 @@ def validate_replay(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     previous_revisions: dict[str, int] = {}
     previous_nav: dict[str, Any] | None = None
     previous_position: tuple[float, float] | None = None
+    previous_cumulative: float | None = None
     for snapshot in snapshots:
         result = validate_snapshot(snapshot)
         violations.extend(
@@ -113,6 +114,25 @@ def validate_replay(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
             current_count = len(ship.get("completed_track", ()))
             if current_count < previous_count:
                 violations.append("completed_track shrank (history rewrote)")
+            cumulative = ship.get("cumulative_travelled_km")
+            if (
+                previous_nav is not None
+                and cumulative is not None
+                and previous_cumulative is not None
+            ):
+                if cumulative < previous_cumulative - 1e-9:
+                    violations.append(
+                        "cumulative travelled distance moved backwards"
+                    )
+                if (
+                    (current_time - previous_time).total_seconds() > 0.0
+                    and abs(cumulative - previous_cumulative) <= 1e-9
+                    and ship.get("status") == "ACTIVE"
+                    and previous_nav.get("status") == "ACTIVE"
+                ):
+                    violations.append(
+                        "stationary vessel while simulation time advanced"
+                    )
             position = ship.get("current_position")
             if position and previous_position:
                 delta_km = _haversine_km(
@@ -129,10 +149,16 @@ def validate_replay(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
                 if ship.get("current_position")
                 else None
             )
+            previous_cumulative = (
+                float(ship["cumulative_travelled_km"])
+                if ship.get("cumulative_travelled_km") is not None
+                else None
+            )
             previous_nav = ship
         else:
             previous_nav = None
             previous_position = None
+            previous_cumulative = None
         previous_time = current_time
         previous_index = snapshot["snapshot_index"]
     return {

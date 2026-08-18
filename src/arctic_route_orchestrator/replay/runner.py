@@ -190,6 +190,9 @@ class ReplayRunner:
     cache_memory_mb: float = 2048.0
     c_attempt_timeout_seconds: int = 900
     planning_workers: int = 1
+    replan_min_interval_hours: float | None = None
+    replan_waypoint_aligned_only: bool = False
+    parallel_pool_mode: str = "percall"
 
     records: tuple[SourceRecord, ...] = ()
     run_context: RunContext | None = None
@@ -208,6 +211,12 @@ class ReplayRunner:
     observation_sequence: int = 0
     risk_window_revision: int = 0
     navigation_state_revision: int = 0
+    pre_planning_skips: int = 0
+    replan_candidate_computations: int = 0
+    replan_candidates_accepted: int = 0
+    replan_candidates_rejected: int = 0
+    planning_elapsed_seconds: float = 0.0
+    tick_performance: list[dict[str, Any]] = field(default_factory=list)
     risk_semantic_digest: str = ""
     route_semantic_digests: dict[str, dict[str, str]] = field(default_factory=dict)
     last_replan_reasons: tuple[str, ...] = ()
@@ -392,7 +401,47 @@ class ReplayRunner:
             self._last_relevant_digest = relevant_digest
             self._last_data_revision = self.data_revision
 
+            planning_started = time.perf_counter()
             planning = self._planning_tick(tick, index, events, progress=progress)
+            planning_seconds = time.perf_counter() - planning_started
+            self.planning_elapsed_seconds += planning_seconds
+            replan_triggered = any(
+                event.type == "REPLAN_TRIGGERED" for event in events
+            )
+            plan_computed = any(
+                event.type == "PLAN_COMPUTED" for event in events
+            )
+            plan_skipped = any(
+                event.type == "REPLAN_SKIPPED" for event in events
+            )
+            plan_reused = any(
+                event.type == "PLAN_REUSED" for event in events
+            )
+            candidate_computed = (
+                plan_computed or replan_triggered
+                or (plan_reused and not plan_skipped)
+            )
+            candidate_accepted = plan_computed or replan_triggered
+            candidate_rejected = candidate_computed and not candidate_accepted
+            if candidate_computed:
+                self.replan_candidate_computations += 1
+                if candidate_accepted:
+                    self.replan_candidates_accepted += 1
+                else:
+                    self.replan_candidates_rejected += 1
+            if plan_skipped:
+                self.pre_planning_skips += 1
+            self.tick_performance.append(
+                {
+                    "tick": index,
+                    "simulation_time": _iso(tick),
+                    "planning_seconds": round(planning_seconds, 2),
+                    "candidate_computed": candidate_computed,
+                    "candidate_accepted": candidate_accepted,
+                    "candidate_rejected": candidate_rejected,
+                    "pre_planning_skip": plan_skipped,
+                }
+            )
             self._update_navigation(tick)
 
             snapshot = self._snapshot(
@@ -435,6 +484,7 @@ class ReplayRunner:
                         "risk_revision": self.risk_revision,
                         "plan_revision": self.plan_revision,
                         "tick_seconds": round(time.perf_counter() - tick_started, 1),
+                        "planning_seconds": round(planning_seconds, 2),
                     }
                 )
             previous_visible = visible
@@ -478,6 +528,13 @@ class ReplayRunner:
             "plan_revision": self.plan_revision,
             "observation_sequence": self.observation_sequence,
             "navigation_state_revision": self.navigation_state_revision,
+            "replan_candidate_computations": self.replan_candidate_computations,
+            "replan_candidates_accepted": self.replan_candidates_accepted,
+            "replan_candidates_rejected": self.replan_candidates_rejected,
+            "pre_planning_skips": self.pre_planning_skips,
+            "planning_elapsed_seconds": round(self.planning_elapsed_seconds, 1),
+            "tick_performance": self.tick_performance,
+            "replan_min_interval_hours": self.replan_min_interval_hours,
             "risk_commit_id": self.risk_commit.commit_id if self.risk_commit else None,
             "risk_valid_start": _iso(self.risk_valid_start) if self.risk_valid_start else None,
             "risk_valid_end": _iso(self.risk_valid_end) if self.risk_valid_end else None,
@@ -487,6 +544,7 @@ class ReplayRunner:
             "planning_blockers": list(self.planning_blockers),
             "v2_probe_eta_hours": self.v2_probe_eta_hours,
             "planning_workers": self.planning_workers,
+            "parallel_pool_mode": self.parallel_pool_mode,
             "route_semantic_digests": self.route_semantic_digests,
             "events": [event.to_dict() for event in self.events],
             "total_elapsed_seconds": round(time.perf_counter() - started, 1),
@@ -638,6 +696,43 @@ class ReplayRunner:
                 progress({"stage": "C initial planning attempt", "tick": _iso(tick)})
             self._run_planning(self._attempt_initial_plan, tick, events)
         elif self.current_plan is not None:
+            if self._should_skip_replan(tick, events):
+                self.last_replan_reasons = ()
+                events.append(
+                    ReplayEvent(
+                        type="REPLAN_SKIPPED",
+                        simulation_time=_iso(tick),
+                        revision=str(self.plan_revision),
+                        description=(
+                            "pre-planning gate: no data/risk-content change "
+                            "and accepted plan is younger than "
+                            f"{self.replan_min_interval_hours:g}h"
+                        ),
+                        observed=True,
+                    )
+                )
+                return PlanningStateSummary(
+                    plan_revision=self.plan_revision,
+                    planning_as_of=_iso(tick),
+                    departure_time=_iso(tick),
+                    planning_valid_start=_iso(tick),
+                    planning_valid_end=(
+                        _iso(self.planning_valid_end)
+                        if self.planning_valid_end
+                        else None
+                    ),
+                    supported_layers=self.supported_layers,
+                    unsupported_layers=self.unsupported_layers,
+                    blockers=self.planning_blockers,
+                    resources=(
+                        {"route_integrity": self._route_integrity}
+                        if self._route_integrity is not None
+                        else {}
+                    ),
+                    observation_sequence=self.observation_sequence,
+                    replan_reasons=self.last_replan_reasons,
+                    route_semantic_digests=dict(self.route_semantic_digests),
+                )
             self._run_planning(self._attempt_replan, tick, events)
         return PlanningStateSummary(
             plan_revision=self.plan_revision,
@@ -662,6 +757,83 @@ class ReplayRunner:
             route_semantic_digests=dict(self.route_semantic_digests),
         )
 
+    def _should_skip_replan(
+        self,
+        tick: datetime,
+        events: list[ReplayEvent],
+    ) -> bool:
+        """Cheap pre-planning gate (never replaces the Switch Gate).
+
+        A replan can be skipped before paying for the expensive C candidate
+        only when all of the following are true:
+
+        * the policy interval is configured;
+        * the accepted plan is younger than the interval;
+        * no real A data or B risk-content change occurred this tick
+          (window suffix advances alone are not a content change);
+        * the accepted route still has at least one interval of remaining
+          planning horizon (fail-closed near arrival).
+        """
+
+        if self.current_plan is None:
+            return False
+        if (
+            self.replan_min_interval_hours is None
+            and not self.replan_waypoint_aligned_only
+        ):
+            return False
+        content_changed = any(
+            event.type
+            in (
+                "DATA_REVISION_CHANGED",
+                "DATA_BECAME_VISIBLE",
+                "RISK_CONTENT_UPDATED",
+                "RISK_REVISION_CHANGED",
+            )
+            for event in events
+        )
+        if content_changed:
+            return False
+        if self.replan_waypoint_aligned_only:
+            edge_progress = self._route_edge_progress(tick, self.current_plan)
+            if edge_progress is None or abs(edge_progress) > 1e-6:
+                return True
+        if self.replan_min_interval_hours is None:
+            return False
+        if self.replan_min_interval_hours <= 0.0:
+            return False
+        start_time = getattr(self.current_plan, "start_time", None)
+        if start_time is None:
+            return False
+        elapsed = tick - start_time
+        if elapsed < timedelta(hours=self.replan_min_interval_hours):
+            return True
+        waypoints = tuple(getattr(self.current_plan, "waypoints", ()))
+        if not waypoints:
+            return False
+        remaining = waypoints[-1].eta - tick
+        if remaining < timedelta(hours=self.replan_min_interval_hours):
+            return False
+        return False
+
+    def _route_edge_progress(self, tick: datetime, plan: Any) -> float | None:
+        waypoints = tuple(getattr(plan, "waypoints", ()))
+        if not waypoints:
+            return None
+        reached = -1
+        for index, waypoint in enumerate(waypoints):
+            if waypoint.eta <= tick:
+                reached = index
+            else:
+                break
+        if reached == len(waypoints) - 1:
+            return 1.0
+        start = waypoints[max(0, reached)]
+        end = waypoints[reached + 1]
+        span = (end.eta - start.eta).total_seconds()
+        if span <= 0.0:
+            return 0.0
+        return max(0.0, min(1.0, (tick - start.eta).total_seconds() / span))
     def _run_planning(self, operation, tick: datetime, events: list[ReplayEvent]) -> None:
         if self.planning_workers <= 1:
             operation(tick, events)
@@ -673,6 +845,7 @@ class ReplayRunner:
             contracts_config_root=self.contracts_config_root,
             max_snap_km=self.max_snap_km,
             timeout_seconds=self.c_attempt_timeout_seconds,
+            pool_mode=self.parallel_pool_mode,
         ):
             operation(tick, events)
 
@@ -1007,6 +1180,8 @@ class ReplayRunner:
         return node
 
     def _position_at(self, tick: datetime, plan: Any) -> dict[str, Any]:
+        from arctic_route_planning.domain import GeoPoint
+
         waypoints = tuple(plan.waypoints)
         if not waypoints:
             return {
@@ -1015,6 +1190,11 @@ class ReplayRunner:
                 "edge_progress": None,
                 "arrived": False,
                 "reached_index": -1,
+                "current_edge_index": None,
+                "current_segment_start_eta": None,
+                "current_segment_end_eta": None,
+                "effective_speed_knots": None,
+                "executed_distance_km": 0.0,
             }
         reached = -1
         for index, waypoint in enumerate(waypoints):
@@ -1027,6 +1207,17 @@ class ReplayRunner:
             node, adjustment = self._snap_position(
                 waypoint.longitude, waypoint.latitude, tick
             )
+            edge_index = max(0, len(waypoints) - 2)
+            start = waypoints[edge_index]
+            end = waypoints[-1]
+            span_hours = max(
+                1e-9,
+                (end.eta - start.eta).total_seconds() / 3600.0,
+            )
+            segment_km = haversine_km(
+                GeoPoint(longitude=start.longitude, latitude=start.latitude),
+                GeoPoint(longitude=end.longitude, latitude=end.latitude),
+            )
             return {
                 "position": {
                     "longitude": waypoint.longitude,
@@ -1037,9 +1228,17 @@ class ReplayRunner:
                 "snap_adjustment_km": adjustment,
                 "arrived": True,
                 "reached_index": reached,
+                "current_edge_index": edge_index,
+                "current_segment_start_eta": _iso(start.eta),
+                "current_segment_end_eta": _iso(end.eta),
+                "effective_speed_knots": segment_km / span_hours / 1.852,
+                "executed_distance_km": float(
+                    getattr(plan.metrics, "distance_km", 0.0)
+                ),
             }
         if reached < 0:
             start = waypoints[0]
+            end = waypoints[1] if len(waypoints) > 1 else waypoints[0]
             position = {
                 "longitude": start.longitude,
                 "latitude": start.latitude,
@@ -1065,6 +1264,33 @@ class ReplayRunner:
                 + (end.latitude - start.latitude) * fraction,
             }
             index = reached
+        span_hours = max(
+            1e-9,
+            (end.eta - start.eta).total_seconds() / 3600.0,
+        )
+        segment_km = haversine_km(
+            GeoPoint(longitude=start.longitude, latitude=start.latitude),
+            GeoPoint(longitude=end.longitude, latitude=end.latitude),
+        )
+        executed_km = 0.0
+        for waypoint_index in range(index):
+            executed_km += haversine_km(
+                GeoPoint(
+                    longitude=waypoints[waypoint_index].longitude,
+                    latitude=waypoints[waypoint_index].latitude,
+                ),
+                GeoPoint(
+                    longitude=waypoints[waypoint_index + 1].longitude,
+                    latitude=waypoints[waypoint_index + 1].latitude,
+                ),
+            )
+        executed_km += haversine_km(
+            GeoPoint(longitude=start.longitude, latitude=start.latitude),
+            GeoPoint(
+                longitude=position["longitude"],
+                latitude=position["latitude"],
+            ),
+        )
         node, adjustment = self._snap_position(
             position["longitude"], position["latitude"], tick
         )
@@ -1075,6 +1301,11 @@ class ReplayRunner:
             "snap_adjustment_km": adjustment,
             "arrived": False,
             "reached_index": index,
+            "current_edge_index": index,
+            "current_segment_start_eta": _iso(start.eta),
+            "current_segment_end_eta": _iso(end.eta),
+            "effective_speed_knots": segment_km / span_hours / 1.852,
+            "executed_distance_km": executed_km,
         }
 
     def _snap_position(
@@ -1197,6 +1428,13 @@ class ReplayRunner:
                     ).astimezone(UTC),
                     tick,
                 )
+        cumulative = None
+        if previous is not None and previous.cumulative_travelled_km is not None:
+            cumulative = float(previous.cumulative_travelled_km)
+            if delta is not None:
+                cumulative += max(delta, 0.0)
+        else:
+            cumulative = float(result.get("executed_distance_km") or 0.0)
         arrived = bool(result["arrived"])
         status = "ARRIVED" if arrived else "ACTIVE"
         executed_until = (
@@ -1217,6 +1455,13 @@ class ReplayRunner:
             snap_adjustment_km=result.get("snap_adjustment_km"),
             last_distance_delta_km=delta,
             expected_travel_km=expected,
+            current_edge_index=result.get("current_edge_index"),
+            current_segment_start_eta=result.get("current_segment_start_eta"),
+            current_segment_end_eta=result.get("current_segment_end_eta"),
+            effective_speed_knots=result.get("effective_speed_knots"),
+            speed_source="waypoint_eta_linear_interpolation",
+            executed_distance_km=result.get("executed_distance_km"),
+            cumulative_travelled_km=cumulative,
         )
 
     def _remaining_distance_km(
@@ -1432,6 +1677,12 @@ class ReplayRunner:
                 "plan_revision": self.plan_revision,
                 "observation_sequence": self.observation_sequence,
                 "navigation_state_revision": self.navigation_state_revision,
+                "pre_planning_skips": self.pre_planning_skips,
+                "replan_candidate_computations": self.replan_candidate_computations,
+                "replan_candidates_accepted": self.replan_candidates_accepted,
+                "replan_candidates_rejected": self.replan_candidates_rejected,
+                "planning_elapsed_seconds": self.planning_elapsed_seconds,
+                "tick_performance": self.tick_performance,
                 "input_revision": self.input_revision,
                 "risk_commit_id": self.risk_commit.commit_id if self.risk_commit else None,
                 "risk_semantic_digest": self.risk_semantic_digest,
@@ -1453,6 +1704,20 @@ class ReplayRunner:
         self.navigation_state_revision = int(
             checkpoint.get("navigation_state_revision", 0)
         )
+        self.pre_planning_skips = int(checkpoint.get("pre_planning_skips", 0))
+        self.replan_candidate_computations = int(
+            checkpoint.get("replan_candidate_computations", 0)
+        )
+        self.replan_candidates_accepted = int(
+            checkpoint.get("replan_candidates_accepted", 0)
+        )
+        self.replan_candidates_rejected = int(
+            checkpoint.get("replan_candidates_rejected", 0)
+        )
+        self.planning_elapsed_seconds = float(
+            checkpoint.get("planning_elapsed_seconds", 0.0)
+        )
+        self.tick_performance = list(checkpoint.get("tick_performance", []))
         self.risk_semantic_digest = str(checkpoint.get("risk_semantic_digest", ""))
         self._last_window_identity = str(checkpoint.get("last_window_identity", ""))
         self.route_semantic_digests = dict(

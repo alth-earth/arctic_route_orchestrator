@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 from arctic_route_planning.domain import ReplanReason
 
 from arctic_route_orchestrator.replay.digests import replay_semantic_digest
 from arctic_route_orchestrator.replay.models import NavigationExecutionState, ReplayEvent
 from arctic_route_orchestrator.replay.runner import (
+    ReplayRunner,
     _honest_replan_reasons,
     merge_completed_track,
 )
@@ -32,6 +34,13 @@ def _nav(status: str = "ACTIVE", revision: int = 3) -> NavigationExecutionState:
         snap_adjustment_km=0.0,
         last_distance_delta_km=8.0,
         expected_travel_km=9.0,
+        current_edge_index=2,
+        current_segment_start_eta="2026-08-15T12:00:00Z",
+        current_segment_end_eta="2026-08-15T14:00:00Z",
+        effective_speed_knots=14.2,
+        speed_source="waypoint_eta_linear_interpolation",
+        executed_distance_km=120.0,
+        cumulative_travelled_km=130.0,
     )
 
 
@@ -164,6 +173,17 @@ def test_validate_replay_accepts_active_navigation_and_flags_rewind() -> None:
         _snapshot(0, "2026-08-15T10:00:00Z"),
         _snapshot(1, "2026-08-15T11:00:00Z"),
     ]
+    moving = _nav(revision=4).to_dict()
+    moving["current_position"] = {"longitude": 15.0, "latitude": 70.5}
+    moving["cumulative_travelled_km"] = 140.0
+    snapshots[1]["ship_state"] = moving
+    snapshots[1]["snapshot_digest"] = replay_semantic_digest(
+        {
+            key: value
+            for key, value in snapshots[1].items()
+            if key != "snapshot_digest"
+        }
+    )
     result = validate_replay(snapshots)
     assert result["status"] == "PASS"
 
@@ -175,3 +195,115 @@ def test_validate_replay_accepts_active_navigation_and_flags_rewind() -> None:
     result = validate_replay([snapshots[0], bad])
     assert result["status"] == "FAIL"
     assert any("navigation_revision moved backwards" in item for item in result["violations"])
+
+
+def test_validate_replay_flags_stationary_vessel() -> None:
+    first = _snapshot(0, "2026-08-15T10:00:00Z")
+    second = _snapshot(1, "2026-08-15T11:00:00Z")
+    moving = _nav(revision=4).to_dict()
+    moving["cumulative_travelled_km"] = 130.0
+    second["ship_state"] = moving
+    second["snapshot_digest"] = replay_semantic_digest(
+        {key: value for key, value in second.items() if key != "snapshot_digest"}
+    )
+    result = validate_replay([first, second])
+    assert result["status"] == "FAIL"
+    assert any(
+        "stationary vessel while simulation time advanced" in item
+        for item in result["violations"]
+    )
+
+
+def test_pre_planning_gate_respects_interval_and_data_change() -> None:
+    start = datetime(2026, 8, 15, 10, tzinfo=UTC)
+    plan = SimpleNamespace(
+        start_time=start,
+        waypoints=(
+            SimpleNamespace(eta=start + timedelta(hours=2)),
+            SimpleNamespace(eta=start + timedelta(hours=60)),
+        ),
+    )
+    runner = ReplayRunner(
+        replay_id="test",
+        scenario_id="s",
+        corridor_id="c",
+        replay_start=start,
+        replay_end=start + timedelta(hours=2),
+        tick_cadence_hours=1,
+        a_data_root=None,
+        manifest_path=None,
+        b_config_path=None,
+        c_config_root=None,
+        contracts_config_root=None,
+        frozen_run_context_path=None,
+        replan_min_interval_hours=2.0,
+    )
+    runner.current_plan = plan
+    tick_young = start + timedelta(hours=1)
+    assert runner._should_skip_replan(
+        tick_young,
+        [ReplayEvent(type="CLOCK_TICK", simulation_time=tick_young.isoformat())],
+    ) is True
+    tick_boundary = start + timedelta(hours=2)
+    assert runner._should_skip_replan(
+        tick_boundary,
+        [ReplayEvent(type="CLOCK_TICK", simulation_time=tick_boundary.isoformat())],
+    ) is False
+    assert runner._should_skip_replan(
+        tick_young,
+        [
+            ReplayEvent(
+                type="DATA_REVISION_CHANGED",
+                simulation_time=tick_young.isoformat(),
+            )
+        ],
+    ) is False
+
+
+def test_pre_planning_gate_waits_for_waypoint_alignment() -> None:
+    start = datetime(2026, 8, 15, 10, tzinfo=UTC)
+    plan = SimpleNamespace(
+        start_time=start,
+        waypoints=(
+            SimpleNamespace(eta=start),
+            SimpleNamespace(eta=start + timedelta(hours=2)),
+            SimpleNamespace(eta=start + timedelta(hours=60)),
+        ),
+    )
+    runner = ReplayRunner(
+        replay_id="test",
+        scenario_id="s",
+        corridor_id="c",
+        replay_start=start,
+        replay_end=start + timedelta(hours=4),
+        tick_cadence_hours=1,
+        a_data_root=None,
+        manifest_path=None,
+        b_config_path=None,
+        c_config_root=None,
+        contracts_config_root=None,
+        frozen_run_context_path=None,
+        replan_min_interval_hours=1.0,
+        replan_waypoint_aligned_only=True,
+    )
+    runner.current_plan = plan
+    interior = start + timedelta(hours=1)
+    assert runner._should_skip_replan(
+        interior,
+        [ReplayEvent(type="CLOCK_TICK", simulation_time=interior.isoformat())],
+    ) is True
+    waypoint = start + timedelta(hours=2)
+    assert runner._should_skip_replan(
+        waypoint,
+        [ReplayEvent(type="CLOCK_TICK", simulation_time=waypoint.isoformat())],
+    ) is False
+    event_tick = interior + timedelta(hours=1)
+    assert runner._should_skip_replan(
+        event_tick,
+        [
+            ReplayEvent(
+                type="RISK_CONTENT_UPDATED",
+                simulation_time=event_tick.isoformat(),
+            )
+        ],
+    ) is False

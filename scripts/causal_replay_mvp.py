@@ -83,6 +83,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-snap-km", type=float, default=30.0)
     parser.add_argument("--cache-memory-mb", type=float, default=2048.0)
     parser.add_argument("--planning-workers", type=int, default=1)
+    parser.add_argument("--replan-min-interval-hours", type=float, default=None)
+    parser.add_argument("--replan-waypoint-aligned-only", action="store_true")
+    parser.add_argument(
+        "--parallel-pool-mode",
+        choices=("persistent", "percall"),
+        default="percall",
+    )
     args = parser.parse_args(argv)
 
     replay_start = _parse_utc(args.replay_start)
@@ -116,6 +123,9 @@ def main(argv: list[str] | None = None) -> int:
         max_snap_km=args.max_snap_km,
         cache_memory_mb=args.cache_memory_mb,
         planning_workers=args.planning_workers,
+        replan_min_interval_hours=args.replan_min_interval_hours,
+        replan_waypoint_aligned_only=args.replan_waypoint_aligned_only,
+        parallel_pool_mode=args.parallel_pool_mode,
     )
 
     def progress(item: dict) -> None:

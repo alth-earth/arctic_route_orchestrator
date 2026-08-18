@@ -159,6 +159,13 @@ class NavigationExecutionState:
     snap_adjustment_km: float | None = None
     last_distance_delta_km: float | None = None
     expected_travel_km: float | None = None
+    current_edge_index: int | None = None
+    current_segment_start_eta: str | None = None
+    current_segment_end_eta: str | None = None
+    effective_speed_knots: float | None = None
+    speed_source: str = "waypoint_eta_linear_interpolation"
+    executed_distance_km: float | None = None
+    cumulative_travelled_km: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -177,6 +184,13 @@ class NavigationExecutionState:
             "snap_adjustment_km": self.snap_adjustment_km,
             "last_distance_delta_km": self.last_distance_delta_km,
             "expected_travel_km": self.expected_travel_km,
+            "current_edge_index": self.current_edge_index,
+            "current_segment_start_eta": self.current_segment_start_eta,
+            "current_segment_end_eta": self.current_segment_end_eta,
+            "effective_speed_knots": self.effective_speed_knots,
+            "speed_source": self.speed_source,
+            "executed_distance_km": self.executed_distance_km,
+            "cumulative_travelled_km": self.cumulative_travelled_km,
         }
 
     @classmethod
@@ -211,6 +225,25 @@ class NavigationExecutionState:
             snap_adjustment_km=document.get("snap_adjustment_km"),
             last_distance_delta_km=document.get("last_distance_delta_km"),
             expected_travel_km=document.get("expected_travel_km"),
+            current_edge_index=(
+                int(document["current_edge_index"])
+                if document.get("current_edge_index") is not None
+                else None
+            ),
+            current_segment_start_eta=document.get("current_segment_start_eta"),
+            current_segment_end_eta=document.get("current_segment_end_eta"),
+            effective_speed_knots=(
+                float(document["effective_speed_knots"])
+                if document.get("effective_speed_knots") is not None
+                else None
+            ),
+            speed_source=str(
+                document.get(
+                    "speed_source", "waypoint_eta_linear_interpolation"
+                )
+            ),
+            executed_distance_km=document.get("executed_distance_km"),
+            cumulative_travelled_km=document.get("cumulative_travelled_km"),
         )
 
 
