@@ -74,6 +74,11 @@ from arctic_route_orchestrator.replay.models import (
     RiskStateSummary,
     SimulationSnapshot,
 )
+from arctic_route_orchestrator.replay.vessel_motion import (
+    InvalidRouteTimingError,
+    VesselState,
+    vessel_state_at,
+)
 
 EXPECTED_INTERVAL_HOURS: dict[str, float | None] = {
     "land_sea_mask": None,
@@ -193,6 +198,16 @@ class ReplayRunner:
     replan_min_interval_hours: float | None = None
     replan_waypoint_aligned_only: bool = False
     parallel_pool_mode: str = "percall"
+    pending_plan: Any = None
+    pending_plan_set: Any = None
+    pending_plan_kind: str = ""
+    pending_decision_time: datetime | None = None
+    pending_adoption_time: datetime | None = None
+    pending_revision: int = 0
+    pending_origin_node: tuple[int, int] | None = None
+    pending_origin_adjustment_km: float | None = None
+    pending_decision_position: dict[str, float] | None = None
+    active_plan_time_offset: timedelta = field(default_factory=timedelta)
 
     records: tuple[SourceRecord, ...] = ()
     run_context: RunContext | None = None
@@ -686,6 +701,7 @@ class ReplayRunner:
                 unsupported_layers=self.unsupported_layers,
                 blockers=("RISK_NOT_READY",),
             )
+        self._adopt_pending_if_due(tick, events)
         if (
             self.current_plan is None
             and self.plan_revision == 0
@@ -952,8 +968,8 @@ class ReplayRunner:
             )
 
     def _attempt_replan(self, tick: datetime, events: list[ReplayEvent]) -> None:
-        origin = self._origin_for_tick(tick)
-        if origin is None:
+        adoption_spec = self._plan_adoption_spec(tick, self.current_plan)
+        if adoption_spec is None:
             events.append(
                 ReplayEvent(
                     type="PLAN_REUSED",
@@ -965,6 +981,7 @@ class ReplayRunner:
             )
             self.last_replan_reasons = ()
             return
+        origin = adoption_spec["origin_node"]
         self.observation_sequence += 1
         self.input_revision = self.observation_sequence
         request = self._planning_request(
@@ -987,12 +1004,13 @@ class ReplayRunner:
                 )
                 published = policy_triggered and outcome.batch.published
                 if published:
-                    self.plan_revision += 1
-                    self.current_plan = outcome.batch.selected
-                    self.current_batch = outcome.batch
-                    self.current_plan_set = None
-                    self._audit_and_attach_route()
-                    self._attach_route_digests()
+                    self._accept_published_replan(
+                        tick,
+                        adoption_spec,
+                        plan=outcome.batch.selected,
+                        plan_set=None,
+                        plan_kind="v2_complete_route_fallback",
+                    )
             else:
                 outcome = prepared.replan_four_layer_if_needed(observation)
                 policy_triggered = (
@@ -1000,33 +1018,49 @@ class ReplayRunner:
                 )
                 published = policy_triggered and outcome.outcome.published
                 if published:
-                    self.plan_revision += 1
-                    self.current_plan_set = outcome.outcome.plan_set
-                    self.current_plan = outcome.outcome.plan_set.recommended
-                    self._audit_and_attach_route()
-                    self._attach_route_digests()
+                    self._accept_published_replan(
+                        tick,
+                        adoption_spec,
+                        plan=outcome.outcome.plan_set.recommended,
+                        plan_set=outcome.outcome.plan_set,
+                        plan_kind="v3_four_layer",
+                    )
             triggered = published
             self.last_replan_reasons = _honest_replan_reasons(
                 outcome.decision.reasons, events
             )
             if triggered:
-                events.append(
-                    ReplayEvent(
-                        type="REPLAN_TRIGGERED",
-                        simulation_time=_iso(tick),
-                        revision=str(self.plan_revision),
-                        description=",".join(self.last_replan_reasons),
-                        observed=True,
+                if adoption_spec["mode"] == "IMMEDIATE":
+                    events.append(
+                        ReplayEvent(
+                            type="REPLAN_TRIGGERED",
+                            simulation_time=_iso(tick),
+                            revision=str(self.plan_revision),
+                            description=",".join(self.last_replan_reasons),
+                            observed=True,
+                        )
                     )
-                )
-                events.append(
-                    ReplayEvent(
-                        type="ROUTE_CHANGED",
-                        simulation_time=_iso(tick),
-                        revision=str(self.plan_revision),
-                        observed=True,
+                    events.append(
+                        ReplayEvent(
+                            type="ROUTE_CHANGED",
+                            simulation_time=_iso(tick),
+                            revision=str(self.plan_revision),
+                            observed=True,
+                        )
                     )
-                )
+                else:
+                    events.append(
+                        ReplayEvent(
+                            type="REPLAN_DECIDED",
+                            simulation_time=_iso(tick),
+                            revision=str(self.pending_revision),
+                            description=(
+                                f"deferred adoption at {_iso(self.pending_adoption_time)}; "
+                                "physical vessel stays on current accepted segment"
+                            ),
+                            observed=True,
+                        )
+                    )
             else:
                 events.append(
                     ReplayEvent(
@@ -1058,6 +1092,183 @@ class ReplayRunner:
                     observed=True,
                 )
             )
+
+    def _accept_published_replan(
+        self,
+        tick: datetime,
+        adoption_spec: dict[str, Any],
+        *,
+        plan: Any,
+        plan_set: Any,
+        plan_kind: str,
+    ) -> None:
+        """Store a published candidate as the accepted plan.
+
+        At an exact accepted-route waypoint the plan can be adopted
+        immediately.  Mid-edge decisions are deferred: the physical vessel
+        stays on the current accepted segment and the new plan becomes the
+        accepted route only when the vessel reaches the planner-origin node.
+        """
+
+        if adoption_spec["mode"] == "IMMEDIATE":
+            self.current_plan = plan
+            self.current_plan_set = plan_set
+            self.plan_kind = plan_kind
+            self.plan_revision += 1
+            self.active_plan_time_offset = timedelta()
+            self.pending_plan = None
+            self.pending_plan_set = None
+            self.pending_plan_kind = ""
+            self.pending_decision_time = None
+            self.pending_adoption_time = None
+            self.pending_revision = 0
+            self.pending_origin_node = None
+            self.pending_origin_adjustment_km = None
+            self.pending_decision_position = None
+            self._audit_and_attach_route()
+            self._attach_route_digests()
+            return
+        self.pending_plan = plan
+        self.pending_plan_set = plan_set
+        self.pending_plan_kind = plan_kind
+        self.pending_decision_time = tick
+        self.pending_adoption_time = adoption_spec["adoption_time"]
+        self.pending_revision = self.plan_revision + 1
+        self.pending_origin_node = adoption_spec["origin_node"]
+        self.pending_origin_adjustment_km = adoption_spec[
+            "origin_adjustment_km"
+        ]
+        self.pending_decision_position = self._physical_state_at(
+            tick, self.current_plan
+        ).position
+
+    def _adopt_pending_if_due(
+        self,
+        tick: datetime,
+        events: list[ReplayEvent],
+    ) -> None:
+        """Switch a deferred plan into the accepted route at adoption time."""
+
+        if (
+            self.pending_plan is None
+            or self.pending_adoption_time is None
+            or tick < self.pending_adoption_time
+        ):
+            return
+        self.current_plan = self.pending_plan
+        self.current_plan_set = self.pending_plan_set
+        self.plan_kind = self.pending_plan_kind
+        self.plan_revision = self.pending_revision
+        self.active_plan_time_offset = (
+            self.pending_adoption_time - self.pending_decision_time
+            if self.pending_decision_time is not None
+            else timedelta()
+        )
+        self._audit_and_attach_route()
+        self._attach_route_digests()
+        events.append(
+            ReplayEvent(
+                type="REPLAN_ADOPTED",
+                simulation_time=_iso(tick),
+                revision=str(self.plan_revision),
+                description="deferred plan adopted at execution node",
+                observed=True,
+            )
+        )
+        events.append(
+            ReplayEvent(
+                type="ROUTE_CHANGED",
+                simulation_time=_iso(tick),
+                revision=str(self.plan_revision),
+                description="deferred adoption",
+                observed=True,
+            )
+        )
+        self.pending_plan = None
+        self.pending_plan_set = None
+        self.pending_plan_kind = ""
+        self.pending_decision_time = None
+        self.pending_adoption_time = None
+        self.pending_revision = 0
+        self.pending_origin_node = None
+        self.pending_origin_adjustment_km = None
+        self.pending_decision_position = None
+
+    def _plan_adoption_spec(
+        self,
+        tick: datetime,
+        plan: Any,
+    ) -> dict[str, Any] | None:
+        """Build the planner-origin / effective-adoption tuple for a replan.
+
+        The planner may only start from a grid node.  This does NOT move the
+        physical ship: the returned node is either the current accepted-route
+        waypoint (immediate) or the next waypoint on the accepted route
+        (deferred until the vessel physically reaches it).
+        """
+
+        waypoints = tuple(getattr(plan, "waypoints", ()))
+        if not waypoints:
+            return None
+        state = self._physical_state_at(tick, plan)
+        if state.status == "ARRIVED":
+            return None
+        offset = (
+            self.active_plan_time_offset
+            if plan is self.current_plan
+            else timedelta()
+        )
+        if state.status == "NOT_STARTED":
+            waypoint = waypoints[0]
+            node, adjustment = self._snap_position(
+                waypoint.longitude, waypoint.latitude, tick
+            )
+            return {
+                "origin_node": node,
+                "origin_adjustment_km": adjustment,
+                "adoption_time": waypoint.eta + offset,
+                "mode": "IMMEDIATE",
+            }
+        index = int(state.edge_index)
+        if state.edge_progress == 0.0 and index >= 0:
+            origin_waypoint = waypoints[index]
+            mode = "IMMEDIATE"
+            adoption_time = origin_waypoint.eta + offset
+        else:
+            origin_waypoint = waypoints[index + 1]
+            mode = "NEXT_WAYPOINT_DEFERRED"
+            adoption_time = origin_waypoint.eta + offset
+        node, adjustment = self._snap_position(
+            origin_waypoint.longitude, origin_waypoint.latitude, tick
+        )
+        return {
+            "origin_node": node,
+            "origin_adjustment_km": adjustment,
+            "adoption_time": adoption_time,
+            "mode": mode,
+        }
+
+    def _physical_state_at(self, tick: datetime, plan: Any) -> VesselState:
+        """Pure physical kinematics for the accepted route at ``tick``."""
+
+        offset = (
+            self.active_plan_time_offset
+            if plan is self.current_plan
+            else timedelta()
+        )
+        motion_tick = tick - offset
+        total_distance_km = getattr(
+            getattr(plan, "metrics", None), "distance_km", None
+        )
+        return vessel_state_at(
+            motion_tick,
+            tuple(getattr(plan, "waypoints", ())),
+            total_distance_km=(
+                float(total_distance_km)
+                if total_distance_km is not None
+                else None
+            ),
+        )
 
     def _probe_v2(self, tick: datetime) -> str | None:
         """Independent second C-API probe (v2 batch) for honest evidence."""
@@ -1173,139 +1384,38 @@ class ReplayRunner:
 
         if self.current_plan is None:
             return self.endpoint_mapping.start.node
-        result = self._position_at(tick, self.current_plan)
-        node = result["current_node"]
-        if node is None or node == self.endpoint_mapping.goal.node:
+        adoption_spec = self._plan_adoption_spec(tick, self.current_plan)
+        if adoption_spec is None:
+            return None
+        node = adoption_spec["origin_node"]
+        if node == self.endpoint_mapping.goal.node:
             return None
         return node
 
     def _position_at(self, tick: datetime, plan: Any) -> dict[str, Any]:
-        from arctic_route_planning.domain import GeoPoint
+        """Backward-compatible wrapper: pure physical state + planner snap."""
 
-        waypoints = tuple(plan.waypoints)
-        if not waypoints:
-            return {
-                "position": None,
-                "current_node": None,
-                "edge_progress": None,
-                "arrived": False,
-                "reached_index": -1,
-                "current_edge_index": None,
-                "current_segment_start_eta": None,
-                "current_segment_end_eta": None,
-                "effective_speed_knots": None,
-                "executed_distance_km": 0.0,
-            }
-        reached = -1
-        for index, waypoint in enumerate(waypoints):
-            if waypoint.eta <= tick:
-                reached = index
-            else:
-                break
-        if reached == len(waypoints) - 1:
-            waypoint = waypoints[-1]
-            node, adjustment = self._snap_position(
-                waypoint.longitude, waypoint.latitude, tick
-            )
-            edge_index = max(0, len(waypoints) - 2)
-            start = waypoints[edge_index]
-            end = waypoints[-1]
-            span_hours = max(
-                1e-9,
-                (end.eta - start.eta).total_seconds() / 3600.0,
-            )
-            segment_km = haversine_km(
-                GeoPoint(longitude=start.longitude, latitude=start.latitude),
-                GeoPoint(longitude=end.longitude, latitude=end.latitude),
-            )
-            return {
-                "position": {
-                    "longitude": waypoint.longitude,
-                    "latitude": waypoint.latitude,
-                },
-                "current_node": node,
-                "edge_progress": 1.0,
-                "snap_adjustment_km": adjustment,
-                "arrived": True,
-                "reached_index": reached,
-                "current_edge_index": edge_index,
-                "current_segment_start_eta": _iso(start.eta),
-                "current_segment_end_eta": _iso(end.eta),
-                "effective_speed_knots": segment_km / span_hours / 1.852,
-                "executed_distance_km": float(
-                    getattr(plan.metrics, "distance_km", 0.0)
-                ),
-            }
-        if reached < 0:
-            start = waypoints[0]
-            end = waypoints[1] if len(waypoints) > 1 else waypoints[0]
-            position = {
-                "longitude": start.longitude,
-                "latitude": start.latitude,
-            }
-            fraction = 0.0
-            index = 0
-        else:
-            start = waypoints[reached]
-            end = waypoints[reached + 1]
-            span = (end.eta - start.eta).total_seconds()
-            fraction = (
-                0.0
-                if span <= 0.0
-                else max(
-                    0.0,
-                    min(1.0, (tick - start.eta).total_seconds() / span),
-                )
-            )
-            position = {
-                "longitude": start.longitude
-                + (end.longitude - start.longitude) * fraction,
-                "latitude": start.latitude
-                + (end.latitude - start.latitude) * fraction,
-            }
-            index = reached
-        span_hours = max(
-            1e-9,
-            (end.eta - start.eta).total_seconds() / 3600.0,
-        )
-        segment_km = haversine_km(
-            GeoPoint(longitude=start.longitude, latitude=start.latitude),
-            GeoPoint(longitude=end.longitude, latitude=end.latitude),
-        )
-        executed_km = 0.0
-        for waypoint_index in range(index):
-            executed_km += haversine_km(
-                GeoPoint(
-                    longitude=waypoints[waypoint_index].longitude,
-                    latitude=waypoints[waypoint_index].latitude,
-                ),
-                GeoPoint(
-                    longitude=waypoints[waypoint_index + 1].longitude,
-                    latitude=waypoints[waypoint_index + 1].latitude,
-                ),
-            )
-        executed_km += haversine_km(
-            GeoPoint(longitude=start.longitude, latitude=start.latitude),
-            GeoPoint(
-                longitude=position["longitude"],
-                latitude=position["latitude"],
-            ),
-        )
+        try:
+            state = self._physical_state_at(tick, plan)
+        except InvalidRouteTimingError:
+            raise
+        position = state.position
         node, adjustment = self._snap_position(
             position["longitude"], position["latitude"], tick
         )
         return {
             "position": position,
             "current_node": node,
-            "edge_progress": fraction,
+            "edge_progress": state.edge_progress,
             "snap_adjustment_km": adjustment,
-            "arrived": False,
-            "reached_index": index,
-            "current_edge_index": index,
-            "current_segment_start_eta": _iso(start.eta),
-            "current_segment_end_eta": _iso(end.eta),
-            "effective_speed_knots": segment_km / span_hours / 1.852,
-            "executed_distance_km": executed_km,
+            "arrived": state.status == "ARRIVED",
+            "reached_index": int(state.edge_index or 0),
+            "current_edge_index": state.edge_index,
+            "current_segment_start_eta": state.segment_start_eta,
+            "current_segment_end_eta": state.segment_end_eta,
+            "effective_speed_knots": state.speed_knots,
+            "speed_mps": state.speed_mps,
+            "executed_distance_km": state.executed_distance_km,
         }
 
     def _snap_position(
@@ -1389,9 +1499,14 @@ class ReplayRunner:
             )
             return
         plan = self.current_plan
-        result = self._position_at(tick, plan)
+        state = self._physical_state_at(tick, plan)
         waypoints = tuple(plan.waypoints)
-        reached = int(result["reached_index"])
+        if state.status == "ARRIVED":
+            completed_count = len(waypoints)
+        elif state.status == "NOT_STARTED":
+            completed_count = 1
+        else:
+            completed_count = int(state.edge_index) + 1
         # Completed track is append-only execution history.  When a replan
         # adopts a new route, only the future portion changes; waypoints
         # already executed under the previous accepted plan stay immutable.
@@ -1400,10 +1515,10 @@ class ReplayRunner:
         )
         completed_track = merge_completed_track(
             previous_track,
-            waypoints[: reached + 1],
+            waypoints[:completed_count],
         )
-        position = result["position"]
-        remaining = self._remaining_distance_km(plan, tick, position)
+        position = state.position
+        remaining = state.remaining_distance_km
         previous = self.nav_state
         delta = None
         expected = None
@@ -1420,7 +1535,7 @@ class ReplayRunner:
             )
             delta = haversine_km(previous_position, current_position)
             previous_until = previous.executed_until
-            if previous_until:
+            if previous_until and previous.accepted_plan_revision == self.plan_revision:
                 expected = self._route_travel_km(
                     plan,
                     datetime.fromisoformat(
@@ -1434,12 +1549,27 @@ class ReplayRunner:
             if delta is not None:
                 cumulative += max(delta, 0.0)
         else:
-            cumulative = float(result.get("executed_distance_km") or 0.0)
-        arrived = bool(result["arrived"])
-        status = "ARRIVED" if arrived else "ACTIVE"
+            cumulative = float(state.executed_distance_km or 0.0)
+        arrived = state.status == "ARRIVED"
+        status = state.status
         executed_until = (
             _iso(waypoints[-1].eta) if arrived else _iso(tick)
         )
+        adoption_spec = self._plan_adoption_spec(tick, plan)
+        planner_origin_node = (
+            adoption_spec["origin_node"] if adoption_spec else None
+        )
+        planner_origin_adjustment = (
+            adoption_spec["origin_adjustment_km"] if adoption_spec else None
+        )
+        if self.pending_plan is not None:
+            adoption_status = "PENDING"
+        elif self.active_plan_time_offset.total_seconds() > 0.0:
+            adoption_status = "DEFERRED"
+        elif self.plan_revision > 1:
+            adoption_status = "IMMEDIATE"
+        else:
+            adoption_status = "NONE"
         self.navigation_state_revision += 1
         self.nav_state = NavigationExecutionState(
             status=status,
@@ -1448,20 +1578,42 @@ class ReplayRunner:
             accepted_plan_digest=self._accepted_plan_digest(),
             executed_until=executed_until,
             current_position=position,
-            current_node=result["current_node"],
-            edge_progress=result["edge_progress"],
+            current_node=planner_origin_node,
+            edge_progress=state.edge_progress,
             completed_track=completed_track,
             remaining_distance_km=remaining,
-            snap_adjustment_km=result.get("snap_adjustment_km"),
+            snap_adjustment_km=planner_origin_adjustment,
             last_distance_delta_km=delta,
             expected_travel_km=expected,
-            current_edge_index=result.get("current_edge_index"),
-            current_segment_start_eta=result.get("current_segment_start_eta"),
-            current_segment_end_eta=result.get("current_segment_end_eta"),
-            effective_speed_knots=result.get("effective_speed_knots"),
-            speed_source="waypoint_eta_linear_interpolation",
-            executed_distance_km=result.get("executed_distance_km"),
+            current_edge_index=state.edge_index,
+            current_segment_start_eta=state.segment_start_eta,
+            current_segment_end_eta=state.segment_end_eta,
+            effective_speed_knots=state.speed_knots,
+            speed_mps=state.speed_mps,
+            speed_source=state.interpolation,
+            executed_distance_km=state.executed_distance_km,
             cumulative_travelled_km=cumulative,
+            planner_origin_node=planner_origin_node,
+            planner_origin_adjustment_km=planner_origin_adjustment,
+            replan_decision_time=(
+                _iso(self.pending_decision_time)
+                if self.pending_decision_time is not None
+                else None
+            ),
+            effective_adoption_time=(
+                _iso(self.pending_adoption_time)
+                if self.pending_adoption_time is not None
+                else None
+            ),
+            adoption_status=adoption_status,
+            candidate_plan_revision=(
+                self.pending_revision if self.pending_plan is not None else None
+            ),
+            replan_physical_position=(
+                dict(self.pending_decision_position)
+                if self.pending_decision_position
+                else None
+            ),
         )
 
     def _remaining_distance_km(
@@ -1690,6 +1842,9 @@ class ReplayRunner:
                 "route_semantic_digests": self.route_semantic_digests,
                 "last_replan_reasons": list(self.last_replan_reasons),
                 "nav_state": self.nav_state.to_dict() if self.nav_state else None,
+                "active_plan_time_offset_seconds": (
+                    self.active_plan_time_offset.total_seconds()
+                ),
             },
         )
 
@@ -1728,6 +1883,20 @@ class ReplayRunner:
         )
         nav = checkpoint.get("nav_state")
         self.nav_state = NavigationExecutionState.from_dict(nav) if nav else None
+        self.active_plan_time_offset = timedelta(
+            seconds=float(
+                checkpoint.get("active_plan_time_offset_seconds", 0.0)
+            )
+        )
+        self.pending_plan = None
+        self.pending_plan_set = None
+        self.pending_plan_kind = ""
+        self.pending_decision_time = None
+        self.pending_adoption_time = None
+        self.pending_revision = 0
+        self.pending_origin_node = None
+        self.pending_origin_adjustment_km = None
+        self.pending_decision_position = None
         self._last_visible_digest = ""
         self._last_relevant_digest = ""
         self._last_data_revision = 0

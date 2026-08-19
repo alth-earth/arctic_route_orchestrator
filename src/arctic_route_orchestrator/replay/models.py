@@ -163,9 +163,17 @@ class NavigationExecutionState:
     current_segment_start_eta: str | None = None
     current_segment_end_eta: str | None = None
     effective_speed_knots: float | None = None
+    speed_mps: float | None = None
     speed_source: str = "waypoint_eta_linear_interpolation"
     executed_distance_km: float | None = None
     cumulative_travelled_km: float | None = None
+    planner_origin_node: tuple[int, int] | None = None
+    planner_origin_adjustment_km: float | None = None
+    replan_decision_time: str | None = None
+    effective_adoption_time: str | None = None
+    adoption_status: str = "NONE"
+    candidate_plan_revision: int | None = None
+    replan_physical_position: dict[str, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -188,14 +196,32 @@ class NavigationExecutionState:
             "current_segment_start_eta": self.current_segment_start_eta,
             "current_segment_end_eta": self.current_segment_end_eta,
             "effective_speed_knots": self.effective_speed_knots,
+            "speed_mps": self.speed_mps,
             "speed_source": self.speed_source,
             "executed_distance_km": self.executed_distance_km,
             "cumulative_travelled_km": self.cumulative_travelled_km,
+            "planner_origin_node": (
+                list(self.planner_origin_node)
+                if self.planner_origin_node
+                else None
+            ),
+            "planner_origin_adjustment_km": self.planner_origin_adjustment_km,
+            "replan_decision_time": self.replan_decision_time,
+            "effective_adoption_time": self.effective_adoption_time,
+            "adoption_status": self.adoption_status,
+            "candidate_plan_revision": self.candidate_plan_revision,
+            "replan_physical_position": (
+                dict(self.replan_physical_position)
+                if self.replan_physical_position
+                else None
+            ),
         }
 
     @classmethod
     def from_dict(cls, document: dict[str, Any]) -> NavigationExecutionState:
         node = document.get("current_node")
+        origin_node = document.get("planner_origin_node")
+        replan_position = document.get("replan_physical_position")
         return cls(
             status=str(document.get("status", "DEFERRED")),
             navigation_state_revision=int(
@@ -237,6 +263,11 @@ class NavigationExecutionState:
                 if document.get("effective_speed_knots") is not None
                 else None
             ),
+            speed_mps=(
+                float(document["speed_mps"])
+                if document.get("speed_mps") is not None
+                else None
+            ),
             speed_source=str(
                 document.get(
                     "speed_source", "waypoint_eta_linear_interpolation"
@@ -244,6 +275,30 @@ class NavigationExecutionState:
             ),
             executed_distance_km=document.get("executed_distance_km"),
             cumulative_travelled_km=document.get("cumulative_travelled_km"),
+            planner_origin_node=(
+                (int(origin_node[0]), int(origin_node[1]))
+                if origin_node
+                else None
+            ),
+            planner_origin_adjustment_km=document.get(
+                "planner_origin_adjustment_km"
+            ),
+            replan_decision_time=document.get("replan_decision_time"),
+            effective_adoption_time=document.get("effective_adoption_time"),
+            adoption_status=str(document.get("adoption_status", "NONE")),
+            candidate_plan_revision=document.get("candidate_plan_revision"),
+            replan_physical_position=(
+                {
+                    "longitude": float(
+                        replan_position["longitude"]
+                    ),
+                    "latitude": float(
+                        replan_position["latitude"]
+                    ),
+                }
+                if replan_position
+                else None
+            ),
         )
 
 

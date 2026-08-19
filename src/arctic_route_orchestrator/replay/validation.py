@@ -35,8 +35,16 @@ def validate_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     if snapshot["scenario_mode"] != "causal_replay":
         violations.append("scenario_mode != causal_replay")
     ship_status = snapshot["ship_state"].get("status")
-    if ship_status not in ("DEFERRED", "ACTIVE", "ARRIVED"):
-        violations.append("ship_state.status is not DEFERRED/ACTIVE/ARRIVED")
+    if ship_status not in (
+        "DEFERRED",
+        "NOT_STARTED",
+        "UNDERWAY",
+        "ACTIVE",
+        "ARRIVED",
+    ):
+        violations.append(
+            "ship_state.status is not DEFERRED/NOT_STARTED/UNDERWAY/ACTIVE/ARRIVED"
+        )
     if ship_status != "DEFERRED":
         if "navigation_state_revision" not in snapshot["ship_state"]:
             violations.append("active ship_state lacks navigation_state_revision")
@@ -127,8 +135,8 @@ def validate_replay(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
                 if (
                     (current_time - previous_time).total_seconds() > 0.0
                     and abs(cumulative - previous_cumulative) <= 1e-9
-                    and ship.get("status") == "ACTIVE"
-                    and previous_nav.get("status") == "ACTIVE"
+                    and ship.get("status") in ("ACTIVE", "UNDERWAY")
+                    and previous_nav.get("status") in ("ACTIVE", "UNDERWAY")
                 ):
                     violations.append(
                         "stationary vessel while simulation time advanced"

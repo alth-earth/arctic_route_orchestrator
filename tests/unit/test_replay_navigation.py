@@ -15,6 +15,7 @@ from arctic_route_orchestrator.replay.runner import (
     merge_completed_track,
 )
 from arctic_route_orchestrator.replay.validation import validate_replay
+from arctic_route_orchestrator.replay.vessel_motion import vessel_state_at
 
 
 def _nav(status: str = "ACTIVE", revision: int = 3) -> NavigationExecutionState:
@@ -38,9 +39,17 @@ def _nav(status: str = "ACTIVE", revision: int = 3) -> NavigationExecutionState:
         current_segment_start_eta="2026-08-15T12:00:00Z",
         current_segment_end_eta="2026-08-15T14:00:00Z",
         effective_speed_knots=14.2,
+        speed_mps=7.3,
         speed_source="waypoint_eta_linear_interpolation",
         executed_distance_km=120.0,
         cumulative_travelled_km=130.0,
+        planner_origin_node=(3, 4),
+        planner_origin_adjustment_km=0.0,
+        replan_decision_time="2026-08-15T12:00:00Z",
+        effective_adoption_time="2026-08-15T12:30:00Z",
+        adoption_status="PENDING",
+        candidate_plan_revision=3,
+        replan_physical_position={"longitude": 14.0, "latitude": 70.0},
     )
 
 
@@ -307,3 +316,59 @@ def test_pre_planning_gate_waits_for_waypoint_alignment() -> None:
             )
         ],
     ) is False
+
+
+def test_deferred_replan_keeps_physical_position_until_adoption() -> None:
+    start = datetime(2026, 8, 15, 10, tzinfo=UTC)
+    waypoints = (
+        SimpleNamespace(longitude=0.0, latitude=0.0, eta=start),
+        SimpleNamespace(longitude=1.0, latitude=0.0, eta=start + timedelta(hours=1)),
+        SimpleNamespace(longitude=2.0, latitude=0.0, eta=start + timedelta(hours=2)),
+    )
+    current_plan = SimpleNamespace(
+        start_time=start,
+        waypoints=waypoints,
+        metrics=SimpleNamespace(distance_km=222.0),
+    )
+    runner = ReplayRunner(
+        replay_id="test",
+        scenario_id="s",
+        corridor_id="c",
+        replay_start=start,
+        replay_end=start + timedelta(hours=3),
+        tick_cadence_hours=1,
+        a_data_root=None,
+        manifest_path=None,
+        b_config_path=None,
+        c_config_root=None,
+        contracts_config_root=None,
+        frozen_run_context_path=None,
+    )
+    runner.current_plan = current_plan
+    decision = start + timedelta(minutes=30)
+    before = vessel_state_at(decision, waypoints)
+    adoption_spec = {
+        "mode": "NEXT_WAYPOINT_DEFERRED",
+        "origin_node": (0, 1),
+        "origin_adjustment_km": 0.0,
+        "adoption_time": start + timedelta(hours=1),
+    }
+    runner._accept_published_replan(
+        decision,
+        adoption_spec,
+        plan=SimpleNamespace(
+            start_time=start,
+            waypoints=waypoints,
+            metrics=SimpleNamespace(distance_km=150.0),
+        ),
+        plan_set=None,
+        plan_kind="v3_four_layer",
+    )
+    assert runner.pending_plan is not None
+    assert runner.pending_adoption_time == start + timedelta(hours=1)
+    assert runner.pending_revision == 1
+    assert runner.current_plan is current_plan
+    after = vessel_state_at(decision, waypoints)
+    assert after.position == before.position
+    assert after.speed_knots == before.speed_knots
+    assert after.executed_distance_km == before.executed_distance_km

@@ -50,6 +50,10 @@
   PASS；24h 扩展 1743.2s（≈29min）；Moving-vessel 字段与校验就绪。
   新增 `scripts/replay_performance_audit.py`。详见
   `STRATEGY_B_PERFORMANCE_HARDENING_20260819.md`。
+- Ship Motion Semantics（2026-08-19）：`physical_position` 与
+  `planner_origin_node` 分离；`vessel_state_at(任意 t)` 提供连续船位与
+  route-ETA speed；mid-edge replan 采用 next-waypoint deferred adoption，
+  无瞬移。详见 `STRATEGY_B_SHIP_MOTION_SEMANTICS_20260819.md`。
 
 ## 接手顺序
 

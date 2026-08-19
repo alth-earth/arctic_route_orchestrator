@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased - 2026-08-19（Strategy B Ship Motion Semantics）
+
+- 新增纯 kinematics `replay/vessel_motion.py`：`vessel_state_at(任意 t)` 输出
+  连续 physical position、edge progress、segment ETAs、speed_mps/knots、
+  course、executed/remaining、NOT_STARTED/UNDERWAY/ARRIVED；route ETA 严格
+  递增否则 fail-closed；
+- `physical_position` 与 `planner_origin_node` 分离：planner snap 不再写回
+  物理船位；NavigationExecutionState 新增 planner_origin_node/adjustment、
+  replan_decision_time、effective_adoption_time、adoption_status、
+  candidate_plan_revision、replan_physical_position；
+- replan next-waypoint deferred adoption：mid-edge 决策时物理船继续当前
+  accepted route，新路线在下一执行节点 `REPLAN_ADOPTED` 生效，避免 planner
+  snap 造成瞬移；IMMEDIATE 仍用于 exactly-waypoint 决策；
+- 真实 12h artifact audit：speed≈9.65 knots、1h 位移≈20.4km、snap
+  median≈5.1km / max≈17.9km、grid edge median≈40.8km；
+- tests：`test_vessel_motion.py`（T1-T6 + 5min 高频采样）+ navigation
+  deferred no-teleport；unit 42 项 PASS；ruff 全绿。
+
 ## Unreleased - 2026-08-19（Strategy B Performance Hardening + Moving-Vessel Semantics）
 
 - Replan 成本审计：旧 12h = 13 candidate、6 accepted、7 rejected
