@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased - 2026-08-19（Replay-driven Viewer MVP + L2 Preflight）
+
+- `replay/geospatial.py`：L2 gate 改为 raster-cell traversal（mask grid，
+  oversample<=2x cell，out-of-bounds fail-closed）；修正 GEBCO
+  `land_sea_mask` 极性（规范 `1=sea,0=land_or_coast`）；
+- `replay/preflight.py` + `scripts/replay_l2_preflight.py` +
+  `scripts/replay_viewer_preflight.py`：L2 GEBCO coastline + artifacts +
+  canonical EPSG:4326 transform + layer coverage → `presentation_eligible`；
+  真实 Scenario B 12h：5 route revisions + completed tracks 全 PASS；
+- `replay/presentation.py`：`PresentationPlan` 新增显式
+  `active_plan_revision / pending_plan_revision / pending_plan_status`；
+- `viewer/`：build_basemap（纯 Python PNG）、build_bundle（Presentation
+  Adapter 生成 1min timeline）、embed（无 server 单文件）、render_proof
+  （数据 proof PNG）、index/app/style（Simulation Clock/Play/Pause/scrub/
+  moving ship/pending route/debug）；
+- `scripts/replay_viewer_serve.py`：离线 127.0.0.1 静态+`/api/state?t=`；
+- tests：`test_replay_preflight.py` + `test_viewer_bundle.py`；unit 78 passed；
+
 ## Unreleased - 2026-08-19（Strategy B Viewer Backend Baseline）
 
 - 新增 `replay/presentation.py`：Presentation Adapter（manifest + snapshots →

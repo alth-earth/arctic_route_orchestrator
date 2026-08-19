@@ -131,6 +131,9 @@ class PresentationPlan:
     current_authoritative_segment: PresentationSegment
     accepted_future_route: list[dict[str, Any]]
     route_distance_km: float | None
+    active_plan_revision: int | None = None
+    pending_plan_revision: int | None = None
+    pending_plan_status: str | None = None
     pending_candidate: dict[str, Any] | None = None
     pending_adoption: dict[str, Any] | None = None
     superseded_future_route: list[dict[str, Any]] | None = None
@@ -138,6 +141,13 @@ class PresentationPlan:
     def to_dict(self) -> dict[str, Any]:
         return {
             "accepted_plan_revision": self.accepted_plan_revision,
+            "active_plan_revision": (
+                self.active_plan_revision
+                if self.active_plan_revision is not None
+                else self.accepted_plan_revision
+            ),
+            "pending_plan_revision": self.pending_plan_revision,
+            "pending_plan_status": self.pending_plan_status,
             "completed_track": self.completed_track,
             "current_authoritative_segment": self.current_authoritative_segment.to_dict(),
             "accepted_future_route": self.accepted_future_route,
@@ -543,10 +553,19 @@ class PresentationAdapter:
             ]
         return PresentationPlan(
             accepted_plan_revision=accepted_revision,
+            active_plan_revision=accepted_revision,
             completed_track=completed_track,
             current_authoritative_segment=segment,
             accepted_future_route=future,
             route_distance_km=route.get("distance_km"),
+            pending_plan_revision=(
+                ship.get("candidate_plan_revision") if pending_route else None
+            ),
+            pending_plan_status=(
+                ship.get("adoption_status")
+                if ship.get("adoption_status") == "PENDING"
+                else None
+            ),
             pending_candidate=pending_candidate,
             pending_adoption=pending_adoption,
             superseded_future_route=superseded_future,

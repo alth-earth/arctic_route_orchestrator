@@ -33,9 +33,10 @@ def _metadata(**overrides: Any) -> BasemapMetadata:
 
 
 def _sampler(land_cells: set[tuple[int, int]]) -> LandMaskSampler:
-    land = np.zeros((5, 5), dtype=bool)
+    # Canonical semantics: True=sea (1), False=land/coast (0).
+    land = np.ones((5, 5), dtype=bool)
     for lat_index, lon_index in land_cells:
-        land[lat_index, lon_index] = True
+        land[lat_index, lon_index] = False
     return LandMaskSampler(
         longitude=(10.0, 10.5, 11.0, 11.5, 12.0),
         latitude=(60.0, 60.5, 61.0, 61.5, 62.0),
@@ -116,12 +117,12 @@ def test_l2_real_data_smoke_water_and_land() -> None:
     )
     sampler = load_netcdf_land_mask(nc_path)
     water = [
-        {"longitude": 17.55, "latitude": 68.49791666666667},
-        {"longitude": 22.0, "latitude": 68.49791666666667},
+        {"longitude": 18.4, "latitude": 70.5},
+        {"longitude": 18.4, "latitude": 73.0},
     ]
     land = [
-        {"longitude": 12.0, "latitude": 69.5},
-        {"longitude": 18.0, "latitude": 70.5},
+        {"longitude": 15.0, "latitude": 68.5},
+        {"longitude": 16.0, "latitude": 68.5},
     ]
     water_result = l2_coastline_gate(water, sampler)
     land_result = l2_coastline_gate(land, sampler)
@@ -130,4 +131,5 @@ def test_l2_real_data_smoke_water_and_land() -> None:
     assert any(
         item["status"] == "LAND" for item in land_result["violations"]
     )
-    assert sampler.sample(19.0, 68.5) == "WATER"
+    assert sampler.sample(18.4, 71.8) == "WATER"
+    assert sampler.sample(15.5, 68.5) == "LAND"

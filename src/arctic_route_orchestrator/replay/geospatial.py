@@ -102,6 +102,30 @@ class LandMaskSampler:
     land: np.ndarray
     source: str = "GEBCO_2026_land_sea_mask"
 
+    # Canonical GEBCO-derived semantics (work_package_a::derive_land_sea_mask):
+    # 1 = sea (elevation < 0), 0 = land/coast.  The stored boolean array keeps
+    # the raw value; True means SEA, False means LAND.
+
+    def cell_step_degrees(self) -> tuple[float, float]:
+        if len(self.longitude) < 2 or len(self.latitude) < 2:
+            raise ValueError("land mask needs at least 2x2 cells for traversal")
+        lon_step = self.longitude[1] - self.longitude[0]
+        lat_step = self.latitude[1] - self.latitude[0]
+        if lon_step <= 0 or lat_step <= 0:
+            raise ValueError("land mask coordinates must be strictly increasing")
+        return float(lon_step), float(lat_step)
+
+    def bbox(self) -> dict[str, float]:
+        return {
+            "min_lon": float(self.longitude[0]),
+            "max_lon": float(self.longitude[-1]),
+            "min_lat": float(self.latitude[0]),
+            "max_lat": float(self.latitude[-1]),
+        }
+
+    def grid_shape(self) -> tuple[int, int]:
+        return int(self.land.shape[0]), int(self.land.shape[1])
+
     def sample(self, longitude: float, latitude: float) -> str:
         lons = self.longitude
         lats = self.latitude
@@ -109,7 +133,72 @@ class LandMaskSampler:
             return "DATA_UNAVAILABLE"
         lon_index = int(np.argmin(np.abs(np.asarray(lons) - longitude)))
         lat_index = int(np.argmin(np.abs(np.asarray(lats) - latitude)))
-        return "LAND" if bool(self.land[lat_index, lon_index]) else "WATER"
+        return "WATER" if bool(self.land[lat_index, lon_index]) else "LAND"
+
+    def cell_status(self, lat_index: int, lon_index: int) -> str:
+        if not (0 <= lat_index < self.land.shape[0] and 0 <= lon_index < self.land.shape[1]):
+            return "DATA_UNAVAILABLE"
+        return "WATER" if bool(self.land[lat_index, lon_index]) else "LAND"
+
+    def cells_between(
+        self,
+        start_lon: float,
+        start_lat: float,
+        end_lon: float,
+        end_lat: float,
+        *,
+        oversample: float = 2.0,
+        max_samples: int | None = None,
+    ) -> list[tuple[int, int, str]]:
+        """Traverse the mask grid along a linear lon/lat segment.
+
+        Returns a list of (lat_index, lon_index, status).  The segment is
+        sampled at <= half-cell spacing in grid space so long edges cannot
+        skip a small island cell between their endpoints.  Out-of-bounds
+        portions are reported as DATA_UNAVAILABLE cells.
+        """
+
+        lat_array = np.asarray(self.latitude)
+        lon_array = np.asarray(self.longitude)
+        lon_step, lat_step = self.cell_step_degrees()
+
+        def grid_position(lon: float, lat: float) -> tuple[float, float]:
+            gx = (lon - (lon_array[0] - lon_step / 2.0)) / lon_step
+            gy = (lat - (lat_array[0] - lat_step / 2.0)) / lat_step
+            return float(gx), float(gy)
+
+        x0, y0 = grid_position(start_lon, start_lat)
+        x1, y1 = grid_position(end_lon, end_lat)
+        distance_cells = max(abs(x1 - x0), abs(y1 - y0))
+        sample_count = max(2, math.ceil(distance_cells * oversample) + 2)
+        if max_samples is not None and max_samples > 0:
+            sample_count = max(2, min(sample_count, max_samples))
+        cells: dict[tuple[int, int], str] = {}
+        lon_count = len(lon_array)
+        lat_count = len(lat_array)
+        for sample_index in range(sample_count):
+            fraction = sample_index / (sample_count - 1)
+            gx = x0 + (x1 - x0) * fraction
+            gy = y0 + (y1 - y0) * fraction
+            lon_index = math.floor(gx)
+            lat_index = math.floor(gy)
+            key = (lat_index, lon_index)
+            out_of_bounds = (
+                gx < -0.5
+                or gx > lon_count - 0.5
+                or gy < -0.5
+                or gy > lat_count - 0.5
+            )
+            if out_of_bounds:
+                cells[key] = "DATA_UNAVAILABLE"
+            elif key not in cells:
+                cells[key] = (
+                    self.cell_status(lat_index, lon_index)
+                )
+        return [
+            (lat_index, lon_index, status)
+            for (lat_index, lon_index), status in cells.items()
+        ]
 
 
 def load_netcdf_land_mask(path: str | Path) -> LandMaskSampler:
@@ -129,6 +218,21 @@ def load_netcdf_land_mask(path: str | Path) -> LandMaskSampler:
         land=land,
         source=str(path),
     )
+
+
+def find_land_sea_mask(
+    route_id: str,
+    data_root: str | Path,
+) -> Path | None:
+    """Resolve the local GEBCO-derived land_sea_mask for a corridor."""
+
+    base = Path(data_root) / "raw" / route_id / "land_sea_mask"
+    candidates: list[Path] = []
+    for path in base.glob("**/*.nc"):
+        candidates.append(path)
+    if not candidates:
+        return None
+    return sorted(candidates)[-1]
 
 
 def projection_consistency_gate(
@@ -168,33 +272,61 @@ def l2_coastline_gate(
     if len(waypoints) < 2:
         raise ValueError("L2 gate needs at least two waypoints")
     violations: list[dict[str, Any]] = []
+    cells_checked = 0
+    land_cells = 0
+    data_unavailable_cells = 0
+    sample_checks = 0
     for edge_index in range(len(waypoints) - 1):
         start = waypoints[edge_index]
         end = waypoints[edge_index + 1]
-        distance_km = _haversine_km(
-            start["longitude"], start["latitude"], end["longitude"], end["latitude"]
+        cell_km = _haversine_km(
+            sampler.longitude[0],
+            sampler.latitude[0],
+            sampler.longitude[1],
+            sampler.latitude[1],
+        ) if sampler.grid_shape()[1] > 1 and sampler.grid_shape()[0] > 1 else sample_step_km
+        oversample = max(2.0, min(8.0, cell_km / max(sample_step_km, 1e-9)))
+        cells = sampler.cells_between(
+            start["longitude"],
+            start["latitude"],
+            end["longitude"],
+            end["latitude"],
+            oversample=oversample,
+            max_samples=max_samples_per_edge,
         )
-        sample_count = max(
-            2,
-            min(int(distance_km / sample_step_km) + 2, max_samples_per_edge),
-        )
-        for sample_index in range(sample_count):
-            fraction = sample_index / (sample_count - 1)
-            lon = start["longitude"] + (end["longitude"] - start["longitude"]) * fraction
-            lat = start["latitude"] + (end["latitude"] - start["latitude"]) * fraction
-            status = sampler.sample(lon, lat)
+        sample_checks += len(cells)
+        for lat_index, lon_index, status in cells:
+            cells_checked += 1
+            if status == "LAND":
+                land_cells += 1
+            if status == "DATA_UNAVAILABLE":
+                data_unavailable_cells += 1
             if status in ("LAND", "DATA_UNAVAILABLE"):
+                lon = (
+                    sampler.longitude[lon_index]
+                    if 0 <= lon_index < len(sampler.longitude)
+                    else None
+                )
+                lat = (
+                    sampler.latitude[lat_index]
+                    if 0 <= lat_index < len(sampler.latitude)
+                    else None
+                )
                 violations.append(
                     {
                         "edge_index": edge_index,
                         "status": status,
                         "longitude": lon,
                         "latitude": lat,
-                        "sample_index": sample_index,
+                        "cell": [lat_index, lon_index],
                     }
                 )
     return {
         "status": "PASS" if not violations else "FAIL",
         "edge_count": len(waypoints) - 1,
+        "cells_traversed": cells_checked,
+        "sample_checks": sample_checks,
+        "land_cells": land_cells,
+        "data_unavailable_cells": data_unavailable_cells,
         "violations": violations,
     }

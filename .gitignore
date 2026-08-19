@@ -11,4 +11,8 @@ __pycache__/
 htmlcov/
 output/
 data/
-
+viewer/bundle.json
+viewer/gebco_basemap.png
+viewer/basemap_metadata.json
+viewer/index_self_contained.html
+viewer/replay-viewer-proof.png
