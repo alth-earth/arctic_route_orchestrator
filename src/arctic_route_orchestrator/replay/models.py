@@ -174,6 +174,10 @@ class NavigationExecutionState:
     adoption_status: str = "NONE"
     candidate_plan_revision: int | None = None
     replan_physical_position: dict[str, float] | None = None
+    planner_origin_position: dict[str, float] | None = None
+    accepted_route: dict[str, Any] | None = None
+    pending_route: dict[str, Any] | None = None
+    superseded_route: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -215,6 +219,14 @@ class NavigationExecutionState:
                 if self.replan_physical_position
                 else None
             ),
+            "planner_origin_position": (
+                dict(self.planner_origin_position)
+                if self.planner_origin_position
+                else None
+            ),
+            "accepted_route": self.accepted_route,
+            "pending_route": self.pending_route,
+            "superseded_route": self.superseded_route,
         }
 
     @classmethod
@@ -222,6 +234,7 @@ class NavigationExecutionState:
         node = document.get("current_node")
         origin_node = document.get("planner_origin_node")
         replan_position = document.get("replan_physical_position")
+        origin_position = document.get("planner_origin_position")
         return cls(
             status=str(document.get("status", "DEFERRED")),
             navigation_state_revision=int(
@@ -299,6 +312,23 @@ class NavigationExecutionState:
                 if replan_position
                 else None
             ),
+            planner_origin_position=(
+                {
+                    "longitude": float(origin_position["longitude"]),
+                    "latitude": float(origin_position["latitude"]),
+                }
+                if origin_position
+                else None
+            ),
+            accepted_route=dict(document["accepted_route"])
+            if document.get("accepted_route")
+            else None,
+            pending_route=dict(document["pending_route"])
+            if document.get("pending_route")
+            else None,
+            superseded_route=dict(document["superseded_route"])
+            if document.get("superseded_route")
+            else None,
         )
 
 

@@ -50,6 +50,40 @@ def _nav(status: str = "ACTIVE", revision: int = 3) -> NavigationExecutionState:
         adoption_status="PENDING",
         candidate_plan_revision=3,
         replan_physical_position={"longitude": 14.0, "latitude": 70.0},
+        planner_origin_position={"longitude": 13.5, "latitude": 69.75},
+        accepted_route={
+            "distance_km": 221.5,
+            "waypoints": [
+                {"longitude": 12.0, "latitude": 69.0, "eta": "2026-08-15T10:00:00Z"},
+                {"longitude": 13.5, "latitude": 69.75, "eta": "2026-08-15T12:00:00Z"},
+            ],
+        },
+        pending_route={
+            "distance_km": 180.0,
+            "waypoints": [
+                {"longitude": 13.5, "latitude": 69.75, "eta": "2026-08-15T12:00:00Z"},
+                {"longitude": 15.0, "latitude": 70.5, "eta": "2026-08-15T14:00:00Z"},
+            ],
+        },
+        superseded_route={
+            "plan_revision": 2,
+            "superseded_at": "2026-08-15T12:00:00Z",
+            "route": {
+                "distance_km": 200.0,
+                "waypoints": [
+                    {
+                        "longitude": 13.5,
+                        "latitude": 69.75,
+                        "eta": "2026-08-15T11:00:00Z",
+                    },
+                    {
+                        "longitude": 15.0,
+                        "latitude": 70.5,
+                        "eta": "2026-08-15T13:00:00Z",
+                    },
+                ],
+            },
+        },
     )
 
 

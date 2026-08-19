@@ -208,6 +208,7 @@ class ReplayRunner:
     pending_origin_adjustment_km: float | None = None
     pending_decision_position: dict[str, float] | None = None
     active_plan_time_offset: timedelta = field(default_factory=timedelta)
+    superseded_route_payload: dict[str, Any] | None = None
 
     records: tuple[SourceRecord, ...] = ()
     run_context: RunContext | None = None
@@ -423,6 +424,9 @@ class ReplayRunner:
             replan_triggered = any(
                 event.type == "REPLAN_TRIGGERED" for event in events
             )
+            replan_decided = any(
+                event.type == "REPLAN_DECIDED" for event in events
+            )
             plan_computed = any(
                 event.type == "PLAN_COMPUTED" for event in events
             )
@@ -434,9 +438,12 @@ class ReplayRunner:
             )
             candidate_computed = (
                 plan_computed or replan_triggered
+                or replan_decided
                 or (plan_reused and not plan_skipped)
             )
-            candidate_accepted = plan_computed or replan_triggered
+            candidate_accepted = (
+                plan_computed or replan_triggered or replan_decided
+            )
             candidate_rejected = candidate_computed and not candidate_accepted
             if candidate_computed:
                 self.replan_candidate_computations += 1
@@ -1111,6 +1118,7 @@ class ReplayRunner:
         """
 
         if adoption_spec["mode"] == "IMMEDIATE":
+            self.superseded_route_payload = self._capture_superseded(tick)
             self.current_plan = plan
             self.current_plan_set = plan_set
             self.plan_kind = plan_kind
@@ -1155,6 +1163,7 @@ class ReplayRunner:
             or tick < self.pending_adoption_time
         ):
             return
+        self.superseded_route_payload = self._capture_superseded(tick)
         self.current_plan = self.pending_plan
         self.current_plan_set = self.pending_plan_set
         self.plan_kind = self.pending_plan_kind
@@ -1228,6 +1237,10 @@ class ReplayRunner:
                 "origin_adjustment_km": adjustment,
                 "adoption_time": waypoint.eta + offset,
                 "mode": "IMMEDIATE",
+                "origin_position": {
+                    "longitude": waypoint.longitude,
+                    "latitude": waypoint.latitude,
+                },
             }
         index = int(state.edge_index)
         if state.edge_progress == 0.0 and index >= 0:
@@ -1246,6 +1259,10 @@ class ReplayRunner:
             "origin_adjustment_km": adjustment,
             "adoption_time": adoption_time,
             "mode": mode,
+            "origin_position": {
+                "longitude": origin_waypoint.longitude,
+                "latitude": origin_waypoint.latitude,
+            },
         }
 
     def _physical_state_at(self, tick: datetime, plan: Any) -> VesselState:
@@ -1270,6 +1287,49 @@ class ReplayRunner:
             ),
         )
 
+    def _route_payload(
+        self,
+        plan: Any,
+        *,
+        offset: timedelta = timedelta(),
+    ) -> dict[str, Any] | None:
+        """Serialize accepted/pending route waypoints for the viewer.
+
+        ETAs are shifted by ``offset`` so they are expressed in physical
+        simulation-clock time.  ``vessel_state_at(tick, payload)`` then
+        reproduces the runner's physical motion exactly without replanning.
+        """
+
+        waypoints = tuple(getattr(plan, "waypoints", ()))
+        if not waypoints:
+            return None
+        rows = [
+            {
+                "longitude": float(waypoint.longitude),
+                "latitude": float(waypoint.latitude),
+                "eta": _iso(waypoint.eta + offset),
+            }
+            for waypoint in waypoints
+        ]
+        distance = getattr(getattr(plan, "metrics", None), "distance_km", None)
+        return {
+            "distance_km": float(distance) if distance is not None else None,
+            "waypoints": rows,
+        }
+
+    def _capture_superseded(self, tick: datetime) -> dict[str, Any] | None:
+        """Snapshot the route being replaced (physical-clock ETAs)."""
+
+        if self.current_plan is None:
+            return None
+        return {
+            "plan_revision": self.plan_revision,
+            "superseded_at": _iso(tick),
+            "route": self._route_payload(
+                self.current_plan,
+                offset=self.active_plan_time_offset,
+            ),
+        }
     def _probe_v2(self, tick: datetime) -> str | None:
         """Independent second C-API probe (v2 batch) for honest evidence."""
 
@@ -1562,6 +1622,9 @@ class ReplayRunner:
         planner_origin_adjustment = (
             adoption_spec["origin_adjustment_km"] if adoption_spec else None
         )
+        planner_origin_position = (
+            adoption_spec["origin_position"] if adoption_spec else None
+        )
         if self.pending_plan is not None:
             adoption_status = "PENDING"
         elif self.active_plan_time_offset.total_seconds() > 0.0:
@@ -1595,6 +1658,17 @@ class ReplayRunner:
             cumulative_travelled_km=cumulative,
             planner_origin_node=planner_origin_node,
             planner_origin_adjustment_km=planner_origin_adjustment,
+            planner_origin_position=planner_origin_position,
+            accepted_route=self._route_payload(
+                plan,
+                offset=self.active_plan_time_offset,
+            ),
+            pending_route=(
+                self._route_payload(self.pending_plan)
+                if self.pending_plan is not None
+                else None
+            ),
+            superseded_route=self.superseded_route_payload,
             replan_decision_time=(
                 _iso(self.pending_decision_time)
                 if self.pending_decision_time is not None
@@ -1845,6 +1919,7 @@ class ReplayRunner:
                 "active_plan_time_offset_seconds": (
                     self.active_plan_time_offset.total_seconds()
                 ),
+                "superseded_route_payload": self.superseded_route_payload,
             },
         )
 
@@ -1887,6 +1962,10 @@ class ReplayRunner:
             seconds=float(
                 checkpoint.get("active_plan_time_offset_seconds", 0.0)
             )
+        )
+        superseded = checkpoint.get("superseded_route_payload")
+        self.superseded_route_payload = (
+            dict(superseded) if superseded is not None else None
         )
         self.pending_plan = None
         self.pending_plan_set = None

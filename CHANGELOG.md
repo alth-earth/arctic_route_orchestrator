@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased - 2026-08-19（Strategy B Viewer Backend Baseline）
+
+- 新增 `replay/presentation.py`：Presentation Adapter（manifest + snapshots →
+  stable presentation contract）；`state_at(t)` / `vessel_at(t)` 支持任意
+  仿真时刻船位（accepted route ETA + `vessel_state_at`，snapshot cadence ≠
+  render cadence）；`adoption_audit()` 输出机器可读
+  IMMEDIATE / NEXT_WAYPOINT_DEFERRED 决策、snap、revisions、track 长度；
+- 新增 `scripts/replay_presentation.py` CLI（`--audit` / `--state`）；
+- NavigationExecutionState 新增 `accepted_route` / `pending_route` /
+  `superseded_route` / `planner_origin_position`（physical-clock ETA），
+  Adapter 不重算 Planner、不发明航速；Runner 统计修正：`REPLAN_DECIDED`
+  计入 candidate_computed / candidate_accepted；
+- 新增 `replay/geospatial.py`：EPSG:4326 canonical transform、basemap
+  metadata、L2 coastline gate harness + 本地 GEBCO_2026 land_sea_mask
+  real-data smoke；
+- 最新 HEAD 12h authoritative（`sb-viewer-baseline-12h(-det)`）：13
+  snapshots、2044.9s、validation / route integrity PASS、determinism PASS
+  （manifest + 13/13 snapshot + risk + route digest 一致）；
+- tests：`test_replay_presentation.py`（T1-T7 + audit + 旧 schema 拒绝）+
+  `test_replay_geospatial.py`；unit 70 passed；ruff 全绿。
+
 ## Unreleased - 2026-08-19（Strategy B Ship Motion Semantics）
 
 - 新增纯 kinematics `replay/vessel_motion.py`：`vessel_state_at(任意 t)` 输出
