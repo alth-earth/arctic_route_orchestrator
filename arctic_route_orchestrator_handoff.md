@@ -7,8 +7,13 @@
 
 # A–B–C 编排器项目交接
 
-> Status: CURRENT — RC1（2026-08-16）。v3 四层 + 6h 重规划已跑通（r6/r7）；
+> Status: CURRENT — 2026-08-20。v3 四层 + 6h 重规划已跑通（r6/r7）；
 > 可中断 worker timeout 已实现并单测；worker 模式全链冒烟为 pre-demo 必做。
+> **Viewer ownership（2026-08-20）**：orchestrator 是 **A-B-C-D root coordinator**，
+> 拥有 replay/navigation/replan/presentation-adapter/L1/L2 preflight/
+> presentation artifact export（`scripts/replay_viewer_export.py`）；
+> **不拥有 Viewer runtime** —— Viewer 实现全部在 `work_package_d`（D），
+> orchestrator `viewer/` 前端残留已删除（commit aeda5f2）。
 
 ## 1. 目标与边界
 
