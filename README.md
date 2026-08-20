@@ -21,14 +21,22 @@ Package version: `0.1.0`.
 
 ## Presentation Export Product Contract（2026-08-20 21:13 +08:00）
 
-The presentation adapter now exports a presentation-ready current-risk
-projection from the co-located formal `bc.risk-frame.v2` artifact. It emits
-`risk` frames in `bundle.json` with the selection rule
-`latest_valid_time_at_or_before_simulation_time`, hourly cadence, explicit
-`valid_time`, risk levels, and separate `hard_reason` values. The adapter
-validates frame shape and provenance and fails closed; D does not read raw
-weather data or recalculate B semantics. D remains the sole Viewer runtime
-owner, while this package owns the export contract and L1/L2 preflight.
+The presentation adapter exports a presentation-ready current-risk projection
+and Current/+6h/+12h/+24h horizon selection index from the co-located formal
+`bc.risk-frame.v2` artifact. It emits explicit requested/actual valid times,
+actual horizon seconds, selection method, availability, and fail-closed reason.
+Future horizons use floor selection only when the requested valid time remains
+inside the formal frame range; an out-of-range request never reuses the last
+frame. The adapter validates frame shape and provenance and fails closed; D
+does not read raw weather data or recalculate B semantics. D remains the sole
+Viewer runtime owner, while this package owns the export contract and L1/L2
+preflight.
+
+`pyrightconfig.json` is repo-local and points editor analysis at the
+Orchestrator `.venv` plus `src`; it does not modify global editor settings or
+production import paths. The four original export-script import diagnostics
+were environment/import-resolution diagnostics for `numpy`, `geospatial`,
+`preflight`, and `presentation`, not runtime failures.
 
 ## 当前状态
 

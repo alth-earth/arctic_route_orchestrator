@@ -1,0 +1,18 @@
+{
+  "include": ["scripts", "src", "tests"],
+  "exclude": [".mamba-env", ".mamba-root", ".uv-cache", ".uv-python", ".venv", "data", "output"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "executionEnvironments": [
+    {
+      "root": "scripts",
+      "extraPaths": ["src"]
+    },
+    {
+      "root": "tests",
+      "extraPaths": ["src"]
+    }
+  ],
+  "typeCheckingMode": "basic",
+  "reportMissingTypeStubs": "none"
+}

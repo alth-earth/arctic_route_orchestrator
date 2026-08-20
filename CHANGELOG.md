@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-08-20（Viewer ownership migration）
 
+- fix: add repo-local `pyrightconfig.json` for the Orchestrator `.venv` and
+  `src` resolution; the four export-script editor import diagnostics are now
+  closed without a production `sys.path` workaround;
+- feat: add fail-closed Current/+6h/+12h/+24h horizon selection metadata to
+  `presentation.risk-overlay.v1`, including requested/actual valid time,
+  actual horizon seconds, selection method, availability, reason, and frame
+  index;
 - feat: export a presentation-ready `presentation.risk-overlay.v1` current
   risk projection from formal `bc.risk-frame.v2` frames; preserve
   `valid_time`, risk levels, confidence, provenance, and separate hard

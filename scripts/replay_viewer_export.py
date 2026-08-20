@@ -29,6 +29,12 @@ from arctic_route_orchestrator.replay.presentation import PresentationAdapter
 SEA_RGB = (46, 102, 150)
 LAND_RGB = (108, 132, 98)
 OUT_RGB = (36, 44, 56)
+RISK_HORIZONS: tuple[tuple[str, int], ...] = (
+    ("current", 0),
+    ("+6h", 6),
+    ("+12h", 12),
+    ("+24h", 24),
+)
 
 
 def _write_png(path: Path, width: int, height: int, pixels: bytes) -> None:
@@ -256,12 +262,101 @@ def _timeline(adapter: PresentationAdapter, cadence_seconds: int) -> list[dict]:
     return results
 
 
+def _select_risk_horizon(
+    frames: list[dict],
+    *,
+    simulation_time: datetime,
+    horizon_hours: int,
+) -> dict:
+    requested_time = simulation_time + timedelta(hours=horizon_hours)
+    unavailable = {
+        "requested_horizon_hours": horizon_hours,
+        "requested_valid_time": _iso(requested_time),
+        "actual_valid_time": None,
+        "actual_horizon_seconds": None,
+        "selection_method": "unavailable",
+        "availability": "UNAVAILABLE",
+        "reason": "no_frame_available",
+        "frame_index": None,
+        "risk_id": None,
+    }
+    if not frames:
+        return unavailable
+
+    valid_times = [_parse_utc(frame["valid_time"]) for frame in frames]
+    selected_index: int | None = None
+    selection_method = "unavailable"
+    if horizon_hours == 0:
+        candidates = [
+            index for index, valid_time in enumerate(valid_times) if valid_time <= simulation_time
+        ]
+        if candidates:
+            selected_index = candidates[-1]
+            selection_method = "latest_valid_time_at_or_before_simulation_time"
+    elif requested_time > valid_times[-1]:
+        unavailable["reason"] = "requested_valid_time_after_available_range"
+    else:
+        candidates = [
+            index
+            for index, valid_time in enumerate(valid_times)
+            if simulation_time <= valid_time <= requested_time
+        ]
+        if candidates:
+            selected_index = candidates[-1]
+            selection_method = (
+                "exact_requested_valid_time"
+                if valid_times[selected_index] == requested_time
+                else "floor_valid_time_at_or_before_requested_valid_time"
+            )
+
+    if selected_index is None:
+        return unavailable
+    actual_time = valid_times[selected_index]
+    return {
+        "requested_horizon_hours": horizon_hours,
+        "requested_valid_time": _iso(requested_time),
+        "actual_valid_time": _iso(actual_time),
+        "actual_horizon_seconds": int((actual_time - simulation_time).total_seconds()),
+        "selection_method": selection_method,
+        "availability": "AVAILABLE",
+        "reason": None,
+        "frame_index": selected_index,
+        "risk_id": frames[selected_index].get("risk_id"),
+    }
+
+
+def _risk_horizon_selections(frames: list[dict], simulation_times: list[datetime]) -> list[dict]:
+    selections = []
+    for simulation_time in simulation_times:
+        by_horizon = {
+            key: _select_risk_horizon(
+                frames,
+                simulation_time=simulation_time,
+                horizon_hours=hours,
+            )
+            for key, hours in RISK_HORIZONS
+        }
+        selections.append(
+            {
+                "simulation_time": _iso(simulation_time),
+                "available_horizons": [
+                    key
+                    for key, selection in by_horizon.items()
+                    if selection["availability"] == "AVAILABLE"
+                ],
+                "selections": by_horizon,
+            }
+        )
+    return selections
+
+
 def _presentation_risk(
     *,
     risk_store_root: Path | None,
     scenario_id: str,
     replay_start: datetime,
     replay_end: datetime,
+    simulation_times: list[datetime] | None = None,
 ) -> dict:
     """Project committed B risk frames into a bounded viewer-ready payload.
 
@@ -275,10 +370,17 @@ def _presentation_risk(
         "schema_version": "presentation.risk-overlay.v1",
         "status": "NOT_EXPORTED",
         "selection_rule": "latest_valid_time_at_or_before_simulation_time",
+        "horizon_selection_rules": {
+            "current": "latest_valid_time_at_or_before_simulation_time",
+            "future": "floor_valid_time_at_or_before_requested_valid_time",
+            "future_availability": "requested_valid_time_must_be_within_frame_range",
+        },
         "cadence_seconds": 3600,
         "level_range": [1, 5],
+        "supported_horizons_hours": [hours for _, hours in RISK_HORIZONS],
         "hard_reasons": [],
         "frames": [],
+        "horizon_selections": [],
     }
     if risk_store_root is None or not risk_store_root.is_dir():
         return empty
@@ -369,6 +471,7 @@ def _presentation_risk(
         },
         "hard_reasons": hard_reasons,
         "frames": frames,
+        "horizon_selections": _risk_horizon_selections(frames, simulation_times or []),
     }
 
 
@@ -485,6 +588,14 @@ def main(argv: list[str] | None = None) -> int:
             ("11:00", adapter.replay_start + timedelta(minutes=60)),
         )
     }
+    timeline = _timeline(adapter, args.cadence_seconds)
+    risk = _presentation_risk(
+        risk_store_root=risk_store_root,
+        scenario_id=str(manifest_doc.get("scenario_id", "")),
+        replay_start=replay_start,
+        replay_end=replay_end,
+        simulation_times=[_parse_utc(entry["t"]) for entry in timeline],
+    )
     bundle = {
         "schema_version": "replay.viewer-bundle.v1",
         "replay": {
@@ -509,13 +620,8 @@ def main(argv: list[str] | None = None) -> int:
             }
             for event in adapter._events
         ],
-        "timeline": _timeline(adapter, args.cadence_seconds),
-        "risk": _presentation_risk(
-            risk_store_root=risk_store_root,
-            scenario_id=str(manifest_doc.get("scenario_id", "")),
-            replay_start=replay_start,
-            replay_end=replay_end,
-        ),
+        "timeline": timeline,
+        "risk": risk,
         "acceptance_positions": positions,
     }
     (output_dir / "bundle.json").write_text(
