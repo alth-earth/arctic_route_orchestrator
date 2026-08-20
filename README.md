@@ -3,7 +3,7 @@ Document Status: ACTIVE_SUPPORTING
 Scope: orchestrator package README
 Canonical For: orchestrator role and ownership
 Branch: demo-engineering
-Last Verified: 2026-08-20
+Last Verified: 2026-08-21
 Related Canonical Docs: ../arctic_route_governance/current/architecture/ARCTIC_ROUTE_SYSTEM.md
 ---
 
@@ -37,6 +37,16 @@ Orchestrator `.venv` plus `src`; it does not modify global editor settings or
 production import paths. The four original export-script import diagnostics
 were environment/import-resolution diagnostics for `numpy`, `geospatial`,
 `preflight`, and `presentation`, not runtime failures.
+
+## Viewer Presentation Export Polish（2026-08-21 01:20 +08:00）
+
+`scripts/replay_viewer_export.py` now adds backward-compatible
+`presentation.viewer-presentation.v1` metadata to the Viewer bundle. The
+metadata makes the display boundary explicit: risk and hard layers are exact
+authoritative cells with no interpolation, route densification is display-only
+and collinear, and vessel position/heading are derived from the timeline and
+active authoritative segment. This export metadata does not alter
+`bc.risk-frame.v2`, route waypoints, ETA, adoption, or causal replay semantics.
 
 ## 当前状态
 

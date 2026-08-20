@@ -10,6 +10,7 @@ _SPEC.loader.exec_module(_EXPORTER)
 
 _risk_horizon_selections = _EXPORTER._risk_horizon_selections
 _select_risk_horizon = _EXPORTER._select_risk_horizon
+_viewer_presentation = _EXPORTER.VIEWER_PRESENTATION
 
 
 def _frames() -> list[dict]:
@@ -69,3 +70,15 @@ def test_horizon_index_keeps_simulation_time_and_available_keys() -> None:
     assert entries[0]["simulation_time"] == "2026-08-15T10:00:00Z"
     assert entries[0]["available_horizons"] == ["current", "+6h", "+12h"]
     assert entries[0]["selections"]["+24h"]["availability"] == "UNAVAILABLE"
+
+
+def test_viewer_presentation_declares_display_only_geometry_policies() -> None:
+    assert _viewer_presentation["schema_version"] == "presentation.viewer-presentation.v1"
+    assert _viewer_presentation["risk_rendering"]["geometry_policy"] == (
+        "exact_authoritative_cells_no_interpolation"
+    )
+    assert _viewer_presentation["risk_rendering"]["hard_reason_policy"] == (
+        "separate_exact_cells_fail_closed"
+    )
+    assert _viewer_presentation["route_rendering"]["authoritative_semantics_unchanged"]
+    assert _viewer_presentation["vessel_rendering"]["pixel_motion"] == "none"

@@ -36,6 +36,25 @@ RISK_HORIZONS: tuple[tuple[str, int], ...] = (
     ("+24h", 24),
 )
 
+VIEWER_PRESENTATION = {
+    "schema_version": "presentation.viewer-presentation.v1",
+    "risk_rendering": {
+        "source_schema": "presentation.risk-overlay.v1",
+        "geometry_policy": "exact_authoritative_cells_no_interpolation",
+        "hard_reason_policy": "separate_exact_cells_fail_closed",
+    },
+    "route_rendering": {
+        "source": "routes.waypoints",
+        "geometry_policy": "authoritative_polyline_linear_densification_for_display",
+        "authoritative_semantics_unchanged": True,
+    },
+    "vessel_rendering": {
+        "position_source": "timeline.vessel_at",
+        "heading_source": "active_authoritative_route_segment_bearing",
+        "pixel_motion": "none",
+    },
+}
+
 
 def _write_png(path: Path, width: int, height: int, pixels: bytes) -> None:
     def chunk(tag: bytes, data: bytes) -> bytes:
@@ -607,6 +626,7 @@ def main(argv: list[str] | None = None) -> int:
             "manifest_semantic_digest": manifest_doc.get("semantic_digest"),
         },
         "basemap": metadata.to_dict(),
+        "presentation": VIEWER_PRESENTATION,
         "gates": gates,
         "routes": [
             _route_meta(adapter, revision)

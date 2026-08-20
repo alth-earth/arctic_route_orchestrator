@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased - Viewer Presentation Polish（2026-08-21 01:20 +08:00）
+
+- feat: export backward-compatible `presentation.viewer-presentation.v1`
+  metadata describing exact risk/hard cell rendering, display-only collinear
+  route densification, and ETA/segment-bearing vessel rendering;
+- test: add contract assertions for the display-only policies; Orchestrator
+  fast suite passes 78 tests with 2 integration tests deselected and ruff clean;
+- no authoritative risk, route, ETA, adoption, causal replay, or determinism
+  semantics changed.
+
 ## Unreleased - 2026-08-20（Viewer ownership migration）
 
 - fix: add repo-local `pyrightconfig.json` for the Orchestrator `.venv` and
