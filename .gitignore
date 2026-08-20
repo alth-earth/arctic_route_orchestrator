@@ -11,10 +11,3 @@ __pycache__/
 htmlcov/
 output/
 data/
-
-# Viewer generated artifacts (produced by export script, not source)
-viewer/bundle.json
-viewer/gebco_basemap.png
-viewer/basemap_metadata.json
-viewer/replay-viewer-preflight.json
-viewer/index_self_contained.html
