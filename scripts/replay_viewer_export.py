@@ -142,6 +142,7 @@ def _timeline(adapter: PresentationAdapter, cadence_seconds: int) -> list[dict]:
     results: list[dict] = []
     previous_track_key: tuple | None = None
     previous_pending_key: tuple | None = None
+    previous_superseded_key: tuple | None = None
     moment = adapter.replay_start
     while moment <= adapter.replay_end:
         state = adapter.state_at(moment)
@@ -178,9 +179,7 @@ def _timeline(adapter: PresentationAdapter, cadence_seconds: int) -> list[dict]:
             "dt": plan_dict["pending_adoption"]["decision_time"]
             if plan_dict["pending_adoption"]
             else None,
-            "eat": plan_dict["pending_adoption"]["effective_adoption_time"]
-            if plan_dict["pending_adoption"]
-            else None,
+            "eat": None,
             "ctl": len(track),
             "seg": {
                 "index": segment["index"],
@@ -188,6 +187,22 @@ def _timeline(adapter: PresentationAdapter, cadence_seconds: int) -> list[dict]:
                 "end_eta": segment["end_eta"],
             },
         }
+        if plan_dict["pending_adoption"]:
+            pending_revision = plan_dict["pending_plan_revision"]
+            effective_event = next(
+                (
+                    event
+                    for event in adapter._events
+                    if event["type"] in {"REPLAN_ADOPTED", "ROUTE_CHANGED"}
+                    and str(event.get("revision")) == str(pending_revision)
+                ),
+                None,
+            )
+            entry["eat"] = (
+                effective_event["simulation_time"]
+                if effective_event is not None
+                else plan_dict["pending_adoption"]["effective_adoption_time"]
+            )
         if track_key != previous_track_key:
             entry["track"] = track
             previous_track_key = track_key
@@ -209,9 +224,152 @@ def _timeline(adapter: PresentationAdapter, cadence_seconds: int) -> list[dict]:
             else:
                 entry["pending"] = None
             previous_pending_key = pending_key
+        superseded = plan_dict.get("superseded_future_route")
+        superseded_key = (
+            tuple(
+                (
+                    item.get("longitude"),
+                    item.get("latitude"),
+                    item.get("eta"),
+                )
+                for item in superseded or ()
+            )
+            if superseded
+            else None
+        )
+        if superseded_key != previous_superseded_key:
+            entry["superseded"] = (
+                [
+                    {
+                        "lon": item["longitude"],
+                        "lat": item["latitude"],
+                        "eta": item["eta"],
+                    }
+                    for item in superseded
+                ]
+                if superseded
+                else None
+            )
+            previous_superseded_key = superseded_key
         results.append(entry)
         moment += timedelta(seconds=cadence_seconds)
     return results
+
+
+def _presentation_risk(
+    *,
+    risk_store_root: Path | None,
+    scenario_id: str,
+    replay_start: datetime,
+    replay_end: datetime,
+) -> dict:
+    """Project committed B risk frames into a bounded viewer-ready payload.
+
+    The exporter reads immutable ``bc.risk-frame.v2`` files only.  It does not
+    calculate risk, reinterpret hard reasons, or expose raw source data to D.
+    One frame per valid time is retained for the replay interval; the Viewer
+    selects the latest valid frame at or before its single simulation clock.
+    """
+
+    empty = {
+        "schema_version": "presentation.risk-overlay.v1",
+        "status": "NOT_EXPORTED",
+        "selection_rule": "latest_valid_time_at_or_before_simulation_time",
+        "cadence_seconds": 3600,
+        "level_range": [1, 5],
+        "hard_reasons": [],
+        "frames": [],
+    }
+    if risk_store_root is None or not risk_store_root.is_dir():
+        return empty
+
+    frames_by_valid_time: dict[str, dict] = {}
+    for path in sorted((risk_store_root / "frames").glob("risk-sha256-*.json")):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot read risk frame {path}: {exc}") from exc
+        if document.get("schema_version") != "bc.risk-frame.v2":
+            continue
+        if document.get("scenario_id") != scenario_id:
+            continue
+        valid_time = document.get("valid_time")
+        if not valid_time:
+            continue
+        valid = _parse_utc(valid_time)
+        if valid < replay_start or valid > replay_end:
+            continue
+        payload = document.get("payload") or {}
+        coordinates = payload.get("coordinates") or {}
+        variables = payload.get("variables") or {}
+        latitudes = coordinates.get("latitude")
+        longitudes = coordinates.get("longitude")
+        hard_reasons = variables.get("hard_reason")
+        risk_levels = variables.get("risk_level")
+        risk_scores = variables.get("risk_score")
+        confidences = variables.get("confidence")
+        if not all(
+            isinstance(value, list)
+            for value in (
+                latitudes,
+                longitudes,
+                hard_reasons,
+                risk_levels,
+                risk_scores,
+                confidences,
+            )
+        ):
+            raise ValueError(f"risk frame {path} is missing spatial arrays")
+        if any(
+            len(matrix) != len(latitudes)
+            or any(len(row) != len(longitudes) for row in matrix)
+            for matrix in (hard_reasons, risk_levels, risk_scores, confidences)
+        ):
+            raise ValueError(f"risk frame {path} spatial arrays have mismatched shapes")
+        flattened = {
+            "hard_reasons": [reason for row in hard_reasons for reason in row],
+            "risk_levels": [level for row in risk_levels for level in row],
+            "risk_scores": [score for row in risk_scores for score in row],
+            "confidences": [confidence for row in confidences for confidence in row],
+        }
+        frame = {
+            "valid_time": valid_time,
+            "risk_id": document.get("risk_id"),
+            "as_of_time": document.get("as_of_time"),
+            "provenance": document.get("provenance"),
+            "coordinates": {"latitude": latitudes, "longitude": longitudes},
+            **flattened,
+        }
+        previous = frames_by_valid_time.get(valid_time)
+        if previous is not None and previous["risk_id"] != frame["risk_id"]:
+            raise ValueError(f"multiple risk frames for valid_time {valid_time}")
+        frames_by_valid_time[valid_time] = frame
+
+    frames = [frames_by_valid_time[key] for key in sorted(frames_by_valid_time)]
+    if not frames:
+        return empty
+    hard_reasons = sorted(
+        {
+            reason
+            for frame in frames
+            for reason in frame["hard_reasons"]
+            if reason not in (None, "NONE")
+        }
+    )
+    return {
+        **empty,
+        "status": "PASS",
+        "source": {
+            "schema_version": "bc.risk-frame.v2",
+            "risk_store_root": str(risk_store_root),
+            "scenario_id": scenario_id,
+            "provenance": sorted(
+                {str(frame["provenance"]) for frame in frames}
+            ),
+        },
+        "hard_reasons": hard_reasons,
+        "frames": frames,
+    }
 
 
 def _build_basemap(
@@ -258,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="replay-viewer-export")
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--snapshots-dir", type=Path, default=None)
+    parser.add_argument("--risk-store-root", type=Path, default=None)
     data_default = Path("/root/my_project/work_package_a/data")
     parser.add_argument("--data-root", type=Path, default=data_default)
     parser.add_argument("--route-id", default="tromso_to_isfjorden_outer")
@@ -276,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest_doc = json.loads(args.manifest.read_text(encoding="utf-8"))
     snapshots_dir = args.snapshots_dir or args.manifest.parent / "snapshots"
+    risk_store_root = args.risk_store_root or args.manifest.parent / "risk-store"
     snapshots = [
         json.loads((snapshots_dir / f"{entry['index']:04d}.json").read_text(encoding="utf-8"))
         for entry in manifest_doc["snapshots"]
@@ -311,6 +471,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     adapter = PresentationAdapter(manifest_doc, snapshots)
+    replay_start = adapter.replay_start
+    replay_end = adapter.replay_end
     gates = {
         "status": preflight.overall,
         "l2_status": preflight.document.get("l2", {}).get("overall"),
@@ -348,6 +510,12 @@ def main(argv: list[str] | None = None) -> int:
             for event in adapter._events
         ],
         "timeline": _timeline(adapter, args.cadence_seconds),
+        "risk": _presentation_risk(
+            risk_store_root=risk_store_root,
+            scenario_id=str(manifest_doc.get("scenario_id", "")),
+            replay_start=replay_start,
+            replay_end=replay_end,
+        ),
         "acceptance_positions": positions,
     }
     (output_dir / "bundle.json").write_text(

@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-08-20（Viewer ownership migration）
 
+- feat: export a presentation-ready `presentation.risk-overlay.v1` current
+  risk projection from formal `bc.risk-frame.v2` frames; preserve
+  `valid_time`, risk levels, confidence, provenance, and separate hard
+  reasons without recomputing B semantics in D;
+- fix: expose superseded future-route segments and use the actual
+  `REPLAN_ADOPTED` event as the effective adoption time when present;
+
 - refactor: hand off viewer presentation runtime to work_package_d;
   D now owns HTML/JS/CSS, Simulation Clock, moving ship, static server,
   proof renderer;

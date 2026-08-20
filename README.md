@@ -19,6 +19,17 @@ D renders them. The orchestrator does NOT own HTML/JS/CSS or rendering.
 
 Package version: `0.1.0`.
 
+## Presentation Export Product Contract（2026-08-20 21:13 +08:00）
+
+The presentation adapter now exports a presentation-ready current-risk
+projection from the co-located formal `bc.risk-frame.v2` artifact. It emits
+`risk` frames in `bundle.json` with the selection rule
+`latest_valid_time_at_or_before_simulation_time`, hourly cadence, explicit
+`valid_time`, risk levels, and separate `hard_reason` values. The adapter
+validates frame shape and provenance and fails closed; D does not read raw
+weather data or recalculate B semantics. D remains the sole Viewer runtime
+owner, while this package owns the export contract and L1/L2 preflight.
+
 ## 当前状态
 
 - **Demo RC1（2026-08-16）**：mur/dikson v3 四层 + 6h 重规划经 r6 首次完整 E2E、
