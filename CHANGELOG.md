@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased - 2026-08-20（Viewer ownership migration）
+
+- refactor: hand off viewer presentation runtime to work_package_d;
+  D now owns HTML/JS/CSS, Simulation Clock, moving ship, static server,
+  proof renderer;
+- added `scripts/replay_viewer_export.py`: backend artifact producer
+  (bundle.json, gebco_basemap.png, basemap_metadata.json,
+  replay-viewer-preflight.json) — orchestrator owns presentation package
+  production, D renders;
+- removed `viewer/build_basemap.py`, `viewer/build_bundle.py`,
+  `viewer/embed.py`, `viewer/render_proof.py`, `viewer/README.md`,
+  `scripts/replay_viewer_serve.py`, `tests/unit/test_viewer_bundle.py`
+  (migrated to D);
+- fixed basemap export to write proper PNG via `_write_png` (was writing
+  raw RGB bytes);
+
+
 ## Unreleased - 2026-08-19（Replay-driven Viewer MVP + L2 Preflight）
 
 - `replay/geospatial.py`：L2 gate 改为 raster-cell traversal（mask grid，
