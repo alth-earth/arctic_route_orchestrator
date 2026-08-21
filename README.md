@@ -1,13 +1,24 @@
 ---
-Document Status: ACTIVE_SUPPORTING
+Overall Status: ACTIVE
+Content Status:
+  - COMPLETED
+  - PLANNED
+Document Role: CANONICAL
 Scope: orchestrator package README
 Canonical For: orchestrator role and ownership
-Branch: demo-engineering
+Branch: research-validation-system
 Last Verified: 2026-08-21
 Related Canonical Docs: ../arctic_route_governance/current/architecture/ARCTIC_ROUTE_SYSTEM.md
 ---
 
 # A-B-C-D Root Coordinator
+
+## Research Validation role（2026-08-21 23:18）
+
+The Orchestrator is the Pipeline / Artifact / Presentation Adapter. It owns
+replay/navigation coordination, validation and export, but not the D Viewer runtime.
+The current candidate presentation package remains explicitly `NOT_PUBLISHED`; a
+future versioned extension must project real C artifacts without ranking or inventing routes.
 
 `arctic-route-orchestrator` is the root coordinator for A, B, C, and D.
 It coordinates the pipeline, runs causal replay, manages navigation execution
