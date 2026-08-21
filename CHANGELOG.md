@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased - Competition Demo Freeze Presentation Extension（2026-08-21 17:15 +08:00）
+
+- presentation export: publish forecast trend and explicit hard-cell counts
+  from already exported risk-frame summaries;
+- presentation export: publish route arrival ETA, optional existing metrics,
+  and an empty backward-compatible `presentation.route-candidates.v1` package
+  when candidate geometry/metrics are absent;
+- preserve all authoritative B risk, C route, ETA, adoption, replay, and
+  determinism semantics.
+
 ## Unreleased - Competition Demo Final Polish（2026-08-21 15:30 +08:00）
 
 - presentation export: add per-frame risk grid metadata and distribution

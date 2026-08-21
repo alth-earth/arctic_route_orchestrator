@@ -38,6 +38,23 @@ percentages, finite score min/max/mean, and hard-reason counts). These are
 descriptive metadata only; they do not change `bc.risk-frame.v2` values,
 thresholds, route semantics, or replay timing.
 
+## Competition Demo Freeze Presentation Extension（2026-08-21 17:15 +08:00）
+
+The export also publishes presentation-only risk forecast summary metadata
+(first-to-last finite mean-score trend and explicit LAND,
+`DATA_UNAVAILABLE`, and total hard-cell counts) and route display metadata
+(arrival ETA and optional route metrics). Missing route metrics remain null.
+
+`route_candidates` is exported as the backward-compatible
+`presentation.route-candidates.v1` package. The current formal artifact has no
+candidate geometry/metrics, so it publishes `status=NOT_PUBLISHED` with an
+empty `candidates` list. D keeps the authoritative route and does not infer
+Fastest/Low Risk/Recommended candidates from semantic digests.
+
+These fields are presentation summaries only. The Orchestrator still owns
+export/preflight, D remains the sole Viewer runtime owner, and no B/C/replay
+semantics are recalculated or changed.
+
 `pyrightconfig.json` is repo-local and points editor analysis at the
 Orchestrator `.venv` plus `src`; it does not modify global editor settings or
 production import paths. The four original export-script import diagnostics

@@ -11,6 +11,7 @@ _SPEC.loader.exec_module(_EXPORTER)
 _risk_horizon_selections = _EXPORTER._risk_horizon_selections
 _select_risk_horizon = _EXPORTER._select_risk_horizon
 _viewer_presentation = _EXPORTER.VIEWER_PRESENTATION
+_risk_forecast_summary = _EXPORTER._risk_forecast_summary
 
 
 def _frames() -> list[dict]:
@@ -96,3 +97,26 @@ def test_risk_frame_summary_is_presentation_only_and_counts_published_values() -
     assert summary["risk_level_counts"] == {"1": 2, "2": 0, "3": 0, "4": 0, "5": 1}
     assert summary["hard_reason_counts"] == {"LAND": 1, "NONE": 2}
     assert abs(summary["risk_score_mean"] - 0.15) < 1e-12
+    assert summary["land_count"] == 1
+    assert summary["data_unavailable_count"] == 0
+    assert summary["hard_cell_count"] == 1
+
+
+def test_risk_forecast_summary_reports_presentation_trend_only() -> None:
+    frames = [
+        {
+            "valid_time": "2026-08-15T10:00:00Z",
+            "summary": {"risk_score_mean": 0.2},
+        },
+        {
+            "valid_time": "2026-08-15T11:00:00Z",
+            "summary": {"risk_score_mean": 0.1},
+        },
+    ]
+
+    summary = _risk_forecast_summary(frames)
+
+    assert summary["status"] == "PASS"
+    assert summary["trend"] == "decreasing"
+    assert summary["trend_method"] == "first_to_last_finite_mean_score"
+    assert summary["mean_score_delta"] == -0.1

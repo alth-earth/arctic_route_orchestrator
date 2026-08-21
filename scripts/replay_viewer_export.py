@@ -49,12 +49,21 @@ VIEWER_PRESENTATION = {
         "source": "routes.waypoints",
         "geometry_policy": "authoritative_polyline_linear_densification_for_display",
         "authoritative_semantics_unchanged": True,
+        "candidate_source": "route_candidates",
+        "candidate_empty_policy": "keep_single_authoritative_route",
     },
     "vessel_rendering": {
         "position_source": "timeline.vessel_at",
         "heading_source": "active_authoritative_route_segment_bearing",
         "pixel_motion": "none",
     },
+}
+
+ROUTE_CANDIDATES_PACKAGE = {
+    "schema_version": "presentation.route-candidates.v1",
+    "status": "NOT_PUBLISHED",
+    "candidates": [],
+    "reason": "candidate_geometry_and_metrics_not_published",
 }
 
 
@@ -131,6 +140,14 @@ def _iso(value: datetime) -> str:
 def _route_meta(adapter: PresentationAdapter, revision: int) -> dict:
     entry = adapter._routes_by_revision[revision]
     route = entry["route"]
+    waypoints = [
+        {
+            "lon": item["longitude"],
+            "lat": item["latitude"],
+            "eta": item["eta"],
+        }
+        for item in route["waypoints"]
+    ]
     decision_time = None
     adopt_time = None
     mode = "INITIAL"
@@ -154,14 +171,13 @@ def _route_meta(adapter: PresentationAdapter, revision: int) -> dict:
         "effective_adoption_time": adopt_time,
         "adoption_mode": mode,
         "distance_km": route.get("distance_km"),
-        "waypoints": [
-            {
-                "lon": item["longitude"],
-                "lat": item["latitude"],
-                "eta": item["eta"],
-            }
-            for item in route["waypoints"]
-        ],
+        "arrival_eta": waypoints[-1]["eta"] if waypoints else None,
+        "metrics": {
+            "distance_km": route.get("distance_km"),
+            "average_risk": route.get("average_risk", route.get("avg_risk")),
+            "maximum_risk": route.get("maximum_risk", route.get("max_risk")),
+        },
+        "waypoints": waypoints,
     }
 
 
@@ -399,6 +415,47 @@ def _risk_frame_summary(frame: dict) -> dict:
         "risk_score_max": max(scores) if scores else None,
         "risk_score_mean": fmean(scores) if scores else None,
         "hard_reason_counts": reason_counts,
+        "land_count": reason_counts.get("LAND", 0),
+        "data_unavailable_count": reason_counts.get("DATA_UNAVAILABLE", 0),
+        "hard_cell_count": sum(
+            count for reason, count in reason_counts.items() if reason != "NONE"
+        ),
+    }
+
+
+def _risk_forecast_summary(frames: list[dict]) -> dict:
+    summaries = [
+        frame.get("summary")
+        for frame in frames
+        if isinstance(frame.get("summary"), dict)
+        and isinstance(frame["summary"].get("risk_score_mean"), (int, float))
+        and math.isfinite(float(frame["summary"]["risk_score_mean"]))
+    ]
+    if not summaries:
+        return {
+            "status": "NOT_AVAILABLE",
+            "trend": "unavailable",
+            "trend_method": "first_to_last_finite_mean_score",
+            "mean_score_delta": None,
+        }
+    first = float(summaries[0]["risk_score_mean"])
+    last = float(summaries[-1]["risk_score_mean"])
+    delta = last - first
+    if abs(delta) <= 1e-6:
+        trend = "stable"
+    elif delta > 0:
+        trend = "increasing"
+    else:
+        trend = "decreasing"
+    return {
+        "status": "PASS",
+        "trend": trend,
+        "trend_method": "first_to_last_finite_mean_score",
+        "first_valid_time": frames[0]["valid_time"],
+        "last_valid_time": frames[-1]["valid_time"],
+        "first_mean_score": first,
+        "last_mean_score": last,
+        "mean_score_delta": delta,
     }
 
 
@@ -433,6 +490,12 @@ def _presentation_risk(
         "hard_reasons": [],
         "frames": [],
         "horizon_selections": [],
+        "forecast_summary": {
+            "status": "NOT_AVAILABLE",
+            "trend": "unavailable",
+            "trend_method": "first_to_last_finite_mean_score",
+            "mean_score_delta": None,
+        },
     }
     if risk_store_root is None or not risk_store_root.is_dir():
         return empty
@@ -540,6 +603,7 @@ def _presentation_risk(
         "hard_reasons": hard_reasons,
         "frames": frames,
         "horizon_selections": _risk_horizon_selections(frames, simulation_times or []),
+        "forecast_summary": _risk_forecast_summary(frames),
     }
 
 
@@ -681,6 +745,7 @@ def main(argv: list[str] | None = None) -> int:
             _route_meta(adapter, revision)
             for revision in sorted(adapter._routes_by_revision)
         ],
+        "route_candidates": ROUTE_CANDIDATES_PACKAGE,
         "events": [
             {
                 "t": event["simulation_time"],
