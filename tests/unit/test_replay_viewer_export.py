@@ -82,3 +82,17 @@ def test_viewer_presentation_declares_display_only_geometry_policies() -> None:
     )
     assert _viewer_presentation["route_rendering"]["authoritative_semantics_unchanged"]
     assert _viewer_presentation["vessel_rendering"]["pixel_motion"] == "none"
+
+
+def test_risk_frame_summary_is_presentation_only_and_counts_published_values() -> None:
+    summary = _EXPORTER._risk_frame_summary(
+        {
+            "risk_levels": [1, 1, 5],
+            "risk_scores": [0.1, 0.2, None],
+            "hard_reasons": ["NONE", "NONE", "LAND"],
+        }
+    )
+
+    assert summary["risk_level_counts"] == {"1": 2, "2": 0, "3": 0, "4": 0, "5": 1}
+    assert summary["hard_reason_counts"] == {"LAND": 1, "NONE": 2}
+    assert abs(summary["risk_score_mean"] - 0.15) < 1e-12

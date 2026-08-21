@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased - Competition Demo Final Polish（2026-08-21 15:30 +08:00）
+
+- presentation export: add per-frame risk grid metadata and distribution
+  summaries (counts, percentages, finite score min/max/mean, hard-reason
+  counts) as a backward-compatible Viewer presentation extension;
+- preserve `bc.risk-frame.v2`, horizon selection, route, ETA, adoption, and
+  causal replay semantics; D consumes the exported summaries only for display
+  and audit.
+
 ## Unreleased - Viewer Presentation Polish（2026-08-21 01:20 +08:00）
 
 - feat: export backward-compatible `presentation.viewer-presentation.v1`

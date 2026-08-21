@@ -32,6 +32,12 @@ does not read raw weather data or recalculate B semantics. D remains the sole
 Viewer runtime owner, while this package owns the export contract and L1/L2
 preflight.
 
+The Competition Demo Final Polish export additionally publishes per-frame
+presentation summaries (grid rows/columns/resolution, risk-level counts and
+percentages, finite score min/max/mean, and hard-reason counts). These are
+descriptive metadata only; they do not change `bc.risk-frame.v2` values,
+thresholds, route semantics, or replay timing.
+
 `pyrightconfig.json` is repo-local and points editor analysis at the
 Orchestrator `.venv` plus `src`; it does not modify global editor settings or
 production import paths. The four original export-script import diagnostics

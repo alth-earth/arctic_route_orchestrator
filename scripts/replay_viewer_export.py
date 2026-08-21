@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import struct
 import sys
 import zlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from statistics import fmean
 
 import numpy as np
 
@@ -369,6 +371,37 @@ def _risk_horizon_selections(frames: list[dict], simulation_times: list[datetime
     return selections
 
 
+def _risk_frame_summary(frame: dict) -> dict:
+    """Add presentation-only distribution facts without changing B semantics."""
+
+    levels = [int(value) for value in frame["risk_levels"]]
+    scores = [
+        float(value)
+        for value in frame["risk_scores"]
+        if isinstance(value, (int, float)) and math.isfinite(float(value))
+    ]
+    reasons = [str(value or "NONE") for value in frame["hard_reasons"]]
+    total = len(levels)
+    level_counts = {str(level): levels.count(level) for level in range(1, 6)}
+    reason_counts = {
+        reason: reasons.count(reason)
+        for reason in sorted(set(reasons))
+    }
+    return {
+        "total_cells": total,
+        "risk_level_counts": level_counts,
+        "risk_level_percentages": {
+            level: round(count * 100.0 / total, 4) if total else 0.0
+            for level, count in level_counts.items()
+        },
+        "risk_score_finite_count": len(scores),
+        "risk_score_min": min(scores) if scores else None,
+        "risk_score_max": max(scores) if scores else None,
+        "risk_score_mean": fmean(scores) if scores else None,
+        "hard_reason_counts": reason_counts,
+    }
+
+
 def _presentation_risk(
     *,
     risk_store_root: Path | None,
@@ -469,6 +502,21 @@ def _presentation_risk(
     frames = [frames_by_valid_time[key] for key in sorted(frames_by_valid_time)]
     if not frames:
         return empty
+    first = frames[0]
+    latitude = first["coordinates"]["latitude"]
+    longitude = first["coordinates"]["longitude"]
+    risk_grid = {
+        "rows": len(latitude),
+        "cols": len(longitude),
+        "latitude_resolution_degrees": (
+            abs(latitude[1] - latitude[0]) if len(latitude) > 1 else None
+        ),
+        "longitude_resolution_degrees": (
+            abs(longitude[1] - longitude[0]) if len(longitude) > 1 else None
+        ),
+    }
+    for frame in frames:
+        frame["summary"] = _risk_frame_summary(frame)
     hard_reasons = sorted(
         {
             reason
@@ -488,6 +536,7 @@ def _presentation_risk(
                 {str(frame["provenance"]) for frame in frames}
             ),
         },
+        "grid": risk_grid,
         "hard_reasons": hard_reasons,
         "frames": frames,
         "horizon_selections": _risk_horizon_selections(frames, simulation_times or []),
