@@ -1,3 +1,14 @@
+---
+Overall Status: ACTIVE
+Content Status:
+  - COMPLETED
+  - PLANNED
+Document Role: SUPPORTING
+Scope: orchestrator handoff
+Branch: research-validation-system
+Last Verified: 2026-08-21
+---
+
 > **文档治理声明**
 >
 > - 本文件角色：当前 A–B–C 根级编排器的人类与 AI 统一交接入口。
