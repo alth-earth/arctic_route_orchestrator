@@ -166,11 +166,10 @@ class ArtifactIntake:
                 f"records without source_snapshot_id: {missing_snapshots[:5]}",
             )
         latest_issue_time = max(record.issue_time for record in bundle.records)
-        if bundle.as_of_time != latest_issue_time:
-            raise ArtifactIntakeError(
-                "a_artifact_knowledge_cutoff_mismatch",
-                "bundle as_of_time must equal the maximum selected record issue_time",
-            )
+        _validate_knowledge_cutoff(
+            as_of_time=bundle.as_of_time,
+            latest_issue_time=latest_issue_time,
+        )
         horizon_hours = int(
             (bundle.requested_end - bundle.requested_start).total_seconds() // 3600
         )
@@ -259,6 +258,18 @@ class ArtifactIntake:
                 )
                 for record in bundle.records
             ),
+        )
+
+
+def _validate_knowledge_cutoff(
+    *, as_of_time: datetime, latest_issue_time: datetime
+) -> None:
+    """Accept a logical cutoff at or after every selected record issue time."""
+
+    if latest_issue_time > as_of_time:
+        raise ArtifactIntakeError(
+            "a_artifact_knowledge_cutoff_mismatch",
+            "bundle contains a record issued after as_of_time",
         )
 
 

@@ -1,0 +1,20 @@
+{
+  "config_digest": "0af276205eb8f22c0727a29dedefae18d72f8ccda4e816ced9142f851e463842",
+  "corridor_digest": "032f7b0f66e4db603b9fcaaf93a281ce8958200ac0613fe3b424825ad8405cf3",
+  "corridor_id": "tromso_to_isfjorden_outer",
+  "corridor_version": "1.2.0",
+  "created_at": "2026-08-22T17:09:00Z",
+  "dataset_bundle_digest": "a2146dd0adbaa7db77a6beb7c818e975888600fb31236901fd4af2092069fb71",
+  "dataset_bundle_id": "a-bundle-a2146dd0adbaa7db77a6beb7",
+  "run_id": "run-441b03c8-d45b-5414-b0e8-b7fd0d990c22",
+  "scenario_digest": "200df6acfd66fb40e2eb9cbdd7693314abfae0b842bd16ddb3a03bcb1a936875",
+  "scenario_id": "tromso_isfjorden_february_2026_research_v1",
+  "scenario_mode": "retrospective_best_estimate",
+  "scenario_version": "0.1.0",
+  "schema_version": "run-context.v2",
+  "simulation_end": "2026-02-21T00:00:00Z",
+  "simulation_start": "2026-02-15T00:00:00Z",
+  "vessel_profile_digest": "d7fb6ce90db06aaf667644b5eb5cd6a03d1641287fcbaec58a5ab001f3527a9d",
+  "vessel_profile_id": "nordic_odyssey_reference_v1",
+  "vessel_profile_version": "1.0.0"
+}

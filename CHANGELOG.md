@@ -6,10 +6,21 @@ Content Status:
 Document Role: SUPPORTING
 Scope: orchestrator change history
 Branch: research-validation-system
-Last Verified: 2026-08-21
+Last Verified: 2026-08-23
 ---
 
 # Changelog
+
+## Unreleased - Winter Formal Handoff（2026-08-23 01:16 +08:00）
+
+- publish matching `run-context.v2` and strict `orchestrator.execution-spec.v1`
+  artifacts for the frozen Winter DatasetBundle;
+- align intake knowledge-cutoff validation with the shared temporal invariant
+  `max(record.issue_time) <= bundle.as_of_time`; future-issued records remain
+  fail closed;
+- validate the exact 1,212-record archive through intake-only without invoking
+  B RiskBuild, C planning, replay, or D Viewer;
+- no bundle, contract schema, B/C algorithm, route, ETA, or Viewer semantics changed.
 
 ## Unreleased - Competition Demo Freeze Presentation Extension（2026-08-21 17:15 +08:00）
 

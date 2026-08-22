@@ -26,6 +26,11 @@ def build_parser() -> argparse.ArgumentParser:
     intake = subparsers.add_parser("intake", help="验证外部正式 A bundle/RunContext")
     intake.add_argument("--bundle", required=True)
     intake.add_argument("--run-context", required=True)
+    intake.add_argument(
+        "--execution-spec",
+        type=Path,
+        help="optionally bind strict ExecutionSpec identity during intake-only validation",
+    )
     intake.add_argument("--a-data-root", required=True)
     intake.add_argument("--generation-id", required=True, type=int)
     run = subparsers.add_parser("run", help="执行正式 A→B→C 与 6 h 同代次重规划")
@@ -49,13 +54,33 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         if args.command == "intake":
+            spec = (
+                ExecutionSpec.from_path(args.execution_spec)
+                if args.execution_spec is not None
+                else None
+            )
+            if spec is not None and spec.generation_id != args.generation_id:
+                raise OrchestrationError(
+                    "execution_spec_invalid",
+                    "ExecutionSpec generation_id differs from intake generation_id",
+                )
             result = ArtifactIntake.validate(
                 bundle_path=args.bundle,
                 run_context_path=args.run_context,
                 a_data_root=args.a_data_root,
                 generation_id=args.generation_id,
+                scenario_id=spec.scenario_id if spec is not None else None,
+                run_id=spec.run_id if spec is not None else None,
+                created_at=spec.generated_at if spec is not None else None,
             )
             response = {"ok": True, **asdict(result.report)}
+            if spec is not None:
+                response.update(
+                    {
+                        "execution_spec_validated": True,
+                        "planning_contract": spec.planning_contract,
+                    }
+                )
         else:
             spec = ExecutionSpec.from_path(args.execution_spec)
             result = run_with_timeout(

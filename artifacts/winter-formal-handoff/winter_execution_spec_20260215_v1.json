@@ -1,0 +1,12 @@
+{
+  "schema_version": "orchestrator.execution-spec.v1",
+  "run_id": "run-441b03c8-d45b-5414-b0e8-b7fd0d990c22",
+  "scenario_id": "tromso_isfjorden_february_2026_research_v1",
+  "generation_id": 0,
+  "input_revision": 0,
+  "generated_at": "2026-08-22T17:09:00Z",
+  "planning_contract": "cd.four-layer-route-plan-set.v3",
+  "max_snap_km": 150.0,
+  "replan_after_hours": 6,
+  "per_stage_timeout_seconds": 3600
+}

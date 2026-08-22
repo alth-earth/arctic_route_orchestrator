@@ -6,7 +6,7 @@ Content Status:
 Document Role: SUPPORTING
 Scope: orchestrator handoff
 Branch: research-validation-system
-Last Verified: 2026-08-21
+Last Verified: 2026-08-23
 ---
 
 > **文档治理声明**
@@ -55,6 +55,7 @@ GeoJSON 和校验清单。D 未来只读这些完整制品。
 | 挑战杯完整链 | 待完成 D 展示和两次断网演示 |
 | Strategy B Causal Replay / Performance | PASS（2026-08-19）：12h=1306.8s（1.59×）、24h=1743.2s；pre-planning gate + moving-vessel 语义；详见 `../STRATEGY_B_PERFORMANCE_HARDENING_20260819.md` |
 | Ship Motion Semantics | PASS（2026-08-19）：physical/planner 分离、vessel_state_at 任意时刻、deferred adoption 无瞬移；详见 `../STRATEGY_B_SHIP_MOTION_SEMANTICS_20260819.md` |
+| Winter Formal Handoff | READY_FOR_B_VALIDATION（2026-08-23）：RunContext + ExecutionSpec + exact archive intake-only PASS；B/C/D 未执行 |
 
 已完成清单（源自：arctic_route_orchestrator_handoff_归档_20260815.md）：
 
@@ -224,7 +225,7 @@ initial/replan、正确路线数量、同一身份/digest、原子 output、chec
 
 - [README](README.md)
 - [长运行复盘](docs/INCIDENT_2026-08-14_LONG_INTEGRATION_RUN.md)
-- [系统权威](../ARCTIC_ROUTE_SYSTEM.md)
-- [十日计划](../ABC_10_DAY_SPRINT.md)
+- [系统权威](../arctic_route_governance/current/architecture/ARCTIC_ROUTE_SYSTEM.md)
+- [十日计划（历史）](../arctic_route_governance/archive/superseded/ABC_10_DAY_SPRINT.md)
 
 项目负责人对 A/B/C 决策拥有最终权；Git 提交与同步在本会话结束后由用户手动执行。

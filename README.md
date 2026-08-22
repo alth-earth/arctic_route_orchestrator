@@ -7,7 +7,7 @@ Document Role: CANONICAL
 Scope: orchestrator package README
 Canonical For: orchestrator role and ownership
 Branch: research-validation-system
-Last Verified: 2026-08-21
+Last Verified: 2026-08-23
 Related Canonical Docs: ../arctic_route_governance/current/architecture/ARCTIC_ROUTE_SYSTEM.md
 ---
 
@@ -29,6 +29,29 @@ stable presentation packages (JSON/PNG) via `scripts/replay_viewer_export.py`;
 D renders them. The orchestrator does NOT own HTML/JS/CSS or rendering.
 
 Package version: `0.1.0`.
+
+## Winter Formal Handoff（2026-08-23 01:16 +08:00）
+
+Winter research identity `run-441b03c8-d45b-5414-b0e8-b7fd0d990c22` 已以 matching
+`run-context.v2` 和 strict `orchestrator.execution-spec.v1` 发布到
+`artifacts/winter-formal-handoff/`。对 active 144 小时 A bundle 的 exact archive
+intake-only 已通过；这只代表 `READY_FOR_B_VALIDATION`，没有执行或发布 Winter B/C/D
+结果。
+
+Intake 的 knowledge cutoff 继续 fail closed 于任何 `issue_time > as_of_time`，但不再要求
+logical cutoff 必须恰好等于 max source issue time。可见 record set 仍由 bundle IDs、
+checksums、source snapshots 和 digest 精确锁定。
+
+复验命令：
+
+```bash
+.venv/bin/arctic-route-orchestrator intake \
+  --bundle ../work_package_a/data/tromso_to_isfjorden_outer_winter_20260215T000000Z_min144_bundle.json \
+  --run-context artifacts/winter-formal-handoff/winter_run_context_20260215_v1.json \
+  --execution-spec artifacts/winter-formal-handoff/winter_execution_spec_20260215_v1.json \
+  --a-data-root ../work_package_a/data \
+  --generation-id 0
+```
 
 ## Presentation Export Product Contract（2026-08-20 21:13 +08:00）
 
