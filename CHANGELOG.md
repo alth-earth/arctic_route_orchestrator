@@ -11,6 +11,17 @@ Last Verified: 2026-08-23
 
 # Changelog
 
+## Unreleased - Winter Combined Viewer Assembly（2026-08-23 20:14 +08:00）
+
+- feat: 为 `replay_viewer_export.py` 增加 Winter combined assembly，严格绑定
+  DatasetBundle、RunContext、145-frame committed RiskWindow、C v3 plan set、12-route
+  candidate sidecar 与 integrity evidence；
+- feat: 从 C full-voyage recommended waypoint ETA 投影 1-minute navigation simulation
+  timeline，并明确标记 `source_replay=null`，不伪称 causal replay；
+- safety: scenario/run/bundle/risk-window/candidate/selected-route/geometry/metrics 任一不一致
+  都 fail closed；不调用或修改 A/B/C；
+- compatibility: 原 causal-replay export 路径和 D single-route fallback 保持不变。
+
 ## Unreleased - Winter C 与 Route Presentation 接口（2026-08-23 10:20 +08:00）
 
 - 新增只消费已提交 `bc.risk-frame.v2` 窗口的 Winter C validation runner；不重跑 A/B；

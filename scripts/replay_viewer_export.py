@@ -9,6 +9,8 @@ application in work_package_d never imports orchestrator internals.
 from __future__ import annotations
 
 import argparse
+import bisect
+import hashlib
 import json
 import math
 import struct
@@ -17,6 +19,7 @@ import zlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import fmean
+from typing import Any
 
 import numpy as np
 
@@ -66,6 +69,9 @@ ROUTE_CANDIDATES_PACKAGE = {
     "candidates": [],
     "reason": "candidate_geometry_and_metrics_not_published",
 }
+
+WINTER_COMBINED_SCHEMA = "presentation.winter-combined-viewer.v1"
+WINTER_MANIFEST_SCHEMA = "presentation.winter-combined-manifest.v1"
 
 
 def _route_candidates_package(
@@ -664,9 +670,575 @@ def _build_basemap(
     return metadata, pixels
 
 
+def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read {label} {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def _winter_recommended_plan(plan_set: dict[str, Any]) -> dict[str, Any]:
+    layers = plan_set.get("layers")
+    _require(isinstance(layers, list), "Winter C plan set layers are missing")
+    full_voyage = next(
+        (
+            layer
+            for layer in layers
+            if isinstance(layer, dict) and layer.get("planning_layer") == "full_voyage"
+        ),
+        None,
+    )
+    _require(isinstance(full_voyage, dict), "Winter C full_voyage layer is missing")
+    plans = full_voyage.get("plans")
+    _require(isinstance(plans, dict), "Winter C full_voyage plans are missing")
+    recommended = plans.get("recommended")
+    _require(isinstance(recommended, dict), "Winter C recommended plan is missing")
+    return recommended
+
+
+def _validate_winter_identity(
+    *,
+    dataset_bundle: dict[str, Any],
+    run_context: dict[str, Any],
+    risk_index: dict[str, Any],
+    risk_commit: dict[str, Any],
+    plan_set: dict[str, Any],
+    route_candidates: dict[str, Any],
+    route_integrity: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Fail closed when any Winter source identity crosses experiment boundaries."""
+
+    _require(
+        dataset_bundle.get("schema_version") == "a.dataset-bundle.v2",
+        "Winter source is not a.dataset-bundle.v2",
+    )
+    _require(
+        run_context.get("schema_version") == "run-context.v2",
+        "Winter source is not RunContext.v2",
+    )
+    bundle_id = dataset_bundle.get("bundle_id")
+    bundle_digest = dataset_bundle.get("bundle_digest")
+    run_id = run_context.get("run_id")
+    scenario_id = run_context.get("scenario_id")
+    _require(
+        run_context.get("dataset_bundle_id") == bundle_id
+        and run_context.get("dataset_bundle_digest") == bundle_digest,
+        "RunContext does not bind the supplied DatasetBundle",
+    )
+    _require(
+        risk_index.get("status") == "FORMAL_VALIDATED"
+        and risk_index.get("frame_schema") == "bc.risk-frame.v2",
+        "Winter RiskFrame index is not FORMAL_VALIDATED bc.risk-frame.v2",
+    )
+    for label, value in (
+        ("RiskFrame index run", risk_index.get("run_id")),
+        ("RiskWindow run", risk_commit.get("run_id")),
+        ("C plan set run", plan_set.get("run_id")),
+        ("route candidate run", route_candidates.get("provenance", {}).get("source_run_id")),
+    ):
+        _require(value == run_id, f"{label} does not match RunContext")
+    for label, value in (
+        ("RiskFrame index scenario", risk_index.get("scenario_id")),
+        ("RiskWindow scenario", risk_commit.get("scenario_id")),
+        ("C plan set scenario", plan_set.get("scenario_id")),
+    ):
+        _require(value == scenario_id, f"{label} does not match RunContext")
+    _require(
+        risk_index.get("dataset_bundle_id") == bundle_id
+        and risk_index.get("dataset_bundle_digest") == bundle_digest,
+        "RiskFrame index does not bind the supplied DatasetBundle",
+    )
+    _require(
+        risk_commit.get("schema_version") == "bc.risk-window-commit.v1",
+        "Winter risk window is not bc.risk-window-commit.v1",
+    )
+    risk_window_id = risk_commit.get("commit_id")
+    risk_window_digest = risk_commit.get("content_digest")
+    _require(
+        risk_index.get("commit_id") == risk_window_id
+        and risk_index.get("content_digest") == risk_window_digest,
+        "RiskFrame index and RiskWindow commit identity differ",
+    )
+    commit_frames = risk_commit.get("frames")
+    frame_ids = risk_index.get("frame_ids")
+    _require(
+        isinstance(commit_frames, list)
+        and isinstance(frame_ids, list)
+        and len(commit_frames) == len(frame_ids) == risk_commit.get("count"),
+        "RiskWindow frame cardinality is inconsistent",
+    )
+    commit_ids = [frame.get("risk_id") for frame in commit_frames if isinstance(frame, dict)]
+    _require(commit_ids == frame_ids, "RiskFrame index order differs from RiskWindow commit")
+    _require(
+        risk_commit.get("interval_seconds") == 3600,
+        "Winter RiskWindow is not hourly",
+    )
+    _require(
+        risk_commit.get("start") == run_context.get("simulation_start")
+        and risk_commit.get("end") == run_context.get("simulation_end"),
+        "RiskWindow does not cover the formal RunContext window",
+    )
+    _require(
+        dataset_bundle.get("minimum_required_end") >= run_context.get("simulation_end"),
+        "DatasetBundle minimum_required_end does not cover RunContext",
+    )
+    _require(
+        plan_set.get("schema_version") == "cd.four-layer-route-plan-set.v3",
+        "Winter C source is not cd.four-layer-route-plan-set.v3",
+    )
+    recommended = _winter_recommended_plan(plan_set)
+    selected_id = route_candidates.get("selected_candidate_id")
+    _require(
+        recommended.get("plan_id") == selected_id,
+        "C recommended plan does not match selected_candidate_id",
+    )
+    selected_candidate = next(
+        (
+            candidate
+            for candidate in route_candidates.get("candidates", [])
+            if candidate.get("candidate_id") == selected_id
+        ),
+        None,
+    )
+    _require(isinstance(selected_candidate, dict), "selected route candidate is missing")
+    plan_coordinates = [
+        [waypoint.get("longitude"), waypoint.get("latitude")]
+        for waypoint in recommended.get("waypoints", [])
+    ]
+    _require(
+        selected_candidate.get("geometry", {}).get("coordinates") == plan_coordinates,
+        "selected route candidate geometry differs from C plan",
+    )
+    metrics = recommended.get("metrics", {})
+    candidate_metrics = selected_candidate.get("risk_metrics", {})
+    _require(
+        selected_candidate.get("distance_km") == metrics.get("distance_km")
+        and selected_candidate.get("travel_hours") == metrics.get("eta_hours")
+        and candidate_metrics.get("average_risk") == metrics.get("avg_risk")
+        and candidate_metrics.get("maximum_risk") == metrics.get("max_risk")
+        and candidate_metrics.get("integrated_risk_hours")
+        == metrics.get("integrated_risk_hours"),
+        "selected route candidate metrics differ from C plan",
+    )
+    candidate_ids = {
+        candidate.get("candidate_id") for candidate in route_candidates.get("candidates", [])
+    }
+    integrity_ids = {
+        item.get("route_id") for item in route_integrity if isinstance(item, dict)
+    }
+    _require(
+        len(candidate_ids) == 12 and integrity_ids == candidate_ids,
+        "route integrity evidence does not cover all 12 published candidates",
+    )
+    _require(
+        all(
+            item.get("status") == "PASS"
+            and item.get("land_intersections") == 0
+            and item.get("data_unavailable_violations") == 0
+            and item.get("edge_hard_violations") == 0
+            for item in route_integrity
+        ),
+        "route integrity evidence is not fail-closed PASS",
+    )
+    source_risk_ids = {
+        risk_id
+        for candidate in route_candidates.get("candidates", [])
+        for risk_id in candidate.get("provenance", {}).get("source_risk_ids", [])
+    }
+    _require(
+        source_risk_ids <= set(frame_ids),
+        "route candidates reference RiskFrames outside the supplied RiskWindow",
+    )
+    return {
+        "dataset_bundle_id": bundle_id,
+        "dataset_bundle_digest": bundle_digest,
+        "run_id": run_id,
+        "scenario_id": scenario_id,
+        "corridor_id": run_context.get("corridor_id"),
+        "vessel_profile_id": run_context.get("vessel_profile_id"),
+        "risk_window_id": risk_window_id,
+        "risk_window_digest": risk_window_digest,
+        "risk_frame_count": len(frame_ids),
+        "risk_window_start": risk_commit.get("start"),
+        "risk_window_end": risk_commit.get("end"),
+        "layer_set_id": plan_set.get("layer_set_id"),
+        "candidate_set_id": route_candidates.get("candidate_set_id"),
+        "selected_candidate_id": selected_id,
+    }
+
+
+def _winter_route_meta(plan: dict[str, Any]) -> dict[str, Any]:
+    waypoints = [
+        {
+            "lon": waypoint["longitude"],
+            "lat": waypoint["latitude"],
+            "eta": waypoint["eta"],
+        }
+        for waypoint in plan["waypoints"]
+    ]
+    metrics = plan["metrics"]
+    return {
+        "revision": 1,
+        "route_id": plan["plan_id"],
+        "layer": plan["planning_layer"],
+        "objective": plan["objective_mode"],
+        "decision_time": plan["start_time"],
+        "effective_adoption_time": plan["start_time"],
+        "adoption_mode": "INITIAL",
+        "distance_km": metrics["distance_km"],
+        "arrival_eta": waypoints[-1]["eta"],
+        "metrics": {
+            "distance_km": metrics["distance_km"],
+            "travel_hours": metrics["eta_hours"],
+            "average_risk": metrics["avg_risk"],
+            "maximum_risk": metrics["max_risk"],
+            "integrated_risk_hours": metrics["integrated_risk_hours"],
+            "minimum_confidence": metrics["minimum_confidence"],
+        },
+        "waypoints": waypoints,
+    }
+
+
+def _winter_vessel_timeline(
+    plan: dict[str, Any],
+    *,
+    cadence_seconds: int,
+) -> list[dict[str, Any]]:
+    """Project C waypoint ETA into the existing timeline shape without pixel motion."""
+
+    _require(cadence_seconds > 0, "timeline cadence must be positive")
+    waypoints = plan.get("waypoints")
+    _require(isinstance(waypoints, list) and len(waypoints) >= 2, "route needs waypoints")
+    eta = [_parse_utc(waypoint["eta"]) for waypoint in waypoints]
+    _require(eta == sorted(eta) and len(set(eta)) == len(eta), "waypoint ETA must increase")
+    moments: list[datetime] = []
+    moment = eta[0]
+    while moment < eta[-1]:
+        moments.append(moment)
+        moment += timedelta(seconds=cadence_seconds)
+    moments.append(eta[-1])
+
+    result: list[dict[str, Any]] = []
+    previous_track_count = -1
+    for moment in moments:
+        arrived = moment >= eta[-1]
+        edge_index = min(max(0, bisect.bisect_right(eta, moment) - 1), len(eta) - 2)
+        start = waypoints[edge_index]
+        end = waypoints[edge_index + 1]
+        duration = (eta[edge_index + 1] - eta[edge_index]).total_seconds()
+        progress = 1.0 if arrived else (moment - eta[edge_index]).total_seconds() / duration
+        progress = max(0.0, min(1.0, progress))
+        longitude = start["longitude"] + (end["longitude"] - start["longitude"]) * progress
+        latitude = start["latitude"] + (end["latitude"] - start["latitude"]) * progress
+        completed_count = bisect.bisect_right(eta, moment)
+        speed_mps = 0.0 if arrived else float(start["recommended_speed_mps"])
+        entry: dict[str, Any] = {
+            "t": _iso(moment),
+            "v": {
+                "lon": longitude,
+                "lat": latitude,
+                "kn": speed_mps * 1.9438444924406,
+                "status": "ARRIVED" if arrived else "UNDERWAY",
+                "ep": progress,
+                "eidx": edge_index,
+            },
+            "arv": 1,
+            "prv": None,
+            "prs": "NONE",
+            "dt": None,
+            "eat": None,
+            "ctl": completed_count,
+            "seg": {
+                "index": edge_index,
+                "start_eta": start["eta"],
+                "end_eta": end["eta"],
+            },
+        }
+        if completed_count != previous_track_count:
+            entry["track"] = [
+                {
+                    "longitude": waypoint["longitude"],
+                    "latitude": waypoint["latitude"],
+                    "eta": waypoint["eta"],
+                }
+                for waypoint in waypoints[:completed_count]
+            ]
+            previous_track_count = completed_count
+        result.append(entry)
+    return result
+
+
+def _winter_acceptance_positions(timeline: list[dict[str, Any]]) -> dict[str, Any]:
+    start = _parse_utc(timeline[0]["t"])
+
+    def at_offset(minutes: int) -> dict[str, Any]:
+        target = start + timedelta(minutes=minutes)
+        index = min(
+            range(len(timeline)),
+            key=lambda item: abs((_parse_utc(timeline[item]["t"]) - target).total_seconds()),
+        )
+        vessel = timeline[index]["v"]
+        return {
+            "time": timeline[index]["t"],
+            "longitude": vessel["lon"],
+            "latitude": vessel["lat"],
+            "speed_knots": vessel["kn"],
+            "status": vessel["status"],
+        }
+
+    return {"departure": at_offset(0), "+30m": at_offset(30), "+60m": at_offset(60)}
+
+
+def _winter_combined_identity(
+    identity: dict[str, Any],
+    *,
+    route: dict[str, Any],
+    cadence_seconds: int,
+) -> tuple[str, str]:
+    semantic_identity = {
+        **identity,
+        "simulation_start": route["waypoints"][0]["eta"],
+        "simulation_end": route["waypoints"][-1]["eta"],
+        "timeline_source": "cd.route-plan.v3.waypoints.eta",
+        "timeline_cadence_seconds": cadence_seconds,
+    }
+    digest = _canonical_sha256(semantic_identity)
+    return f"winter-viewer-sha256-{digest}", digest
+
+
+def _export_winter_combined(args: argparse.Namespace) -> int:
+    required_paths = {
+        "dataset_bundle": args.winter_dataset_bundle,
+        "run_context": args.winter_run_context,
+        "risk_frame_index": args.winter_risk_frame_index,
+        "risk_window_commit": args.winter_risk_window_commit,
+        "plan_set": args.winter_plan_set,
+        "route_candidates": args.route_candidates,
+        "route_integrity": args.winter_route_integrity,
+    }
+    missing = [name for name, path in required_paths.items() if path is None]
+    _require(not missing, f"Winter combined export missing arguments: {', '.join(missing)}")
+
+    dataset_bundle = _read_json_object(required_paths["dataset_bundle"], label="DatasetBundle")
+    run_context = _read_json_object(required_paths["run_context"], label="RunContext")
+    risk_index = _read_json_object(required_paths["risk_frame_index"], label="RiskFrame index")
+    risk_commit = _read_json_object(
+        required_paths["risk_window_commit"], label="RiskWindow commit"
+    )
+    plan_set = _read_json_object(required_paths["plan_set"], label="C plan set")
+    route_candidates = load_route_candidates(required_paths["route_candidates"])
+    integrity_value = json.loads(required_paths["route_integrity"].read_text(encoding="utf-8"))
+    _require(isinstance(integrity_value, list), "route integrity evidence must be a list")
+    identity = _validate_winter_identity(
+        dataset_bundle=dataset_bundle,
+        run_context=run_context,
+        risk_index=risk_index,
+        risk_commit=risk_commit,
+        plan_set=plan_set,
+        route_candidates=route_candidates,
+        route_integrity=integrity_value,
+    )
+    recommended = _winter_recommended_plan(plan_set)
+    route = _winter_route_meta(recommended)
+    timeline = _winter_vessel_timeline(recommended, cadence_seconds=args.cadence_seconds)
+    risk_store_root = (
+        args.risk_store_root
+        or required_paths["risk_frame_index"].parent / "risk-store"
+    )
+    risk = _presentation_risk(
+        risk_store_root=risk_store_root,
+        scenario_id=identity["scenario_id"],
+        replay_start=_parse_utc(identity["risk_window_start"]),
+        replay_end=_parse_utc(identity["risk_window_end"]),
+        simulation_times=[_parse_utc(entry["t"]) for entry in timeline],
+    )
+    _require(risk.get("status") == "PASS", "Winter RiskFrame presentation projection failed")
+    projected_ids = [frame.get("risk_id") for frame in risk.get("frames", [])]
+    _require(
+        projected_ids == risk_index.get("frame_ids"),
+        "projected RiskFrames differ from the formal RiskWindow index",
+    )
+    risk["source"].update(
+        {
+            "run_id": identity["run_id"],
+            "dataset_bundle_id": identity["dataset_bundle_id"],
+            "dataset_bundle_digest": identity["dataset_bundle_digest"],
+            "risk_window_id": identity["risk_window_id"],
+            "risk_window_digest": identity["risk_window_digest"],
+        }
+    )
+
+    land_mask_path = args.land_mask or find_land_sea_mask(args.route_id, args.data_root)
+    _require(land_mask_path is not None, "no local GEBCO land_sea_mask found")
+    metadata, pixels = _build_basemap(
+        land_mask_path=land_mask_path,
+        width=args.width,
+        height=args.height,
+        version=args.basemap_version,
+    )
+    assembly_id, assembly_digest = _winter_combined_identity(
+        identity,
+        route=route,
+        cadence_seconds=args.cadence_seconds,
+    )
+    source_files = {
+        name: {"path": str(path), "sha256": _sha256_file(path)}
+        for name, path in required_paths.items()
+    }
+    bundle = {
+        "schema_version": "replay.viewer-bundle.v1",
+        "replay": {
+            "replay_id": assembly_id,
+            "scenario_id": identity["scenario_id"],
+            "scenario_mode": "research_navigation_simulation",
+            "identity_kind": "combined_presentation_assembly",
+            "start": route["waypoints"][0]["eta"],
+            "end": route["waypoints"][-1]["eta"],
+            "manifest_semantic_digest": assembly_digest,
+        },
+        "combined_presentation": {
+            "schema_version": WINTER_COMBINED_SCHEMA,
+            "status": "PUBLISHED",
+            "assembly_id": assembly_id,
+            "assembly_digest": assembly_digest,
+            "scenario_label": "Winter Arctic Research",
+            "dataset_bundle_id": identity["dataset_bundle_id"],
+            "dataset_bundle_digest": identity["dataset_bundle_digest"],
+            "run_context_id": identity["run_id"],
+            "risk_window_id": identity["risk_window_id"],
+            "risk_window_digest": identity["risk_window_digest"],
+            "layer_set_id": identity["layer_set_id"],
+            "candidate_set_id": identity["candidate_set_id"],
+            "selected_candidate_id": identity["selected_candidate_id"],
+            "timeline_source": "cd.route-plan.v3.waypoints.eta",
+            "source_replay": None,
+        },
+        "research_validation": {
+            "label": "Winter C Validation",
+            "scenario_label": "Winter Arctic Research",
+            "dataset_bundle_id": identity["dataset_bundle_id"],
+            "run_context_id": identity["run_id"],
+            "risk_window_id": identity["risk_window_id"],
+            "risk_schema": "bc.risk-frame.v2",
+            "risk_frame_count": identity["risk_frame_count"],
+            "route_schema": "cd.four-layer-route-plan-set.v3",
+            "candidate_schema": "presentation.route-candidates.v1",
+        },
+        "basemap": metadata.to_dict(),
+        "presentation": VIEWER_PRESENTATION,
+        "gates": {
+            "status": "PASS",
+            "l2_status": "PASS",
+            "source": "winter_identity_and_existing_route_integrity",
+            "route_integrity_count": len(integrity_value),
+        },
+        "routes": [route],
+        "route_candidates": route_candidates,
+        "events": [
+            {"t": route["waypoints"][0]["eta"], "type": "PLAN_COMPUTED", "rev": 1}
+        ],
+        "timeline": timeline,
+        "risk": risk,
+        "acceptance_positions": _winter_acceptance_positions(timeline),
+    }
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_png(output_dir / "gebco_basemap.png", args.width, args.height, pixels)
+    (output_dir / "basemap_metadata.json").write_text(
+        json.dumps(metadata.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    bundle_path = output_dir / "bundle.json"
+    bundle_path.write_text(
+        json.dumps(bundle, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    preflight_path = output_dir / "replay-viewer-preflight.json"
+    preflight_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "presentation.winter-combined-preflight.v1",
+                "overall": "PASS",
+                "l2": {"overall": "PASS", "route_count": len(integrity_value)},
+                "identity": identity,
+                "checks": {
+                    "dataset_run_binding": "PASS",
+                    "risk_window_binding": "PASS",
+                    "route_candidate_binding": "PASS",
+                    "route_integrity": "PASS",
+                    "timeline_eta_projection": "PASS",
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    manifest = {
+        "schema_version": WINTER_MANIFEST_SCHEMA,
+        "status": "PASS",
+        "assembly_id": assembly_id,
+        "assembly_digest": assembly_digest,
+        "bundle_path": str(bundle_path),
+        "bundle_sha256": _sha256_file(bundle_path),
+        "basemap_sha256": _sha256_file(output_dir / "gebco_basemap.png"),
+        "preflight_sha256": _sha256_file(preflight_path),
+        "source_artifacts": source_files,
+        "identity": identity,
+        "timeline_samples": len(timeline),
+        "risk_frames": len(risk["frames"]),
+        "route_candidates": len(route_candidates["candidates"]),
+    }
+    (output_dir / "winter-combined-viewer-manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    print(
+        "wrote",
+        output_dir,
+        "assembly=",
+        assembly_id,
+        "timeline=",
+        len(timeline),
+        "risk_frames=",
+        len(risk["frames"]),
+        "candidates=",
+        len(route_candidates["candidates"]),
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="replay-viewer-export")
-    parser.add_argument("manifest", type=Path)
+    parser.add_argument("manifest", type=Path, nargs="?")
     parser.add_argument("--snapshots-dir", type=Path, default=None)
     parser.add_argument("--risk-store-root", type=Path, default=None)
     data_default = Path("/root/my_project/work_package_a/data")
@@ -683,6 +1255,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="optional validated presentation.route-candidates.v1 artifact",
     )
+    parser.add_argument("--winter-dataset-bundle", type=Path, default=None)
+    parser.add_argument("--winter-run-context", type=Path, default=None)
+    parser.add_argument("--winter-risk-frame-index", type=Path, default=None)
+    parser.add_argument("--winter-risk-window-commit", type=Path, default=None)
+    parser.add_argument("--winter-plan-set", type=Path, default=None)
+    parser.add_argument("--winter-route-integrity", type=Path, default=None)
     parser.add_argument("--basemap-version", default="gebco-2026-d5a7e2fe3915-7baad866")
     parser.add_argument(
         "--output-dir",
@@ -690,6 +1268,11 @@ def main(argv: list[str] | None = None) -> int:
         default=Path("/root/my_project/work_package_d/viewer"),
     )
     args = parser.parse_args(argv)
+
+    if args.winter_plan_set is not None:
+        return _export_winter_combined(args)
+    if args.manifest is None:
+        parser.error("manifest is required unless --winter-plan-set is supplied")
 
     manifest_doc = json.loads(args.manifest.read_text(encoding="utf-8"))
     snapshots_dir = args.snapshots_dir or args.manifest.parent / "snapshots"

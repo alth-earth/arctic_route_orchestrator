@@ -162,3 +162,182 @@ def test_exporter_rejects_candidate_sidecar_from_another_scenario(
 
     with pytest.raises(ValueError, match="does not match"):
         _EXPORTER._route_candidates_package(path, scenario_id="summer")
+
+
+def _winter_plan() -> dict:
+    return {
+        "plan_id": "route-v3-sha256-" + "a" * 64,
+        "planning_layer": "full_voyage",
+        "objective_mode": "recommended",
+        "start_time": "2026-02-15T00:00:00Z",
+        "metrics": {
+            "distance_km": 10.0,
+            "eta_hours": 1.0,
+            "avg_risk": 0.1,
+            "max_risk": 0.2,
+            "integrated_risk_hours": 0.1,
+            "minimum_confidence": 0.8,
+        },
+        "waypoints": [
+            {
+                "longitude": 18.0,
+                "latitude": 70.0,
+                "eta": "2026-02-15T00:00:00Z",
+                "recommended_speed_mps": 5.0,
+            },
+            {
+                "longitude": 18.0,
+                "latitude": 71.0,
+                "eta": "2026-02-15T01:00:00Z",
+                "recommended_speed_mps": 5.0,
+            },
+        ],
+    }
+
+
+def _winter_identity_documents() -> tuple[dict, ...]:
+    plan = _winter_plan()
+    candidate_ids = [plan["plan_id"]] + [
+        f"route-v3-sha256-{index:064x}" for index in range(1, 12)
+    ]
+    selected = {
+        "candidate_id": plan["plan_id"],
+        "geometry": {
+            "coordinates": [[18.0, 70.0], [18.0, 71.0]],
+        },
+        "distance_km": 10.0,
+        "travel_hours": 1.0,
+        "risk_metrics": {
+            "average_risk": 0.1,
+            "maximum_risk": 0.2,
+            "integrated_risk_hours": 0.1,
+        },
+        "provenance": {"source_risk_ids": ["risk-1"]},
+    }
+    candidates = [selected] + [
+        {
+            "candidate_id": candidate_id,
+            "provenance": {"source_risk_ids": ["risk-1"]},
+        }
+        for candidate_id in candidate_ids[1:]
+    ]
+    bundle = {
+        "schema_version": "a.dataset-bundle.v2",
+        "bundle_id": "a-bundle-test",
+        "bundle_digest": "b" * 64,
+        "minimum_required_end": "2026-02-21T00:00:00Z",
+    }
+    run_context = {
+        "schema_version": "run-context.v2",
+        "run_id": "run-winter",
+        "scenario_id": "winter",
+        "corridor_id": "corridor",
+        "vessel_profile_id": "vessel",
+        "dataset_bundle_id": "a-bundle-test",
+        "dataset_bundle_digest": "b" * 64,
+        "simulation_start": "2026-02-15T00:00:00Z",
+        "simulation_end": "2026-02-21T00:00:00Z",
+    }
+    risk_index = {
+        "status": "FORMAL_VALIDATED",
+        "frame_schema": "bc.risk-frame.v2",
+        "run_id": "run-winter",
+        "scenario_id": "winter",
+        "dataset_bundle_id": "a-bundle-test",
+        "dataset_bundle_digest": "b" * 64,
+        "commit_id": "risk-window",
+        "content_digest": "c" * 64,
+        "frame_ids": ["risk-1", "risk-2"],
+    }
+    risk_commit = {
+        "schema_version": "bc.risk-window-commit.v1",
+        "commit_id": "risk-window",
+        "content_digest": "c" * 64,
+        "run_id": "run-winter",
+        "scenario_id": "winter",
+        "count": 2,
+        "interval_seconds": 3600,
+        "start": "2026-02-15T00:00:00Z",
+        "end": "2026-02-21T00:00:00Z",
+        "frames": [{"risk_id": "risk-1"}, {"risk_id": "risk-2"}],
+    }
+    plan_set = {
+        "schema_version": "cd.four-layer-route-plan-set.v3",
+        "run_id": "run-winter",
+        "scenario_id": "winter",
+        "layer_set_id": "layer-set",
+        "layers": [
+            {"planning_layer": "full_voyage", "plans": {"recommended": plan}}
+        ],
+    }
+    route_candidates = {
+        "selected_candidate_id": plan["plan_id"],
+        "candidate_set_id": "candidate-set",
+        "provenance": {"source_run_id": "run-winter"},
+        "candidates": candidates,
+    }
+    integrity = [
+        {
+            "route_id": candidate_id,
+            "status": "PASS",
+            "land_intersections": 0,
+            "data_unavailable_violations": 0,
+            "edge_hard_violations": 0,
+        }
+        for candidate_id in candidate_ids
+    ]
+    return bundle, run_context, risk_index, risk_commit, plan_set, route_candidates, integrity
+
+
+def test_winter_identity_rejects_cross_scenario_sources() -> None:
+    documents = list(_winter_identity_documents())
+    documents[3]["scenario_id"] = "summer"
+
+    with pytest.raises(ValueError, match="RiskWindow scenario"):
+        _EXPORTER._validate_winter_identity(
+            dataset_bundle=documents[0],
+            run_context=documents[1],
+            risk_index=documents[2],
+            risk_commit=documents[3],
+            plan_set=documents[4],
+            route_candidates=documents[5],
+            route_integrity=documents[6],
+        )
+
+
+def test_winter_identity_binds_a_b_c_and_presentation_sources() -> None:
+    documents = _winter_identity_documents()
+
+    identity = _EXPORTER._validate_winter_identity(
+        dataset_bundle=documents[0],
+        run_context=documents[1],
+        risk_index=documents[2],
+        risk_commit=documents[3],
+        plan_set=documents[4],
+        route_candidates=documents[5],
+        route_integrity=documents[6],
+    )
+
+    assert identity["dataset_bundle_id"] == "a-bundle-test"
+    assert identity["run_id"] == "run-winter"
+    assert identity["risk_frame_count"] == 2
+    assert identity["selected_candidate_id"] == _winter_plan()["plan_id"]
+
+
+def test_winter_vessel_timeline_uses_waypoint_eta_and_linear_lon_lat() -> None:
+    timeline = _EXPORTER._winter_vessel_timeline(
+        _winter_plan(),
+        cadence_seconds=1800,
+    )
+
+    assert [entry["t"] for entry in timeline] == [
+        "2026-02-15T00:00:00Z",
+        "2026-02-15T00:30:00Z",
+        "2026-02-15T01:00:00Z",
+    ]
+    assert timeline[1]["v"]["lon"] == 18.0
+    assert timeline[1]["v"]["lat"] == 70.5
+    assert timeline[1]["v"]["status"] == "UNDERWAY"
+    assert timeline[-1]["v"]["status"] == "ARRIVED"
+    assert timeline[-1]["v"]["kn"] == 0.0
+    assert timeline[-1]["ctl"] == 2

@@ -13,12 +13,27 @@ Related Canonical Docs: ../arctic_route_governance/current/architecture/ARCTIC_R
 
 # A-B-C-D Root Coordinator
 
+## Winter Combined Viewer 组装（2026-08-23 20:14 +08:00）
+
+`scripts/replay_viewer_export.py` 现在支持 Winter research assembly：它同时校验
+`DatasetBundle.v2`、`RunContext.v2`、committed `RiskWindow`、
+`cd.four-layer-route-plan-set.v3`、`presentation.route-candidates.v1` 和 12-route
+integrity evidence，然后输出与既有 D runtime 向后兼容的 `replay.viewer-bundle.v1`。
+
+该模式不调用 A/B/C，不生成 causal replay，也不把 Summer timeline 与 Winter artifact
+混装。航行仿真时间线只投影 C 已发布 full-voyage recommended route 的 waypoint ETA，
+并显式发布 `identity_kind=combined_presentation_assembly`、`source_replay=null` 与完整
+DatasetBundle/RunContext/RiskWindow/candidate identity。任何 identity、geometry、metrics、
+RiskFrame membership 或 route-integrity 不一致均 fail closed。
+
+D 仍是唯一 Viewer runtime owner；本仓库只拥有 assembly、preflight 和 JSON/PNG 输出。
+
 ## Research Validation role（2026-08-21 23:18）
 
 The Orchestrator is the Pipeline / Artifact / Presentation Adapter. It owns
 replay/navigation coordination, validation and export, but not the D Viewer runtime.
-The current candidate presentation package remains explicitly `NOT_PUBLISHED`; a
-future versioned extension must project real C artifacts without ranking or inventing routes.
+既有 Summer frozen package 的 candidate presentation 仍为 `NOT_PUBLISHED`；Winter
+combined package 则投影已验证的真实 C artifacts，不排名或创造路线。
 
 ## Winter C validation 与候选投影（2026-08-23 10:20 +08:00）
 
