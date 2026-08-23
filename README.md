@@ -20,6 +20,16 @@ replay/navigation coordination, validation and export, but not the D Viewer runt
 The current candidate presentation package remains explicitly `NOT_PUBLISHED`; a
 future versioned extension must project real C artifacts without ranking or inventing routes.
 
+## Winter C validation 与候选投影（2026-08-23 10:20 +08:00）
+
+`scripts/run_winter_c_validation.py` 可对既有 committed `bc.risk-frame.v2`
+窗口执行正式 C v3 验证，并输出 `cd.four-layer-route-plan-set.v3`、GeoJSON、
+integrity evidence 与 `presentation.route-candidates.v1` sidecar。该脚本不调用 A/B。
+
+`replay_viewer_export.py --route-candidates PATH` 只接受严格验证且与 replay scenario
+一致的 12-route sidecar。未传入时仍发布现有 `NOT_PUBLISHED` 空包。候选层、目标、几何、
+ETA、risk metrics 和 selected identity 均从 C 原样投影；Orchestrator 不重新计算或排名。
+
 `arctic-route-orchestrator` is the root coordinator for A, B, C, and D.
 It coordinates the pipeline, runs causal replay, manages navigation execution
 and replan lifecycle, produces presentation artifacts, and runs L1/L2 preflight.

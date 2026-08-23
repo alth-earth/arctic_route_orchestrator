@@ -11,6 +11,14 @@ Last Verified: 2026-08-23
 
 # Changelog
 
+## Unreleased - Winter C 与 Route Presentation 接口（2026-08-23 10:20 +08:00）
+
+- 新增只消费已提交 `bc.risk-frame.v2` 窗口的 Winter C validation runner；不重跑 A/B；
+- 新增 `presentation.route-candidates.v1` 严格投影、双状态 schema 与 fail-closed loader，
+  将 C 的 4 层 × 3 目标完整复制为 12-route sidecar，不重排、不重算；
+- `replay_viewer_export.py` 可选接收已验证 sidecar，并拒绝 scenario identity 不一致；
+- 既有 bundle 未提供 sidecar 时继续发布 `NOT_PUBLISHED`，保持向后兼容。
+
 ## Unreleased - Winter Formal Handoff（2026-08-23 01:16 +08:00）
 
 - publish matching `run-context.v2` and strict `orchestrator.execution-spec.v1`

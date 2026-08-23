@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arctic-route.local/schemas/presentation-route-candidates-v1.schema.json",
+  "title": "Presentation Route Candidates v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "candidates"],
+  "properties": {
+    "schema_version": {"const": "presentation.route-candidates.v1"},
+    "status": {"enum": ["PUBLISHED", "NOT_PUBLISHED"]},
+    "candidate_set_id": {"type": "string", "pattern": "^route-candidates-sha256-[0-9a-f]{64}$"},
+    "layer_set_id": {"type": "string", "pattern": "^layer-set-sha256-[0-9a-f]{64}$"},
+    "decision_time": {"type": "string", "format": "date-time"},
+    "selected_candidate_id": {"type": "string", "pattern": "^route-v3-sha256-[0-9a-f]{64}$"},
+    "reason": {"type": "string", "minLength": 1},
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_schema", "source_layer_set_id", "source_run_id", "source_generation_id", "source_input_revision", "projection_owner"],
+      "properties": {
+        "source_schema": {"const": "cd.four-layer-route-plan-set.v3"},
+        "source_layer_set_id": {"type": "string"},
+        "source_run_id": {"type": "string"},
+        "source_generation_id": {"type": "integer", "minimum": 0},
+        "source_input_revision": {"type": "integer", "minimum": 0},
+        "projection_owner": {"const": "arctic_route_orchestrator"}
+      }
+    },
+    "candidates": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/candidate"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "PUBLISHED"}}},
+      "then": {
+        "required": ["candidate_set_id", "layer_set_id", "decision_time", "selected_candidate_id", "provenance"],
+        "properties": {
+          "reason": false,
+          "candidates": {"minItems": 12, "maxItems": 12}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "NOT_PUBLISHED"}}},
+      "then": {
+        "required": ["reason"],
+        "properties": {
+          "candidate_set_id": false,
+          "layer_set_id": false,
+          "decision_time": false,
+          "selected_candidate_id": false,
+          "provenance": false,
+          "candidates": {"maxItems": 0}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "layer", "objective", "geometry", "distance_km", "arrival_eta", "travel_hours", "risk_metrics", "provenance"],
+      "properties": {
+        "candidate_id": {"type": "string", "pattern": "^route-v3-sha256-[0-9a-f]{64}$"},
+        "layer": {"enum": ["full_voyage", "main_corridor_24_72h", "rolling_0_24h", "executable_0_6h"]},
+        "objective": {"enum": ["fastest", "low_risk", "recommended"]},
+        "geometry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "coordinates"],
+          "properties": {
+            "type": {"const": "LineString"},
+            "coordinates": {
+              "type": "array",
+              "minItems": 2,
+              "items": {
+                "type": "array",
+                "prefixItems": [{"type": "number"}, {"type": "number"}],
+                "items": false,
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          }
+        },
+        "distance_km": {"type": "number", "minimum": 0},
+        "arrival_eta": {"type": "string", "format": "date-time"},
+        "travel_hours": {"type": "number", "minimum": 0},
+        "risk_metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["average_risk", "maximum_risk", "integrated_risk_hours", "minimum_confidence", "hard_violation_count"],
+          "properties": {
+            "average_risk": {"type": "number", "minimum": 0, "maximum": 1},
+            "maximum_risk": {"type": "number", "minimum": 0, "maximum": 1},
+            "integrated_risk_hours": {"type": "number", "minimum": 0},
+            "minimum_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "hard_violation_count": {"const": 0}
+          }
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source_schema", "source_plan_id", "run_id", "scenario_id", "corridor_id", "vessel_profile_id", "config_digest", "model_config_digest", "planner_config_digest", "generation_id", "input_revision", "source_risk_ids"],
+          "properties": {
+            "source_schema": {"const": "cd.route-plan.v3"},
+            "source_plan_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "scenario_id": {"type": "string"},
+            "corridor_id": {"type": "string"},
+            "vessel_profile_id": {"type": "string"},
+            "config_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "model_config_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "planner_config_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "generation_id": {"type": "integer", "minimum": 0},
+            "input_revision": {"type": "integer", "minimum": 0},
+            "source_risk_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+          }
+        }
+      }
+    }
+  }
+}

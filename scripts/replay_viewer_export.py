@@ -27,6 +27,7 @@ from arctic_route_orchestrator.replay.geospatial import (
 )
 from arctic_route_orchestrator.replay.preflight import run_viewer_preflight
 from arctic_route_orchestrator.replay.presentation import PresentationAdapter
+from arctic_route_orchestrator.route_presentation import load_route_candidates
 
 SEA_RGB = (46, 102, 150)
 LAND_RGB = (108, 132, 98)
@@ -65,6 +66,22 @@ ROUTE_CANDIDATES_PACKAGE = {
     "candidates": [],
     "reason": "candidate_geometry_and_metrics_not_published",
 }
+
+
+def _route_candidates_package(
+    path: Path | None,
+    *,
+    scenario_id: str | None = None,
+) -> dict:
+    document = load_route_candidates(path) if path is not None else ROUTE_CANDIDATES_PACKAGE
+    if scenario_id is not None and document.get("status") == "PUBLISHED":
+        candidate_scenarios = {
+            candidate.get("provenance", {}).get("scenario_id")
+            for candidate in document.get("candidates", [])
+        }
+        if candidate_scenarios != {scenario_id}:
+            raise ValueError("route candidate scenario does not match replay manifest")
+    return document
 
 
 def _write_png(path: Path, width: int, height: int, pixels: bytes) -> None:
@@ -660,6 +677,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--sample-step-km", type=float, default=5.0)
+    parser.add_argument(
+        "--route-candidates",
+        type=Path,
+        default=None,
+        help="optional validated presentation.route-candidates.v1 artifact",
+    )
     parser.add_argument("--basemap-version", default="gebco-2026-d5a7e2fe3915-7baad866")
     parser.add_argument(
         "--output-dir",
@@ -728,6 +751,10 @@ def main(argv: list[str] | None = None) -> int:
         replay_end=replay_end,
         simulation_times=[_parse_utc(entry["t"]) for entry in timeline],
     )
+    route_candidates = _route_candidates_package(
+        args.route_candidates,
+        scenario_id=str(manifest_doc.get("scenario_id", "")),
+    )
     bundle = {
         "schema_version": "replay.viewer-bundle.v1",
         "replay": {
@@ -745,7 +772,7 @@ def main(argv: list[str] | None = None) -> int:
             _route_meta(adapter, revision)
             for revision in sorted(adapter._routes_by_revision)
         ],
-        "route_candidates": ROUTE_CANDIDATES_PACKAGE,
+        "route_candidates": route_candidates,
         "events": [
             {
                 "t": event["simulation_time"],

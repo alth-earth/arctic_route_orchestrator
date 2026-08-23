@@ -1,6 +1,9 @@
 import importlib.util
+import json
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "replay_viewer_export.py"
 _SPEC = importlib.util.spec_from_file_location("replay_viewer_export", _SCRIPT)
@@ -120,3 +123,42 @@ def test_risk_forecast_summary_reports_presentation_trend_only() -> None:
     assert summary["trend"] == "decreasing"
     assert summary["trend_method"] == "first_to_last_finite_mean_score"
     assert summary["mean_score_delta"] == -0.1
+
+
+def test_exporter_accepts_only_validated_optional_route_candidates(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    expected = {"schema_version": "presentation.route-candidates.v1", "status": "PUBLISHED"}
+    path = tmp_path / "route-candidates.json"
+    path.write_text(json.dumps(expected), encoding="utf-8")
+    observed: list[Path] = []
+
+    def fake_loader(location: Path) -> dict:
+        observed.append(location)
+        return expected
+
+    monkeypatch.setattr(_EXPORTER, "load_route_candidates", fake_loader)
+
+    assert _EXPORTER._route_candidates_package(path) == expected
+    assert observed == [path]
+
+
+def test_exporter_preserves_not_published_fallback_without_candidate_artifact() -> None:
+    assert _EXPORTER._route_candidates_package(None) == _EXPORTER.ROUTE_CANDIDATES_PACKAGE
+
+
+def test_exporter_rejects_candidate_sidecar_from_another_scenario(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "route-candidates.json"
+    path.write_text("{}", encoding="utf-8")
+    document = {
+        "status": "PUBLISHED",
+        "candidates": [{"provenance": {"scenario_id": "winter"}}],
+    }
+    monkeypatch.setattr(_EXPORTER, "load_route_candidates", lambda _path: document)
+
+    with pytest.raises(ValueError, match="does not match"):
+        _EXPORTER._route_candidates_package(path, scenario_id="summer")
