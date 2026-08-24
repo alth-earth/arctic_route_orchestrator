@@ -2097,9 +2097,19 @@ def merge_completed_track(
     return tuple(merged)
 
 
+def _workspace_root() -> Path:
+    env = os.environ.get("ARCTIC_ROUTE_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "arctic_route_contracts").is_dir():
+            return parent
+    return Path.home()
+
+
 def _default_output_root(replay_id: str) -> Path:
     return (
-        Path("/root/my_project/work_package_a/data/output/rc2-smoke")
+        _workspace_root() / "work_package_a" / "data" / "output" / "rc2-smoke"
         / "causal-replay-mvp"
         / replay_id
     )

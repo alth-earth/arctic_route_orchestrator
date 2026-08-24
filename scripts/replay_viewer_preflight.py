@@ -4,10 +4,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 from arctic_route_orchestrator.replay.preflight import run_viewer_preflight
+
+
+def _workspace_root() -> Path:
+    env = os.environ.get("ARCTIC_ROUTE_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "arctic_route_contracts").is_dir():
+            return parent
+    return Path.home()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -17,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("/root/my_project/work_package_a/data"),
+        default=_workspace_root() / "work_package_a" / "data",
     )
     parser.add_argument("--route-id", default="tromso_to_isfjorden_outer")
     parser.add_argument("--land-mask", type=Path, default=None)

@@ -7,6 +7,7 @@ skips intake/B and targets a real CPU-bound four-layer C search.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,8 +19,19 @@ from arctic_route_orchestrator.timeout_runner import (
     run_with_timeout,
 )
 
+
+def _workspace_root() -> Path:
+    env = os.environ.get("ARCTIC_ROUTE_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "arctic_route_contracts").is_dir():
+            return parent
+    return Path.home()
+
+
 WORKER = Path(__file__).with_name("real_c_timeout_worker.py")
-RC2_ROOT = Path("/root/my_project/work_package_a/data/output/rc2-smoke")
+RC2_ROOT = _workspace_root() / "work_package_a" / "data" / "output" / "rc2-smoke"
 OUTPUT_DIR = RC2_ROOT / "output-real-c-timeout"
 
 
@@ -38,15 +50,15 @@ def main() -> int:
     spec_path.write_text(json.dumps(spec.to_document(), sort_keys=True), encoding="utf-8")
     paths = RunPaths(
         bundle_path=RC2_ROOT / "x.json",
-        a_data_root=Path("/root/my_project/work_package_a/data"),
-        b_config_path=Path("/root/my_project/work_package_b/configs/models/x.json"),
-        c_config_root=Path("/root/my_project/work_package_c/configs"),
-        contracts_config_root=Path("/root/my_project/arctic_route_contracts/configs"),
+        a_data_root=_workspace_root() / "work_package_a" / "data",
+        b_config_path=_workspace_root() / "work_package_b" / "configs" / "models" / "x.json",
+        c_config_root=_workspace_root() / "work_package_c" / "configs",
+        contracts_config_root=_workspace_root() / "arctic_route_contracts" / "configs",
         risk_store_root=RC2_ROOT / "risk-store-mur-worker",
         output_dir=OUTPUT_DIR,
-        run_context_path=Path(
-            "/root/my_project/work_package_a/data/output/bundles/"
-            "murmansk_dikson_august_2026_demo_v1.run-context.json"
+        run_context_path=(
+            _workspace_root() / "work_package_a" / "data" / "output" / "bundles"
+            / "murmansk_dikson_august_2026_demo_v1.run-context.json"
         ),
     )
     paths_json = json.dumps(

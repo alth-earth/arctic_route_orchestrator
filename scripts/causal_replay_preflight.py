@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import tomllib
 from datetime import UTC, datetime, timedelta
@@ -26,6 +27,16 @@ from arctic_route_data.causal_replay import (
     STATIC_TYPES,
     load_manifest_records,
 )
+
+
+def _workspace_root() -> Path:
+    env = os.environ.get("ARCTIC_ROUTE_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "arctic_route_contracts").is_dir():
+            return parent
+    return Path.home()
 
 
 def _parse_utc(value: str) -> datetime:
@@ -282,14 +293,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=Path("/root/my_project/work_package_a/data/manifest/manifest.sqlite3"),
+        default=_workspace_root() / "work_package_a" / "data" / "manifest" / "manifest.sqlite3",
     )
     parser.add_argument(
         "--corridor-toml",
         type=Path,
-        default=Path(
-            "/root/my_project/arctic_route_contracts/configs/corridors/"
-            "tromso_to_isfjorden_outer.toml"
+        default=(
+            _workspace_root() / "arctic_route_contracts" / "configs" / "corridors"
+            / "tromso_to_isfjorden_outer.toml"
         ),
     )
     parser.add_argument("--replay-start", default="2026-08-15T10:00:00Z")
@@ -298,9 +309,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path(
-            "/root/my_project/work_package_a/data/output/rc2-smoke/"
-            "causal-replay-mvp/preflight.json"
+        default=(
+            _workspace_root() / "work_package_a" / "data" / "output" / "rc2-smoke"
+            / "causal-replay-mvp" / "preflight.json"
         ),
     )
     args = parser.parse_args(argv)

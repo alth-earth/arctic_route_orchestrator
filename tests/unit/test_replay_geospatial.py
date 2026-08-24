@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,16 @@ from arctic_route_orchestrator.replay.geospatial import (
     load_netcdf_land_mask,
     projection_consistency_gate,
 )
+
+
+def _workspace_root() -> Path:
+    env = os.environ.get("ARCTIC_ROUTE_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "arctic_route_contracts").is_dir():
+            return parent
+    return Path.home()
 
 
 def _metadata(**overrides: Any) -> BasemapMetadata:
@@ -108,12 +119,10 @@ def test_l2_gate_synthetic_land_and_unavailable_fail() -> None:
 
 
 def test_l2_real_data_smoke_water_and_land() -> None:
-    nc_path = Path(
-        "/root/my_project/work_package_a/data/raw/tromso_to_isfjorden_outer/"
-        "land_sea_mask/163a3f67b391a1d90ac83cad/"
-        "land_sea_mask_tromso_to_isfjorden_outer_valid_20260423T000000Z_"
-        "issued_20260423T000000Z_gebco-2026-d5a7e2fe3915-7baad866_"
-        "3640a87b2f5a2d15.nc"
+    nc_path = (
+        _workspace_root() / "work_package_a" / "data" / "raw" / "tromso_to_isfjorden_outer"
+        / "land_sea_mask" / "163a3f67b391a1d90ac83cad"
+        / "land_sea_mask_tromso_to_isfjorden_outer_valid_20260423T000000Z_issued_20260423T000000Z_gebco-2026-d5a7e2fe3915-7baad866_3640a87b2f5a2d15.nc"
     )
     sampler = load_netcdf_land_mask(nc_path)
     water = [

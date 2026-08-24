@@ -153,7 +153,7 @@ pytest 参数化用例中串行跑完 v2+v3 的初始/重规划（避免 30 次�
 ## 6. 工程验收
 
 ```bash
-cd /root/my_project/arctic_route_orchestrator
+cd ${ARCTIC_ROUTE_ROOT}/arctic_route_orchestrator
 make lint
 make test
 make check

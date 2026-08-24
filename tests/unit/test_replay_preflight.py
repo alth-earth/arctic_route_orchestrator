@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,11 +15,22 @@ from arctic_route_orchestrator.replay.preflight import (
     run_viewer_preflight,
 )
 
-ARTIFACT_ROOT = Path(
-    "/root/my_project/work_package_a/data/output/rc2-smoke/causal-replay-mvp/"
-    "sb-viewer-baseline-12h-det"
+
+def _workspace_root() -> Path:
+    env = os.environ.get("ARCTIC_ROUTE_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "arctic_route_contracts").is_dir():
+            return parent
+    return Path.home()
+
+
+ARTIFACT_ROOT = (
+    _workspace_root() / "work_package_a" / "data" / "output" / "rc2-smoke"
+    / "causal-replay-mvp" / "sb-viewer-baseline-12h-det"
 )
-DATA_ROOT = Path("/root/my_project/work_package_a/data")
+DATA_ROOT = _workspace_root() / "work_package_a" / "data"
 ROUTE_ID = "tromso_to_isfjorden_outer"
 
 

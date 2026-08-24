@@ -15,7 +15,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]  # /root/my_project
+ROOT = Path(__file__).resolve().parents[2]  # 工作区根（含各子仓库的公共父目录）
 sys.path.insert(0, str(ROOT / "arctic_route_contracts" / "src"))
 sys.path.insert(0, str(ROOT / "work_package_a" / "src"))
 sys.path.insert(0, str(ROOT / "work_package_b" / "src"))

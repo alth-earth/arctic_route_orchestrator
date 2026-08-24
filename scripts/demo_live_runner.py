@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +14,16 @@ from arctic_route_orchestrator.timeout_runner import (
     StageTimeoutError,
     run_with_timeout,
 )
+
+
+def _workspace_root() -> Path:
+    env = os.environ.get("ARCTIC_ROUTE_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "arctic_route_contracts").is_dir():
+            return parent
+    return Path.home()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_paths = RunPaths(
         bundle_path=output_path.parent / "unused.json",
-        a_data_root=Path("/root/my_project/work_package_a/data"),
+        a_data_root=_workspace_root() / "work_package_a" / "data",
         b_config_path=output_path.parent / "unused.json",
         c_config_root=Path(paths["c_config_root"]),
         contracts_config_root=Path(paths["contracts_config_root"]),

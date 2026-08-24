@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from arctic_route_data.causal_replay import SourceRecord
 from arctic_route_planning.adapters.fixture import FixtureRiskSource
@@ -17,6 +19,17 @@ from arctic_route_orchestrator.replay.digests import (
     route_semantic_digest,
     visible_record_set_digest,
 )
+
+
+def _workspace_root() -> Path:
+    env = os.environ.get("ARCTIC_ROUTE_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "arctic_route_contracts").is_dir():
+            return parent
+    return Path.home()
+
 
 BBOX = (10.0, 68.5, 22.0, 79.5)
 WINDOW_START = datetime(2026, 8, 15, 10, tzinfo=UTC)
@@ -205,7 +218,7 @@ def test_semantic_digest_distinguishes_business_window_revision_not_identity() -
 
 def _synthetic_frames():
     config = load_configuration(
-        "/root/my_project/work_package_c/configs",
+        str(_workspace_root() / "work_package_c" / "configs"),
         "tromso_isfjorden_july_2026_retrospective_v1",
     )
     fixture = FixtureRiskSource(

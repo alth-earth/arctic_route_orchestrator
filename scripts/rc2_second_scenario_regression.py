@@ -2,7 +2,7 @@
 
 Usage:
     python scripts/rc2_second_scenario_regression.py \
-        /root/my_project/work_package_a/data/output/rc2-smoke/output-tromso-144h \
+        ${ARCTIC_ROUTE_ROOT}/work_package_a/data/output/rc2-smoke/output-tromso-144h \
         [golden.json]
 
 Validates the Tromso 144 h v3 qualification artifact: coverage preflight gate,

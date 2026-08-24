@@ -13,6 +13,7 @@ import bisect
 import hashlib
 import json
 import math
+import os
 import struct
 import sys
 import zlib
@@ -22,6 +23,16 @@ from statistics import fmean
 from typing import Any
 
 import numpy as np
+
+
+def _workspace_root() -> Path:
+    env = os.environ.get("ARCTIC_ROUTE_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "arctic_route_contracts").is_dir():
+            return parent
+    return Path.home()
 
 from arctic_route_orchestrator.replay.geospatial import (
     BasemapMetadata,
@@ -1241,7 +1252,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("manifest", type=Path, nargs="?")
     parser.add_argument("--snapshots-dir", type=Path, default=None)
     parser.add_argument("--risk-store-root", type=Path, default=None)
-    data_default = Path("/root/my_project/work_package_a/data")
+    data_default = _workspace_root() / "work_package_a" / "data"
     parser.add_argument("--data-root", type=Path, default=data_default)
     parser.add_argument("--route-id", default="tromso_to_isfjorden_outer")
     parser.add_argument("--land-mask", type=Path, default=None)
@@ -1265,7 +1276,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/root/my_project/work_package_d/viewer"),
+        default=_workspace_root() / "work_package_d" / "viewer",
     )
     args = parser.parse_args(argv)
 

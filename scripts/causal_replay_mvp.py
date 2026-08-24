@@ -13,11 +13,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from arctic_route_orchestrator.replay.runner import ReplayRunner
+
+
+def _workspace_root() -> Path:
+    env = os.environ.get("ARCTIC_ROUTE_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "arctic_route_contracts").is_dir():
+            return parent
+    return Path.home()
 
 
 def _parse_utc(value: str) -> datetime:
@@ -40,44 +51,44 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path(
-            "/root/my_project/work_package_a/data/output/rc2-smoke/causal-replay-mvp"
+        default=(
+            _workspace_root() / "work_package_a" / "data" / "output" / "rc2-smoke" / "causal-replay-mvp"
         ),
     )
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=Path("/root/my_project/work_package_a/data/manifest/manifest.sqlite3"),
+        default=_workspace_root() / "work_package_a" / "data" / "manifest" / "manifest.sqlite3",
     )
     parser.add_argument(
         "--a-data-root",
         type=Path,
-        default=Path("/root/my_project/work_package_a/data"),
+        default=_workspace_root() / "work_package_a" / "data",
     )
     parser.add_argument(
         "--b-config",
         type=Path,
-        default=Path(
-            "/root/my_project/work_package_b/configs/models/"
-            "demo_unvalidated_tromso_smoke_grid_v1.json"
+        default=(
+            _workspace_root() / "work_package_b" / "configs" / "models"
+            / "demo_unvalidated_tromso_smoke_grid_v1.json"
         ),
     )
     parser.add_argument(
         "--c-config-root",
         type=Path,
-        default=Path("/root/my_project/work_package_c/configs"),
+        default=_workspace_root() / "work_package_c" / "configs",
     )
     parser.add_argument(
         "--contracts-config-root",
         type=Path,
-        default=Path("/root/my_project/arctic_route_contracts/configs"),
+        default=_workspace_root() / "arctic_route_contracts" / "configs",
     )
     parser.add_argument(
         "--frozen-run-context",
         type=Path,
-        default=Path(
-            "/root/my_project/work_package_a/data/output/rc2-smoke/"
-            "output-tromso-144h-r2/run-context.json"
+        default=(
+            _workspace_root() / "work_package_a" / "data" / "output" / "rc2-smoke"
+            / "output-tromso-144h-r2" / "run-context.json"
         ),
     )
     parser.add_argument("--max-snap-km", type=float, default=30.0)

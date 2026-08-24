@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import resource
 import sys
 import time
@@ -34,6 +35,16 @@ from referencing import Registry, Resource
 from arctic_route_orchestrator.models import ExecutionSpec
 from arctic_route_orchestrator.replay.route_integrity import audit_route
 from arctic_route_orchestrator.route_presentation import project_route_candidates
+
+
+def _workspace_root() -> Path:
+    env = os.environ.get("ARCTIC_ROUTE_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "arctic_route_contracts").is_dir():
+            return parent
+    return Path.home()
 
 
 def _parse_utc(value: str) -> datetime:
@@ -114,17 +125,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--c-config-root",
         type=Path,
-        default=Path("/root/my_project/work_package_c/configs"),
+        default=_workspace_root() / "work_package_c" / "configs",
     )
     parser.add_argument(
         "--contracts-config-root",
         type=Path,
-        default=Path("/root/my_project/arctic_route_contracts/configs"),
+        default=_workspace_root() / "arctic_route_contracts" / "configs",
     )
     parser.add_argument(
         "--c-schema-root",
         type=Path,
-        default=Path("/root/my_project/work_package_c/schemas"),
+        default=_workspace_root() / "work_package_c" / "schemas",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--prepare-only", action="store_true")

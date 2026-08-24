@@ -2,7 +2,7 @@
 
 Usage:
     python -m arctic_route_orchestrator.scripts.rc1_golden_regression \
-        /root/my_project/work_package_a/data/output/golden
+        ${ARCTIC_ROUTE_ROOT}/work_package_a/data/output/golden
 
 Checks that the frozen r6/r7 layer-set digests still match the documented RC1
 identifiers and that r6/r7 business payloads remain semantically identical.

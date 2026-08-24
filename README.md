@@ -11,6 +11,11 @@ Last Verified: 2026-08-23
 Related Canonical Docs: ../arctic_route_governance/current/architecture/ARCTIC_ROUTE_SYSTEM.md
 ---
 
+> **路径约定（2026-08-24）**：本文件中 `${ARCTIC_ROUTE_ROOT}` 为工作区根占位符，
+> 指向包含各工作包目录（`arctic_route_contracts/`、`work_package_a/` 等）的公共根。
+> 解析优先级：环境变量 > 当前所在目录 > `$HOME`。完整定义见
+> `arctic_route_governance/README.md` 的"路径约定"章节。
+
 # A-B-C-D Root Coordinator
 
 ## Winter Combined Viewer 组装（2026-08-23 20:14 +08:00）
@@ -189,7 +194,7 @@ active authoritative segment. This export metadata does not alter
 ## 标准环境门禁
 
 ```bash
-cd /root/my_project/arctic_route_orchestrator
+cd ${ARCTIC_ROUTE_ROOT}/arctic_route_orchestrator
 make env-create
 make sync
 make check

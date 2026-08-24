@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import UTC, datetime, timedelta
@@ -31,6 +32,16 @@ from arctic_route_planning.risk import RiskSampler
 from arctic_route_risk import PersistentRiskStore
 
 from arctic_route_orchestrator.replay.route_integrity import audit_route
+
+
+def _workspace_root() -> Path:
+    env = os.environ.get("ARCTIC_ROUTE_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "arctic_route_contracts").is_dir():
+            return parent
+    return Path.home()
 
 
 def _parse_utc(value: str) -> datetime:
@@ -172,18 +183,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--risk-store-root",
-        default=(
-            "/root/my_project/work_package_a/data/output/rc2-smoke/"
-            "causal-replay-mvp/sb-c-12h4/risk-store"
+        default=str(
+            _workspace_root() / "work_package_a" / "data" / "output" / "rc2-smoke"
+            / "causal-replay-mvp" / "sb-c-12h4" / "risk-store"
         ),
     )
     parser.add_argument(
         "--c-config-root",
-        default="/root/my_project/work_package_c/configs",
+        default=str(_workspace_root() / "work_package_c" / "configs"),
     )
     parser.add_argument(
         "--contracts-config-root",
-        default="/root/my_project/arctic_route_contracts/configs",
+        default=str(_workspace_root() / "arctic_route_contracts" / "configs"),
     )
     parser.add_argument("--max-snap-km", type=float, default=30.0)
     args = parser.parse_args(argv)
