@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import resource
@@ -25,10 +26,11 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from arctic_route_contracts import load_run_context, run_context_to_dict
@@ -44,6 +46,7 @@ from arctic_route_planning.contracts import (
 from arctic_route_planning.cost import VesselPerformanceModel
 from arctic_route_planning.domain import ObjectiveMode
 from arctic_route_planning.grid import RegularGrid
+from arctic_route_planning.ingress import RiskSourcePlanningIngress
 from arctic_route_planning.layered import (
     FourLayerPlanningOutcome,
     FourLayerPlanningService,
@@ -98,6 +101,15 @@ _CONTROL_TRACE_LAYER_NAMES = (
 )
 _ETA_TOLERANCE_SECONDS = 1.0
 _NUMERIC_TOLERANCE = 1e-8
+_M2_MIN_REPETITIONS = 3
+_M2_SCREENING_REPETITIONS = 2
+_M2_SCREENING_IMPROVEMENT_FLOOR_PERCENT = 10.0
+_M2_TOTAL_IMPROVEMENT_FLOOR_PERCENT = 15.0
+_M2_CELL_REGRESSION_CEILING_PERCENT = 5.0
+_M2_P95_REGRESSION_CEILING_PERCENT = 5.0
+_M2_EXPECTED_TRACE_COUNT = 3
+_M2_EXPECTED_HIT_COUNT = 3
+_M2_EXPECTED_COLD_COUNT = 6
 
 
 def _workspace_root() -> Path:
@@ -141,6 +153,82 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _git_environment(repo: Path) -> dict[str, Any]:
+    """Capture repository identity without changing the caller's worktree."""
+
+    def _git(*args: str) -> str | None:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if completed.returncode != 0:
+            return None
+        value = completed.stdout.strip()
+        return value or None
+
+    upstream = _git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    ahead: int | None = None
+    behind: int | None = None
+    if upstream is not None:
+        counts = _git("rev-list", "--left-right", "--count", f"HEAD...{upstream}")
+        if counts is not None:
+            try:
+                ahead, behind = (int(part) for part in counts.split())
+            except ValueError:
+                ahead = behind = None
+    return {
+        "path": str(repo),
+        "commit": _git("rev-parse", "HEAD"),
+        "branch": _git("branch", "--show-current"),
+        "dirty": bool(_git("status", "--porcelain")),
+        "upstream": upstream,
+        "ahead": ahead,
+        "behind": behind,
+    }
+
+
+def _swap_counters() -> dict[str, int] | None:
+    """Read cumulative kernel swap-in/out counters when available."""
+
+    path = Path("/proc/vmstat")
+    if not path.exists():
+        return None
+    counters: dict[str, int] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            name, _, value = line.partition(" ")
+            if name in {"pswpin", "pswpout"}:
+                counters[name] = int(value.strip())
+    except (OSError, ValueError):
+        return None
+    return counters if counters else None
+
+
+def _swap_delta(
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+) -> dict[str, int] | None:
+    if before is None or after is None:
+        return None
+    return {
+        name: max(0, int(after.get(name, 0)) - int(before.get(name, 0)))
+        for name in ("pswpin", "pswpout")
+    }
+
+
+def _nearest_rank(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    if percentile == 0.5:
+        return float(median(ordered))
+    index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * percentile) - 1))
+    return ordered[index]
 
 
 def _risk_query(commit: dict[str, Any]) -> RiskWindowQuery:
@@ -286,6 +374,7 @@ class _PreparedShadow:
     endpoint_mapping: Any
     request: ServicePlanningRequest
     store: PersistentRiskStore
+    prepared: Any
     input_identity: dict[str, Any]
 
 
@@ -816,11 +905,25 @@ def _plan_comparison(control: Any, candidate: Any) -> dict[str, Any]:
             "objective_cost": abs(
                 control_metrics.objective_cost - candidate_metrics.objective_cost
             ),
+            "minimum_confidence": abs(
+                control_metrics.minimum_confidence - candidate_metrics.minimum_confidence
+            ),
         }
+        speed_deltas = [
+            abs(left.recommended_speed_mps - right.recommended_speed_mps)
+            for left, right in zip(control_plan.waypoints, candidate_plan.waypoints, strict=True)
+        ]
+        control_route_digest = route_plan_v3_semantic_digest(control_plan)
+        candidate_route_digest = route_plan_v3_semantic_digest(candidate_plan)
         route_equal = (
             _waypoint_signature(control_plan) == _waypoint_signature(candidate_plan)
+            and max(speed_deltas, default=0.0) <= _NUMERIC_TOLERANCE
             and control_plan.source_risk_ids == candidate_plan.source_risk_ids
             and control_plan.destination_reached == candidate_plan.destination_reached
+            and control_plan.layer_goal_reached == candidate_plan.layer_goal_reached
+            and control_metrics.hard_constraint_violations
+            == candidate_metrics.hard_constraint_violations
+            and control_route_digest == candidate_route_digest
             and max(eta_deltas, default=0.0) <= _ETA_TOLERANCE_SECONDS
             and all(delta <= _NUMERIC_TOLERANCE for delta in metric_deltas.values())
         )
@@ -829,16 +932,22 @@ def _plan_comparison(control: Any, candidate: Any) -> dict[str, Any]:
                 "layer": layer,
                 "objective": objective,
                 "status": "PASS" if route_equal else "FAIL",
-                "control_route_digest": route_plan_v3_semantic_digest(control_plan),
-                "candidate_route_digest": route_plan_v3_semantic_digest(candidate_plan),
+                "control_route_digest": control_route_digest,
+                "candidate_route_digest": candidate_route_digest,
                 "control_waypoint_count": len(control_plan.waypoints),
                 "candidate_waypoint_count": len(candidate_plan.waypoints),
                 "max_eta_delta_seconds": max(eta_deltas, default=0.0),
+                "max_speed_delta_mps": max(speed_deltas, default=0.0),
                 "metric_deltas": metric_deltas,
                 "waypoints_equal": _waypoint_signature(control_plan)
                 == _waypoint_signature(candidate_plan),
                 "source_risk_ids_equal": control_plan.source_risk_ids
                 == candidate_plan.source_risk_ids,
+                "hard_constraint_violations_equal": control_metrics.hard_constraint_violations
+                == candidate_metrics.hard_constraint_violations,
+                "layer_goal_reached_equal": control_plan.layer_goal_reached
+                == candidate_plan.layer_goal_reached,
+                "route_digest_equal": control_route_digest == candidate_route_digest,
                 "allowed_runtime_fields": [
                     "compute_ms",
                     "expanded_nodes",
@@ -882,6 +991,329 @@ def _integrity_document(plan_set: Any, frames: tuple[Any, ...], track: str) -> d
         "track": track,
         "route_count": len(results),
         "routes": results,
+    }
+
+
+def _timing_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, dict) or record.get("_shadow_metadata"):
+            continue
+        layer = record.get("layer")
+        if layer is None and isinstance(record.get("layer_index"), int):
+            index = int(record["layer_index"])
+            layer = (
+                _CONTROL_TRACE_LAYER_NAMES[index]
+                if 0 <= index < len(_CONTROL_TRACE_LAYER_NAMES)
+                else None
+            )
+        objective = record.get("objective")
+        wall_ms = record.get("wall_ms", record.get("elapsed_ms"))
+        if not isinstance(layer, str) or not isinstance(objective, str):
+            continue
+        if not isinstance(wall_ms, (int, float)):
+            continue
+        rows.append(
+            {
+                "layer": layer,
+                "objective": objective,
+                "wall_ms": float(wall_ms),
+            }
+        )
+    return rows
+
+
+def _timing_cell_map(records: list[dict[str, Any]]) -> dict[tuple[str, str], float]:
+    rows = _timing_rows(records)
+    return {(row["layer"], row["objective"]): row["wall_ms"] for row in rows}
+
+
+def _trace_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    sidecar_records = [
+        record
+        for record in records
+        if isinstance(record, dict) and record.get("record_kind") == "shadow_sidecar"
+    ]
+    source = sidecar_records or records
+    statuses = [
+        str(record.get("reuse_status"))
+        for record in source
+        if isinstance(record, dict) and record.get("reuse_status") is not None
+    ]
+    hits = sum(
+        status in {"HIT_EXACT", "HIT_TRACE_EQUIVALENT"}
+        for status in statuses
+    )
+    return {
+        "trace_captured": statuses.count("TRACE_CAPTURED"),
+        "trace_hits": hits,
+        "cold_control": sum(status == "COLD_CONTROL" for status in statuses),
+        "fallback_control": sum(status == "FALLBACK_CONTROL" for status in statuses),
+        "record_count": len(statuses),
+    }
+
+
+def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate the formal M2 gates without pooling semantic failures away."""
+
+    cells = {
+        (str(pair.get("layer")), str(pair.get("objective")))
+        for case in cases
+        for pair in case.get("comparison", {}).get("pairs", [])
+    }
+    overall_control = [
+        float(case["track_resources"]["control"]["wall_seconds"])
+        for case in cases
+        if "track_resources" in case
+        and "control" in case["track_resources"]
+        and case.get("status") == "PASS"
+    ]
+    overall_candidate = [
+        float(case["track_resources"]["candidate"]["wall_seconds"])
+        for case in cases
+        if "track_resources" in case
+        and "candidate" in case["track_resources"]
+        and case.get("status") == "PASS"
+    ]
+    control_median = _nearest_rank(overall_control, 0.5)
+    candidate_median = _nearest_rank(overall_candidate, 0.5)
+    improvement = (
+        None
+        if control_median in (None, 0) or candidate_median is None
+        else (control_median - candidate_median) / control_median * 100.0
+    )
+
+    cell_summary: list[dict[str, Any]] = []
+    for layer, objective in sorted(cells):
+        control_values: list[float] = []
+        candidate_values: list[float] = []
+        for case in cases:
+            if case.get("status") != "PASS":
+                continue
+            control_value = _timing_cell_map(case.get("records", {}).get("control", [])).get(
+                (layer, objective)
+            )
+            candidate_value = _timing_cell_map(
+                case.get("records", {}).get("candidate", [])
+            ).get((layer, objective))
+            if control_value is not None and candidate_value is not None:
+                control_values.append(control_value)
+                candidate_values.append(candidate_value)
+        cell_control_median = _nearest_rank(control_values, 0.5)
+        cell_candidate_median = _nearest_rank(candidate_values, 0.5)
+        cell_control_p95 = _nearest_rank(control_values, 0.95)
+        cell_candidate_p95 = _nearest_rank(candidate_values, 0.95)
+        cell_improvement = (
+            None
+            if cell_control_median in (None, 0) or cell_candidate_median is None
+            else (cell_control_median - cell_candidate_median)
+            / cell_control_median
+            * 100.0
+        )
+        cell_p95_regression = (
+            None
+            if cell_control_p95 in (None, 0) or cell_candidate_p95 is None
+            else (cell_candidate_p95 - cell_control_p95) / cell_control_p95 * 100.0
+        )
+        cell_summary.append(
+            {
+                "layer": layer,
+                "objective": objective,
+                "sample_count": len(control_values),
+                "control_wall_median_ms": cell_control_median,
+                "candidate_wall_median_ms": cell_candidate_median,
+                "control_wall_p95_ms": cell_control_p95,
+                "candidate_wall_p95_ms": cell_candidate_p95,
+                "median_improvement_percent": cell_improvement,
+                "p95_regression_percent": cell_p95_regression,
+                "gate": (
+                    "PASS"
+                    if cell_improvement is not None
+                    and cell_improvement >= -_M2_CELL_REGRESSION_CEILING_PERCENT
+                    else "FAIL"
+                    if cell_improvement is not None
+                    else "NOT_MEASURED"
+                ),
+            }
+        )
+
+    expected_reuse = []
+    semantic_pass = []
+    determinism_inputs: dict[str, list[Any]] = {"control": [], "candidate": []}
+    rss_ratios: list[float] = []
+    swap_deltas: list[dict[str, int]] = []
+    for case in cases:
+        counts = _trace_counts(case.get("records", {}).get("candidate", []))
+        expected_reuse.append(
+            counts == {
+                "trace_captured": _M2_EXPECTED_TRACE_COUNT,
+                "trace_hits": _M2_EXPECTED_HIT_COUNT,
+                "cold_control": _M2_EXPECTED_COLD_COUNT,
+                "fallback_control": 0,
+                "record_count": 12,
+            }
+        )
+        comparison = case.get("comparison", {})
+        integrity = case.get("route_integrity", {})
+        semantic_pass.append(
+            comparison.get("pair_count") == 12
+            and comparison.get("status") == "PASS"
+            and all(
+                value.get("status") == "PASS" and value.get("route_count") == 12
+                for value in integrity.values()
+            )
+        )
+        for track in ("control", "candidate"):
+            determinism_inputs[track].append(
+                tuple(
+                    (
+                        pair.get("layer"),
+                        pair.get("objective"),
+                        pair.get(f"{track}_route_digest"),
+                    )
+                    for pair in comparison.get("pairs", [])
+                )
+            )
+        resources = case.get("track_resources", {})
+        for track_resources in resources.values():
+            if isinstance(track_resources, dict) and isinstance(
+                track_resources.get("swap_delta"), dict
+            ):
+                swap_deltas.append(
+                    {
+                        name: int(track_resources["swap_delta"].get(name, 0))
+                        for name in ("pswpin", "pswpout")
+                    }
+                )
+        if case.get("rss_scope") == "independent_child_process":
+            control_rss = resources.get("control", {}).get("peak_rss_kib")
+            candidate_rss = resources.get("candidate", {}).get("peak_rss_kib")
+            if isinstance(control_rss, (int, float)) and control_rss > 0 and isinstance(
+                candidate_rss, (int, float)
+            ):
+                rss_ratios.append(float(candidate_rss) / float(control_rss))
+    deterministic = all(
+        len(values) > 0 and all(value == values[0] for value in values[1:])
+        for values in determinism_inputs.values()
+    )
+    independent_rss = bool(rss_ratios)
+    rss_median = _nearest_rank(rss_ratios, 0.5)
+    sample_count = len(cases)
+    sufficient = sample_count >= _M2_MIN_REPETITIONS
+    screening_sufficient = sample_count >= _M2_SCREENING_REPETITIONS
+    p95_control = _nearest_rank(overall_control, 0.95)
+    p95_candidate = _nearest_rank(overall_candidate, 0.95)
+    p95_regression = (
+        None
+        if p95_control in (None, 0) or p95_candidate is None
+        else (p95_candidate - p95_control) / p95_control * 100.0
+    )
+    p95_gate = (
+        "PASS"
+        if sufficient
+        and p95_regression is not None
+        and p95_regression <= _M2_P95_REGRESSION_CEILING_PERCENT
+        else "FAIL"
+        if sufficient
+        else "NOT_EVALUATED_INSUFFICIENT_REPETITIONS"
+    )
+    overall_gate = (
+        "PASS"
+        if sufficient
+        and improvement is not None
+        and improvement >= _M2_TOTAL_IMPROVEMENT_FLOOR_PERCENT
+        and p95_gate == "PASS"
+        else "FAIL"
+        if sufficient
+        else "NOT_EVALUATED_INSUFFICIENT_REPETITIONS"
+    )
+    cell_gate = (
+        all(item["gate"] == "PASS" for item in cell_summary)
+        if sufficient and cell_summary
+        else False
+    )
+    semantic_gate = bool(semantic_pass) and all(semantic_pass)
+    reuse_gate = bool(expected_reuse) and all(expected_reuse)
+    resource_gate = independent_rss and (rss_median is not None and rss_median <= 1.10)
+    swap_gate = bool(swap_deltas) and all(
+        delta["pswpin"] == 0 and delta["pswpout"] == 0 for delta in swap_deltas
+    )
+    gate_verdict = (
+        "PASS"
+        if sufficient
+        and semantic_gate
+        and reuse_gate
+        and deterministic
+        and overall_gate == "PASS"
+        and cell_gate
+        and resource_gate
+        and swap_gate
+        else "NOT_EVALUATED_INSUFFICIENT_REPETITIONS"
+        if not sufficient
+        else "FAIL"
+    )
+    screening_gate = (
+        "PASS"
+        if screening_sufficient
+        and semantic_gate
+        and reuse_gate
+        and deterministic
+        and improvement is not None
+        and improvement >= _M2_SCREENING_IMPROVEMENT_FLOOR_PERCENT
+        and bool(cell_summary)
+        and all(item["gate"] == "PASS" for item in cell_summary)
+        and resource_gate
+        and swap_gate
+        else "NOT_EVALUATED_INSUFFICIENT_REPETITIONS"
+        if not screening_sufficient
+        else "FAIL"
+    )
+    return {
+        "schema_version": "orchestrator.winter-p2-m2-summary.v1",
+        "sample_count": sample_count,
+        "minimum_repetitions": _M2_MIN_REPETITIONS,
+        "screening": {
+            "minimum_repetitions": _M2_SCREENING_REPETITIONS,
+            "median_improvement_floor_percent": (
+                _M2_SCREENING_IMPROVEMENT_FLOOR_PERCENT
+            ),
+            "gate_verdict": screening_gate,
+        },
+        "semantic_gate": "PASS" if semantic_gate else "FAIL",
+        "reuse_matrix_gate": "PASS" if reuse_gate else "FAIL",
+        "determinism_gate": "PASS" if deterministic else "FAIL",
+        "overall": {
+            "control_wall_median_seconds": control_median,
+            "candidate_wall_median_seconds": candidate_median,
+            "control_wall_p95_seconds": _nearest_rank(overall_control, 0.95),
+            "candidate_wall_p95_seconds": _nearest_rank(overall_candidate, 0.95),
+            "median_improvement_percent": improvement,
+            "p95_regression_percent": p95_regression,
+            "p95_gate": p95_gate,
+            "gate": overall_gate,
+        },
+        "cells": cell_summary,
+        "rss": {
+            "comparison": (
+                "independent_child_process"
+                if independent_rss
+                else "NOT_MEASURED_COMBINED_PROCESS"
+            ),
+            "median_ratio": rss_median,
+            "ceiling": 1.10,
+            "gate": "PASS" if resource_gate else "FAIL" if sufficient else "NOT_MEASURED",
+        },
+        "swap": {
+            "observations": swap_deltas,
+            "gate": "PASS" if swap_gate else "FAIL" if sufficient else "NOT_MEASURED",
+        },
+        "expected_trace_hit_cold": {
+            "trace_captured": _M2_EXPECTED_TRACE_COUNT,
+            "trace_hits": _M2_EXPECTED_HIT_COUNT,
+            "cold_control": _M2_EXPECTED_COLD_COUNT,
+        },
+        "gate_verdict": gate_verdict,
+        "percentile_method": "median exact; p95 nearest-rank ceil(0.95*n)-1",
     }
 
 
@@ -1078,16 +1510,25 @@ def _candidate_adapter(
     )
 
 
-def _resource_snapshot(started: float) -> dict[str, Any]:
+def _resource_snapshot(
+    started: float,
+    *,
+    swap_before: dict[str, int] | None = None,
+    swap_after: dict[str, int] | None = None,
+) -> dict[str, Any]:
     usage = resource.getrusage(resource.RUSAGE_SELF)
     return {
         "wall_seconds": time.perf_counter() - started,
         "cpu_seconds": usage.ru_utime + usage.ru_stime,
         "peak_rss_kib": usage.ru_maxrss,
+        "swap_before": swap_before,
+        "swap_after": swap_after,
+        "swap_delta": _swap_delta(swap_before, swap_after),
     }
 
 
 def _identity_check_for_case(prepared: _PreparedShadow, current: CommittedRiskWindow) -> None:
+    current.assert_matches(prepared.query)
     if (
         current.commit_id != prepared.commit["commit_id"]
         or current.content_digest != prepared.commit["content_digest"]
@@ -1118,6 +1559,139 @@ def _track_configuration(
     }
 
 
+def _as_document(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _as_document(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_as_document(item) for item in value]
+    if hasattr(value, "__dataclass_fields__"):
+        return _as_document(asdict(value))
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _shadow_sidecar_records(metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Normalize C shadow observations for the runner's common sidecar schema."""
+
+    if not metadata:
+        return []
+    records: list[dict[str, Any]] = []
+    for observation in metadata.get("trace_observations", ()):
+        if not isinstance(observation, dict):
+            continue
+        records.append(
+            {
+                **observation,
+                "record_kind": "shadow_sidecar",
+                "reuse_status": "TRACE_CAPTURED",
+                "reuse_lookup_status": "TRACE_CAPTURED",
+                "reuse_hit": False,
+                "search_used": True,
+                "certificate": {"status": "CERTIFIED_TRACE"},
+            }
+        )
+    for observation in metadata.get("reuse_outcomes", ()):
+        if not isinstance(observation, dict):
+            continue
+        status = str(observation.get("status", ""))
+        records.append(
+            {
+                **observation,
+                "record_kind": "shadow_sidecar",
+                "reuse_status": status,
+                "reuse_lookup_status": status,
+                "reuse_hit": bool(observation.get("reused", False)),
+                "search_used": bool(observation.get("used_search", False)),
+                "certificate": {"status": "CERTIFIED_TRACE"},
+                "zero_search_metrics": (
+                    {"expanded_states": 0, "edge_evaluations": 0}
+                    if observation.get("reused") and not observation.get("used_search")
+                    else None
+                ),
+            }
+        )
+    return records
+
+
+def _prepared_shadow_track(
+    *,
+    prepared: _PreparedShadow,
+    track: str,
+    candidate_mode: str,
+) -> tuple[Any, list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    """Execute exactly one formal-prepared shadow track.
+
+    This is intentionally a strict protocol boundary.  The C side must expose
+    ``execute_four_layer_temporal_shadow_track`` and return an object with an
+    ``outcome`` and per-layer/objective ``timings``.  Falling back to the old
+    combined shadow call would make isolated RSS and timing claims false.
+    """
+
+    if candidate_mode != "control-trace":
+        raise ValueError("the single-track formal shadow runner requires control-trace")
+    if track not in {"control", "candidate"}:
+        raise ValueError("track must be control or candidate")
+    method = getattr(prepared.prepared, "execute_four_layer_temporal_shadow_track", None)
+    if not callable(method):
+        raise RuntimeError(
+            "PreparedRiskPlanning lacks the required single-track shadow API: "
+            "execute_four_layer_temporal_shadow_track"
+        )
+    started = time.perf_counter()
+    swap_before = _swap_counters()
+    result = method(track=track, candidate_mode="control_trace")
+    elapsed_seconds = time.perf_counter() - started
+    swap_after = _swap_counters()
+    outcome = getattr(result, "outcome", None)
+    if outcome is None:
+        raise RuntimeError("single-track shadow API returned no FourLayerPlanningOutcome")
+    if bool(getattr(result, "production_published", False)) or bool(
+        getattr(outcome, "published", False)
+    ):
+        raise RuntimeError("single-track shadow crossed the formal publication boundary")
+    scratch_proof = _as_document(getattr(result, "scratch_proof", None))
+    if not isinstance(scratch_proof, dict) or not all(
+        bool(scratch_proof.get(field))
+        for field in (
+            "production_store_unchanged",
+            "production_session_unchanged",
+            "scratch_store_isolated",
+        )
+    ):
+        raise RuntimeError("single-track shadow did not prove production-state isolation")
+    if bool(scratch_proof.get("production_published", False)):
+        raise RuntimeError("single-track shadow proof reports production publication")
+    raw_timings = getattr(result, "timings", None)
+    if raw_timings is None:
+        raise RuntimeError("single-track shadow API returned no per-layer/objective timings")
+    timings = _as_document(raw_timings)
+    if not isinstance(timings, list):
+        raise RuntimeError("single-track shadow timings must be a list")
+    records = [item for item in timings if isinstance(item, dict)]
+    if len(records) != len(timings):
+        raise RuntimeError("single-track shadow timings contain a non-object record")
+    resources = _resource_snapshot(
+        started,
+        swap_before=swap_before,
+        swap_after=swap_after,
+    )
+    metadata = {
+        "production_published": False,
+        "scratch_published": bool(getattr(result, "scratch_published", False)),
+        "reuse_outcomes": _as_document(getattr(result, "reuse_outcomes", ())),
+        "trace_observations": _as_document(getattr(result, "trace_observations", ())),
+        "scratch_proof": scratch_proof,
+        "api": (
+            "RiskSourcePlanningIngress.prepare/"
+            "PreparedRiskPlanning.execute_four_layer_temporal_shadow_track"
+        ),
+        "track": track,
+        "elapsed_seconds": elapsed_seconds,
+    }
+    return outcome, records, resources, metadata
+
+
 def _run_in_process_case(
     *,
     prepared: _PreparedShadow,
@@ -1129,6 +1703,28 @@ def _run_in_process_case(
     CommittedRiskWindow,
     dict[str, dict[str, Any]],
 ]:
+    if args.candidate_mode == "control-trace":
+        outcomes: dict[str, FourLayerPlanningOutcome] = {}
+        records: dict[str, list[dict[str, Any]]] = {}
+        resources: dict[str, dict[str, Any]] = {}
+        order = (
+            ("control", "candidate")
+            if execution_order == "control-first"
+            else ("candidate", "control")
+        )
+        for track in order:
+            outcome, track_records, track_resources, metadata = _prepared_shadow_track(
+                prepared=prepared,
+                track=track,
+                candidate_mode=args.candidate_mode,
+            )
+            outcomes[track] = outcome
+            records[track] = [
+                *track_records,
+                *_shadow_sidecar_records(metadata if track == "candidate" else None),
+            ]
+            resources[track] = {**track_resources, "shadow_metadata": metadata}
+        return outcomes, records, prepared.window, resources
     with prepared.store.lease_committed_window(prepared.query) as current:
         _identity_check_for_case(prepared, current)
         control_planner, candidate_planner, private = _make_planners(
@@ -1199,6 +1795,9 @@ def _worker_command(
         "--_worker-result",
         str(result_path),
     ]
+    worker_timeout = getattr(args, "worker_timeout_seconds", None)
+    if worker_timeout is not None:
+        command.extend(["--worker-timeout-seconds", str(worker_timeout)])
     return command
 
 
@@ -1219,12 +1818,18 @@ def _run_isolated_track(
 ) -> tuple[FourLayerPlanningOutcome, list[dict[str, Any]], dict[str, Any]]:
     with tempfile.TemporaryDirectory(prefix=f"{track}-worker-", dir=args.output_dir) as tmp:
         result_path = Path(tmp) / "result.json"
-        completed = subprocess.run(
-            _worker_command(args=args, track=track, result_path=result_path),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            completed = subprocess.run(
+                _worker_command(args=args, track=track, result_path=result_path),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=float(args.worker_timeout_seconds),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"{track} worker TIMEOUT after {args.worker_timeout_seconds:g}s"
+            ) from exc
         if not result_path.exists():
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise RuntimeError(
@@ -1237,10 +1842,15 @@ def _run_isolated_track(
             message = error.get("message") or completed.stderr.strip() or "worker failed"
             error_type = error.get("type", "RuntimeError")
             raise RuntimeError(f"{track} worker {error_type}: {message}")
+        resources = dict(payload["resources"])
+        if payload.get("shadow_metadata") is not None:
+            resources["shadow_metadata"] = payload["shadow_metadata"]
+        records = list(payload.get("records", []))
+        records.extend(_shadow_sidecar_records(payload.get("shadow_metadata")))
         return (
             _worker_outcome(payload),
-            payload.get("records", []),
-            payload["resources"],
+            records,
+            resources,
         )
 
 
@@ -1282,48 +1892,82 @@ def _run_track_worker(args: argparse.Namespace) -> int:
     if args._worker_result is None or args._track_worker is None:
         raise ValueError("track worker requires --_worker-result and --_track-worker")
     started = time.perf_counter()
+    swap_before = _swap_counters()
     try:
         prepared = _prepare(args)
-        with prepared.store.lease_committed_window(prepared.query) as current:
-            _identity_check_for_case(prepared, current)
-            control_planner, candidate_planner, private = _make_planners(
-                current,
-                prepared.query,
-                prepared.configuration,
-                candidate_mode=args.candidate_mode,
-            )
-            tracks = _track_configuration(
-                control_planner=control_planner,
-                candidate_planner=candidate_planner,
-                private=private,
+        if args.worker_timeout_seconds is None:
+            args.worker_timeout_seconds = float(prepared.spec.per_stage_timeout_seconds)
+        if args.candidate_mode == "control-trace":
+            outcome, records, resources, shadow_metadata = _prepared_shadow_track(
                 prepared=prepared,
+                track=args._track_worker,
                 candidate_mode=args.candidate_mode,
-            )
-            planner, planner_version = tracks[args._track_worker]
-            outcome, records = _run_track(
-                planner=planner,
-                request=prepared.request,
-                configuration=prepared.configuration,
-                planner_version=planner_version,
             )
             payload = {
                 "ok": True,
-                "schema_version": "orchestrator.winter-p2-track-worker.v1",
+                "schema_version": "orchestrator.winter-p2-track-worker.v2",
                 "track": args._track_worker,
                 "candidate_mode": args.candidate_mode,
-                "candidate_algorithm": _mode_metadata(args.candidate_mode)["candidate_algorithm"],
+                "candidate_algorithm": _mode_metadata(args.candidate_mode)[
+                    "candidate_algorithm"
+                ],
                 "published_in_scratch": outcome.published,
                 "plan_set": _plan_set_document(outcome),
                 "records": records,
-                "resources": _resource_snapshot(started),
+                "resources": resources,
+                "shadow_metadata": shadow_metadata,
             }
+        else:
+            with prepared.store.lease_committed_window(prepared.query) as current:
+                _identity_check_for_case(prepared, current)
+                control_planner, candidate_planner, private = _make_planners(
+                    current,
+                    prepared.query,
+                    prepared.configuration,
+                    candidate_mode=args.candidate_mode,
+                )
+                tracks = _track_configuration(
+                    control_planner=control_planner,
+                    candidate_planner=candidate_planner,
+                    private=private,
+                    prepared=prepared,
+                    candidate_mode=args.candidate_mode,
+                )
+                planner, planner_version = tracks[args._track_worker]
+                outcome, records = _run_track(
+                    planner=planner,
+                    request=prepared.request,
+                    configuration=prepared.configuration,
+                    planner_version=planner_version,
+                )
+                payload = {
+                    "ok": True,
+                    "schema_version": "orchestrator.winter-p2-track-worker.v1",
+                    "track": args._track_worker,
+                    "candidate_mode": args.candidate_mode,
+                    "candidate_algorithm": _mode_metadata(args.candidate_mode)[
+                        "candidate_algorithm"
+                    ],
+                    "published_in_scratch": outcome.published,
+                    "plan_set": _plan_set_document(outcome),
+                    "records": records,
+                    "resources": _resource_snapshot(
+                        started,
+                        swap_before=swap_before,
+                        swap_after=_swap_counters(),
+                    ),
+                }
     except Exception as error:
         payload = {
             "ok": False,
-            "schema_version": "orchestrator.winter-p2-track-worker.v1",
+            "schema_version": "orchestrator.winter-p2-track-worker.v2",
             "track": args._track_worker,
             "error": {"type": type(error).__name__, "message": str(error)},
-            "resources": _resource_snapshot(started),
+            "resources": _resource_snapshot(
+                started,
+                swap_before=swap_before,
+                swap_after=_swap_counters(),
+            ),
         }
     _write_json(args._worker_result, payload)
     return 0 if payload["ok"] else 1
@@ -1366,6 +2010,17 @@ def _prepare(args: argparse.Namespace) -> _PreparedShadow:
         goal=endpoint_mapping.goal.node,
         maximum_elapsed=query.end - query.start,
     )
+    # Even the research runner must cross the formal B->C preparation fence.
+    # The child track entrypoint below is deliberately narrower than the old
+    # direct scratch-service path and requires the PreparedRiskPlanning
+    # single-track shadow API.
+    ingress = RiskSourcePlanningIngress(store, configuration=configuration)
+    prepared = ingress.prepare(request)
+    if (
+        prepared.window.commit_id != window.commit_id
+        or prepared.window.content_digest != window.content_digest
+    ):
+        raise ValueError("formal ingress preparation differs from selected RiskWindow commit")
     input_identity = {
         "run_context": run_context_to_dict(run_context),
         "execution_spec": spec.to_document(),
@@ -1374,6 +2029,20 @@ def _prepare(args: argparse.Namespace) -> _PreparedShadow:
         "risk_frame_count": window.count,
         "risk_window_start": query.start.isoformat().replace("+00:00", "Z"),
         "risk_window_end": query.end.isoformat().replace("+00:00", "Z"),
+        "risk_query": {
+            "start": query.start.isoformat().replace("+00:00", "Z"),
+            "end": query.end.isoformat().replace("+00:00", "Z"),
+            "interval_seconds": int(query.interval.total_seconds()),
+            "run_id": query.run_id,
+            "scenario_id": query.scenario_id,
+            "corridor_id": query.corridor_id,
+            "generation_id": query.generation_id,
+            "vessel_profile_id": query.vessel_profile_id,
+            "config_digest": query.config_digest,
+            "model_config_digest": query.model_config_digest,
+            "as_of": query.as_of.isoformat().replace("+00:00", "Z"),
+        },
+        "input_revision": spec.input_revision,
         "planner_config_digest": configuration.planner_config_digest,
         "model_config_digest": query.model_config_digest,
         "endpoint_mapping": endpoint_mapping.to_document(),
@@ -1388,6 +2057,7 @@ def _prepare(args: argparse.Namespace) -> _PreparedShadow:
         endpoint_mapping=endpoint_mapping,
         request=request,
         store=store,
+        prepared=prepared,
         input_identity=input_identity,
     )
 
@@ -1427,14 +2097,64 @@ def _manifest(
         "p2_scope": (
             "same-goal shadow screening; no formal reuse publication"
             if args.candidate_mode == "exact-temporal"
-            else "control trace only; no P2 certificate or reuse claim"
+            else "formal-prepared control-trace M2 shadow; separate tracks, no publication"
         ),
         "input_identity": prepared.input_identity,
         "input_files": {
             "risk_commit": str(prepared.commit_path),
             "risk_commit_sha256": _file_sha256(prepared.commit_path),
             "run_context": str(args.run_context),
+            "run_context_sha256": _file_sha256(args.run_context),
             "execution_spec": str(args.execution_spec),
+            "execution_spec_sha256": _file_sha256(args.execution_spec),
+        },
+        "repositories": {
+            "orchestrator": _git_environment(Path(__file__).resolve().parents[1]),
+            "work_package_c": _git_environment(_workspace_root() / "work_package_c"),
+        },
+        "lock_sha256": {
+            "orchestrator_uv_lock": _file_sha256(
+                Path(__file__).resolve().parents[1] / "uv.lock"
+            ),
+            "work_package_c_uv_lock": _file_sha256(
+                _workspace_root() / "work_package_c" / "uv.lock"
+            ),
+        },
+        "implementation_sha256": {
+            "winter_p2_shadow.py": _file_sha256(Path(__file__).resolve()),
+            "work_package_c_ingress.py": _file_sha256(
+                _workspace_root()
+                / "work_package_c"
+                / "src"
+                / "arctic_route_planning"
+                / "ingress.py"
+            ),
+            "work_package_c_control_trace_reuse.py": _file_sha256(
+                _workspace_root()
+                / "work_package_c"
+                / "src"
+                / "arctic_route_planning"
+                / "planners"
+                / "control_trace_reuse.py"
+            ),
+        },
+        "m2_policy": {
+            "required_candidate_mode": "control-trace",
+            "required_rss_mode": "isolated",
+            "minimum_repetitions": _M2_MIN_REPETITIONS,
+            "screening_repetitions": _M2_SCREENING_REPETITIONS,
+            "screening_median_improvement_floor_percent": (
+                _M2_SCREENING_IMPROVEMENT_FLOOR_PERCENT
+            ),
+            "overall_median_improvement_floor_percent": _M2_TOTAL_IMPROVEMENT_FLOOR_PERCENT,
+            "per_layer_objective_regression_ceiling_percent": _M2_CELL_REGRESSION_CEILING_PERCENT,
+            "overall_p95_regression_ceiling_percent": _M2_P95_REGRESSION_CEILING_PERCENT,
+            "rss_ratio_ceiling": 1.10,
+            "expected_trace_captured": _M2_EXPECTED_TRACE_COUNT,
+            "expected_trace_hits": _M2_EXPECTED_HIT_COUNT,
+            "expected_cold_control": _M2_EXPECTED_COLD_COUNT,
+            "swap_required_zero": True,
+            "percentile_method": "median exact; p95 nearest-rank ceil(0.95*n)-1",
         },
         "options": {
             "screen_objective": args.screen_objective,
@@ -1446,6 +2166,7 @@ def _manifest(
             "prepare_only": args.prepare_only,
             "candidate_mode": args.candidate_mode,
             "rss_mode": args.rss_mode,
+            "worker_timeout_seconds": args.worker_timeout_seconds,
         },
         "runtime": {
             "python": platform.python_version(),
@@ -1456,6 +2177,7 @@ def _manifest(
             "formal_latest_store_written": False,
             "frozen_artifact_written": False,
             "candidate_presentation_published": False,
+            "production_published": False,
             "shadow_store": "in-memory LayeredRoutePlanLatestStore only",
             "output_directory": str(args.output_dir),
         },
@@ -1470,8 +2192,14 @@ def run(args: argparse.Namespace) -> int:
     args.rss_mode = _validate_rss_mode(getattr(args, "rss_mode", "in-process"))
     if args.repetitions < 1:
         raise ValueError("repetitions must be positive")
+    if args.candidate_mode == "control-trace" and args.rss_mode != "isolated":
+        raise ValueError("control-trace M2 requires --rss-mode isolated")
     _empty_output_dir(args.output_dir)
     prepared = _prepare(args)
+    if args.worker_timeout_seconds is None:
+        args.worker_timeout_seconds = float(prepared.spec.per_stage_timeout_seconds)
+    if args.worker_timeout_seconds <= 0:
+        raise ValueError("worker-timeout-seconds must be positive")
     manifest = _manifest(prepared, args, status="PREPARED")
     _write_json(args.output_dir / "manifest.json", manifest)
     _write_json(args.output_dir / "input-identity.json", prepared.input_identity)
@@ -1537,8 +2265,13 @@ def run(args: argparse.Namespace) -> int:
                         "candidate",
                     ),
                 }
+                candidate_sidecar_records = [
+                    record
+                    for record in records["candidate"]
+                    if record.get("record_kind") == "shadow_sidecar"
+                ]
                 reuse = _reuse_sidecar(
-                    candidate_records=records["candidate"],
+                    candidate_records=candidate_sidecar_records or records["candidate"],
                     screen_objective=ObjectiveMode(args.screen_objective),
                     candidate_mode=args.candidate_mode,
                 )
@@ -1550,8 +2283,15 @@ def run(args: argparse.Namespace) -> int:
                             else "combined_parent_process"
                         ),
                         "track_resources": track_resources,
+                        "records": records,
                         "control": {
                             "published": outcomes["control"].published,
+                            "scratch_published": bool(
+                                track_resources.get("control", {})
+                                .get("shadow_metadata", {})
+                                .get("scratch_published", outcomes["control"].published)
+                            ),
+                            "production_published": False,
                             "plan_set": control_doc,
                             "plan_set_digest": _canonical_digest(control_doc),
                             "planner_version": "time-dependent-a-star.v1",
@@ -1559,6 +2299,12 @@ def run(args: argparse.Namespace) -> int:
                         },
                         "candidate": {
                             "published": outcomes["candidate"].published,
+                            "scratch_published": bool(
+                                track_resources.get("candidate", {})
+                                .get("shadow_metadata", {})
+                                .get("scratch_published", outcomes["candidate"].published)
+                            ),
+                            "production_published": False,
                             "plan_set": candidate_doc,
                             "plan_set_digest": _canonical_digest(candidate_doc),
                             "planner_version": mode_metadata["candidate_algorithm"],
@@ -1566,16 +2312,47 @@ def run(args: argparse.Namespace) -> int:
                             "candidate_schema": mode_metadata["candidate_schema"],
                             "records": records["candidate"],
                         },
+                        "publication_boundary": {
+                            "formal_latest_store_written": False,
+                            "frozen_artifact_written": False,
+                            "candidate_presentation_published": False,
+                            "production_published": False,
+                            "control_scratch_published": bool(
+                                track_resources.get("control", {})
+                                .get("shadow_metadata", {})
+                                .get("scratch_published", outcomes["control"].published)
+                            ),
+                            "candidate_scratch_published": bool(
+                                track_resources.get("candidate", {})
+                                .get("shadow_metadata", {})
+                                .get("scratch_published", outcomes["candidate"].published)
+                            ),
+                        },
                         "reuse_sidecar": reuse,
                         "route_integrity": integrity,
                         "comparison": comparison,
                     }
                 )
+                semantic_ok = (
+                    comparison["status"] == "PASS"
+                    and comparison["pair_count"] == 12
+                    and all(
+                        item["status"] == "PASS" and item["route_count"] == 12
+                        for item in integrity.values()
+                    )
+                )
+                nonpublication_ok = all(
+                    not bool(case_track.get("production_published", False))
+                    for case_track in (case["control"], case["candidate"])
+                )
+                timing_ok = True
+                if args.candidate_mode == "control-trace":
+                    timing_ok = all(
+                        len(_timing_rows(records[track])) == 12
+                        for track in ("control", "candidate")
+                    )
                 case["status"] = (
-                    "PASS"
-                    if comparison["status"] == "PASS"
-                    and all(item["status"] == "PASS" for item in integrity.values())
-                    else "FAIL"
+                    "PASS" if semantic_ok and nonpublication_ok and timing_ok else "FAIL"
                 )
             except Exception as error:  # record evidence and continue repetitions
                 failures += 1
@@ -1624,6 +2401,25 @@ def run(args: argparse.Namespace) -> int:
     manifest["passed_cases"] = sum(case["status"] == "PASS" for case in cases)
     manifest["failed_cases"] = sum(case["status"] != "PASS" for case in cases)
     manifest["p2_reuse_claim"] = _mode_metadata(args.candidate_mode)["p2_reuse_claim"]
+    if args.candidate_mode == "control-trace":
+        m2_summary = _m2_summary(cases)
+        manifest["m2_summary"] = m2_summary
+        screening_verdict = m2_summary["screening"]["gate_verdict"]
+        manifest["m2_screening_gate_verdict"] = screening_verdict
+        if (
+            args.repetitions == _M2_SCREENING_REPETITIONS
+            and screening_verdict == "FAIL"
+        ):
+            failures += 1
+            manifest["status"] = "FAIL"
+        if m2_summary["gate_verdict"] == "FAIL" and args.repetitions >= _M2_MIN_REPETITIONS:
+            failures += 1
+            manifest["status"] = "FAIL"
+        manifest["m2_gate_verdict"] = m2_summary["gate_verdict"]
+    else:
+        m2_summary = None
+    manifest["failed_cases"] = sum(case["status"] != "PASS" for case in cases)
+    manifest["runner_failures"] = failures
     _write_json(args.output_dir / "manifest.json", manifest)
     _write_json(
         args.output_dir / "control-plan-sets.json",
@@ -1672,6 +2468,8 @@ def run(args: argparse.Namespace) -> int:
             "screen_objective": args.screen_objective,
             "candidate_mode": args.candidate_mode,
             "rss_mode": args.rss_mode,
+            "m2_gate_verdict": manifest.get("m2_gate_verdict", "NOT_APPLICABLE"),
+            "m2_summary": m2_summary,
         },
     )
     print(json.dumps(manifest, ensure_ascii=False, sort_keys=True), flush=True)
@@ -1719,6 +2517,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="combined in-process RSS or isolated per-track child-process RSS",
     )
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument(
+        "--worker-timeout-seconds",
+        type=float,
+        default=None,
+        help="hard timeout for each isolated track worker; defaults to ExecutionSpec",
+    )
     parser.add_argument(
         "--_track-worker",
         choices=("control", "candidate"),

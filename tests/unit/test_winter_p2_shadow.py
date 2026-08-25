@@ -68,6 +68,53 @@ def test_parser_preserves_exact_temporal_default_and_accepts_control_trace() -> 
     assert trace.rss_mode == "isolated"
 
 
+def test_parser_accepts_explicit_worker_timeout() -> None:
+    required = [
+        "--risk-store-root",
+        "/tmp/risk",
+        "--risk-commit",
+        "/tmp/commit.json",
+        "--run-context",
+        "/tmp/context.json",
+        "--execution-spec",
+        "/tmp/spec.json",
+        "--output-dir",
+        "/tmp/output",
+    ]
+    args = shadow.build_parser().parse_args(
+        [
+            *required,
+            "--candidate-mode",
+            "control-trace",
+            "--rss-mode",
+            "isolated",
+            "--worker-timeout-seconds",
+            "42",
+        ]
+    )
+    assert args.worker_timeout_seconds == 42.0
+
+
+def test_control_trace_refuses_shared_process_m2_measurement() -> None:
+    required = [
+        "--risk-store-root",
+        "/tmp/risk",
+        "--risk-commit",
+        "/tmp/commit.json",
+        "--run-context",
+        "/tmp/context.json",
+        "--execution-spec",
+        "/tmp/spec.json",
+        "--output-dir",
+        "/tmp/output",
+    ]
+    args = shadow.build_parser().parse_args(
+        [*required, "--candidate-mode", "control-trace"]
+    )
+    with pytest.raises(ValueError, match="requires --rss-mode isolated"):
+        shadow.run(args)
+
+
 def test_isolated_worker_command_has_explicit_track_boundary(tmp_path: Path) -> None:
     args = SimpleNamespace(
         risk_store_root=tmp_path / "risk",
@@ -78,6 +125,7 @@ def test_isolated_worker_command_has_explicit_track_boundary(tmp_path: Path) -> 
         contracts_config_root=tmp_path / "contracts-config",
         output_dir=tmp_path / "output",
         candidate_mode="control-trace",
+        worker_timeout_seconds=42.0,
     )
     command = shadow._worker_command(
         args=args,
@@ -88,6 +136,7 @@ def test_isolated_worker_command_has_explicit_track_boundary(tmp_path: Path) -> 
     assert command[command.index("--_track-worker") + 1] == "candidate"
     assert command[command.index("--candidate-mode") + 1] == "control-trace"
     assert command[command.index("--rss-mode") + 1] == "in-process"
+    assert command[command.index("--worker-timeout-seconds") + 1] == "42.0"
 
 
 def test_shadow_requires_empty_output_directory(tmp_path: Path) -> None:
@@ -191,6 +240,177 @@ def test_control_trace_sidecar_reports_real_hits_and_misses() -> None:
         "TRACE_CAPTURED",
     ]
     assert "TRACE_ONLY" not in str(sidecar)
+
+
+def test_shadow_sidecar_records_normalize_trace_and_reuse_counts() -> None:
+    records = shadow._shadow_sidecar_records(
+        {
+            "trace_observations": [
+                {"objective": value}
+                for value in ("fastest", "low_risk", "recommended")
+            ],
+            "reuse_outcomes": [
+                {
+                    "objective": "recommended",
+                    "status": "HIT_TRACE_EQUIVALENT",
+                    "reused": True,
+                    "used_search": False,
+                }
+                for _ in range(3)
+            ]
+            + [
+                {
+                    "objective": "recommended",
+                    "status": "COLD_CONTROL",
+                    "reused": False,
+                    "used_search": True,
+                }
+                for _ in range(6)
+            ],
+        }
+    )
+    assert shadow._trace_counts(records) == {
+        "trace_captured": 3,
+        "trace_hits": 3,
+        "cold_control": 6,
+        "fallback_control": 0,
+        "record_count": 12,
+    }
+
+    combined = [
+        {
+            "layer": "full_voyage",
+            "objective": "recommended",
+            "wall_ms": 1.0,
+            "reuse_status": "TRACE_CAPTURED",
+        },
+        *records,
+    ]
+    assert shadow._trace_counts(combined) == shadow._trace_counts(records)
+
+
+def test_m2_summary_enforces_12_routes_timing_reuse_rss_and_swap() -> None:
+    cells = [
+        (layer, objective)
+        for layer in shadow._CONTROL_TRACE_LAYER_NAMES
+        for objective in ("fastest", "low_risk", "recommended")
+    ]
+    timing_control = [
+        {"layer": layer, "objective": objective, "wall_ms": 100.0}
+        for layer, objective in cells
+    ]
+    timing_candidate = [
+        {"layer": layer, "objective": objective, "wall_ms": 70.0}
+        for layer, objective in cells
+    ]
+    sidecar = shadow._shadow_sidecar_records(
+        {
+            "trace_observations": [
+                {"objective": value}
+                for value in ("fastest", "low_risk", "recommended")
+            ],
+            "reuse_outcomes": [
+                {
+                    "objective": "recommended",
+                    "status": "HIT_TRACE_EQUIVALENT",
+                    "reused": True,
+                    "used_search": False,
+                }
+                for _ in range(3)
+            ]
+            + [
+                {
+                    "objective": "recommended",
+                    "status": "COLD_CONTROL",
+                    "reused": False,
+                    "used_search": True,
+                }
+                for _ in range(6)
+            ],
+        }
+    )
+    pairs = [
+        {
+            "layer": layer,
+            "objective": objective,
+            "status": "PASS",
+            "control_route_digest": f"route-{index}",
+            "candidate_route_digest": f"route-{index}",
+        }
+        for index, (layer, objective) in enumerate(cells)
+    ]
+    cases = [
+        {
+            "case_id": f"case-{index}",
+            "status": "PASS",
+            "rss_scope": "independent_child_process",
+            "records": {
+                "control": timing_control,
+                "candidate": [*timing_candidate, *sidecar],
+            },
+            "track_resources": {
+                "control": {
+                    "wall_seconds": 1.0,
+                    "peak_rss_kib": 100,
+                    "swap_delta": {"pswpin": 0, "pswpout": 0},
+                },
+                "candidate": {
+                    "wall_seconds": 0.7,
+                    "peak_rss_kib": 105,
+                    "swap_delta": {"pswpin": 0, "pswpout": 0},
+                },
+            },
+            "comparison": {"status": "PASS", "pair_count": 12, "pairs": pairs},
+            "route_integrity": {
+                "control": {"status": "PASS", "route_count": 12},
+                "candidate": {"status": "PASS", "route_count": 12},
+            },
+        }
+        for index in range(1, 4)
+    ]
+    summary = shadow._m2_summary(cases)
+    assert summary["gate_verdict"] == "PASS"
+    assert summary["overall"]["median_improvement_percent"] == pytest.approx(30.0)
+    assert summary["overall"]["p95_gate"] == "PASS"
+    assert summary["rss"]["median_ratio"] == pytest.approx(1.05)
+    assert summary["swap"]["gate"] == "PASS"
+    assert all(item["gate"] == "PASS" for item in summary["cells"])
+    assert summary["screening"]["gate_verdict"] == "PASS"
+    assert shadow._m2_summary(cases[:2])["screening"]["gate_verdict"] == "PASS"
+
+
+def test_prepared_shadow_track_requires_strict_single_track_api() -> None:
+    prepared = SimpleNamespace(prepared=SimpleNamespace())
+    with pytest.raises(RuntimeError, match="single-track shadow API"):
+        shadow._prepared_shadow_track(
+            prepared=prepared,
+            track="control",
+            candidate_mode="control-trace",
+        )
+
+
+def test_prepared_shadow_track_rejects_missing_production_isolation_proof() -> None:
+    result = SimpleNamespace(
+        outcome=SimpleNamespace(published=False),
+        production_published=False,
+        scratch_proof=SimpleNamespace(
+            production_published=False,
+            production_store_unchanged=True,
+            production_session_unchanged=False,
+            scratch_store_isolated=True,
+        ),
+    )
+    prepared = SimpleNamespace(
+        prepared=SimpleNamespace(
+            execute_four_layer_temporal_shadow_track=lambda **_: result
+        )
+    )
+    with pytest.raises(RuntimeError, match="production-state isolation"):
+        shadow._prepared_shadow_track(
+            prepared=prepared,
+            track="candidate",
+            candidate_mode="control-trace",
+        )
 
 
 @dataclass(frozen=True)
