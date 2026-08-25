@@ -68,7 +68,7 @@ from arctic_route_planning.planners.temporal_reuse import (
 from arctic_route_planning.planners.temporal_session import TemporalSessionIdentity
 from arctic_route_planning.publishing import (
     four_layer_route_plan_set_to_dict,
-    route_plan_v3_semantic_digest,
+    route_plan_v3_to_dict,
 )
 from arctic_route_planning.publishing.layered_serialization import (
     four_layer_route_plan_set_from_dict,
@@ -114,6 +114,21 @@ _M2_TRACE_SOURCE_LAYER = "full_voyage"
 _M2_TRACE_SOURCE_OVERHEAD_CEILING_PERCENT = 5.0
 _TRACE_CAPTURE_STATUS = "TRACE_CAPTURED"
 _TRACE_HIT_STATUSES = frozenset({"HIT_EXACT", "HIT_TRACE_EQUIVALENT"})
+_RUNNER_COMPARISON_ROUTE_RUNTIME_FIELDS = frozenset(
+    {
+        "plan_id",
+        "layer_set_id",
+        "planning_request_id",
+        "generated_at",
+        "planner_version",
+        "plan_version",
+        "reference_plan_id",
+    }
+)
+_RUNNER_COMPARISON_METRIC_RUNTIME_FIELDS = frozenset({"compute_ms", "expanded_nodes"})
+_RUNNER_COMPARISON_SET_RUNTIME_FIELDS = frozenset(
+    {"layer_set_id", "planning_request_id", "generated_at"}
+)
 
 
 def _workspace_root() -> Path:
@@ -890,6 +905,61 @@ def _waypoint_signature(plan: Any) -> tuple[tuple[float, float, str], ...]:
     )
 
 
+def _runner_comparison_route_document(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize one route for cross-planner semantic comparison.
+
+    The formal C digest intentionally retains some publication/runtime
+    identity fields.  This runner compares two independent algorithms, so
+    those fields would create a false route mismatch even when all business
+    route fields are identical.  Reference identity values are omitted, but
+    their None/non-None structure is checked by ``_plan_comparison``.
+    """
+
+    normalized = dict(document)
+    for key in _RUNNER_COMPARISON_ROUTE_RUNTIME_FIELDS:
+        normalized.pop(key, None)
+    metrics = normalized.get("metrics")
+    if isinstance(metrics, Mapping):
+        normalized["metrics"] = {
+            key: value
+            for key, value in metrics.items()
+            if key not in _RUNNER_COMPARISON_METRIC_RUNTIME_FIELDS
+        }
+    return normalized
+
+
+def _runner_comparison_plan_set_document(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize a four-layer plan-set with the same route policy."""
+
+    normalized = dict(document)
+    for key in _RUNNER_COMPARISON_SET_RUNTIME_FIELDS:
+        normalized.pop(key, None)
+    layers = normalized.get("layers")
+    if isinstance(layers, list):
+        normalized["layers"] = []
+        for layer in layers:
+            if not isinstance(layer, Mapping):
+                normalized["layers"].append(layer)
+                continue
+            normalized_layer = dict(layer)
+            plans = normalized_layer.get("plans")
+            if isinstance(plans, Mapping):
+                normalized_layer["plans"] = {
+                    objective: _runner_comparison_route_document(plan)
+                    if isinstance(plan, Mapping)
+                    else plan
+                    for objective, plan in plans.items()
+                }
+            normalized["layers"].append(normalized_layer)
+    return normalized
+
+
+def _runner_comparison_route_digest(plan: Any) -> str:
+    return _canonical_digest(
+        _runner_comparison_route_document(route_plan_v3_to_dict(plan))
+    )
+
+
 def _plan_comparison(control: Any, candidate: Any) -> dict[str, Any]:
     control_doc = four_layer_route_plan_set_to_dict(control)
     candidate_doc = four_layer_route_plan_set_to_dict(candidate)
@@ -917,8 +987,11 @@ def _plan_comparison(control: Any, candidate: Any) -> dict[str, Any]:
             abs(left.recommended_speed_mps - right.recommended_speed_mps)
             for left, right in zip(control_plan.waypoints, candidate_plan.waypoints, strict=True)
         ]
-        control_route_digest = route_plan_v3_semantic_digest(control_plan)
-        candidate_route_digest = route_plan_v3_semantic_digest(candidate_plan)
+        control_route_digest = _runner_comparison_route_digest(control_plan)
+        candidate_route_digest = _runner_comparison_route_digest(candidate_plan)
+        reference_structure_equal = (
+            control_plan.reference_plan_id is None
+        ) == (candidate_plan.reference_plan_id is None)
         route_equal = (
             _waypoint_signature(control_plan) == _waypoint_signature(candidate_plan)
             and max(speed_deltas, default=0.0) <= _NUMERIC_TOLERANCE
@@ -927,6 +1000,7 @@ def _plan_comparison(control: Any, candidate: Any) -> dict[str, Any]:
             and control_plan.layer_goal_reached == candidate_plan.layer_goal_reached
             and control_metrics.hard_constraint_violations
             == candidate_metrics.hard_constraint_violations
+            and reference_structure_equal
             and control_route_digest == candidate_route_digest
             and max(eta_deltas, default=0.0) <= _ETA_TOLERANCE_SECONDS
             and all(delta <= _NUMERIC_TOLERANCE for delta in metric_deltas.values())
@@ -949,6 +1023,7 @@ def _plan_comparison(control: Any, candidate: Any) -> dict[str, Any]:
                 == candidate_plan.source_risk_ids,
                 "hard_constraint_violations_equal": control_metrics.hard_constraint_violations
                 == candidate_metrics.hard_constraint_violations,
+                "reference_plan_structure_equal": reference_structure_equal,
                 "layer_goal_reached_equal": control_plan.layer_goal_reached
                 == candidate_plan.layer_goal_reached,
                 "route_digest_equal": control_route_digest == candidate_route_digest,
@@ -967,12 +1042,23 @@ def _plan_comparison(control: Any, candidate: Any) -> dict[str, Any]:
         "status": "PASS" if all(item["status"] == "PASS" for item in pairs) else "FAIL",
         "pair_count": len(pairs),
         "pairs": pairs,
-        "control_plan_set_digest": _canonical_digest(control_doc),
-        "candidate_plan_set_digest": _canonical_digest(candidate_doc),
+        "control_plan_set_digest": _canonical_digest(
+            _runner_comparison_plan_set_document(control_doc)
+        ),
+        "candidate_plan_set_digest": _canonical_digest(
+            _runner_comparison_plan_set_document(candidate_doc)
+        ),
         "comparison_policy": {
             "eta_tolerance_seconds": _ETA_TOLERANCE_SECONDS,
             "numeric_tolerance": _NUMERIC_TOLERANCE,
             "compute_and_expansion_differences_are_diagnostic_only": True,
+            "runtime_fields_ignored": sorted(_RUNNER_COMPARISON_ROUTE_RUNTIME_FIELDS),
+            "metric_runtime_fields_ignored": sorted(
+                _RUNNER_COMPARISON_METRIC_RUNTIME_FIELDS
+            ),
+            "reference_plan_id_policy": (
+                "None/non-None structure must match; identity value ignored"
+            ),
         },
     }
 
@@ -2498,7 +2584,9 @@ def run(args: argparse.Namespace) -> int:
                             ),
                             "production_published": False,
                             "plan_set": control_doc,
-                            "plan_set_digest": _canonical_digest(control_doc),
+                            "plan_set_digest": _canonical_digest(
+                                _runner_comparison_plan_set_document(control_doc)
+                            ),
                             "planner_version": "time-dependent-a-star.v1",
                             "records": records["control"],
                         },
@@ -2511,7 +2599,9 @@ def run(args: argparse.Namespace) -> int:
                             ),
                             "production_published": False,
                             "plan_set": candidate_doc,
-                            "plan_set_digest": _canonical_digest(candidate_doc),
+                            "plan_set_digest": _canonical_digest(
+                                _runner_comparison_plan_set_document(candidate_doc)
+                            ),
                             "planner_version": mode_metadata["candidate_algorithm"],
                             "candidate_mode": args.candidate_mode,
                             "candidate_schema": mode_metadata["candidate_schema"],

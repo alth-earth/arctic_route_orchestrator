@@ -295,6 +295,111 @@ def test_shadow_sidecar_records_normalize_trace_and_reuse_counts() -> None:
     assert shadow._trace_counts(combined) == shadow._trace_counts(records)
 
 
+def test_runner_comparison_ignores_runtime_ids_but_rejects_business_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eta = datetime(2026, 8, 25, tzinfo=UTC)
+
+    def route_document(*, suffix: str, avg_risk: float = 0.1) -> dict[str, object]:
+        return {
+            "plan_id": f"route-{suffix}",
+            "plan_version": f"planner-{suffix}:v3:1",
+            "planning_request_id": f"request-{suffix}",
+            "generated_at": f"2026-08-25T00:00:0{suffix}Z",
+            "planner_version": f"algorithm-{suffix}",
+            "layer_set_id": f"set-{suffix}",
+            "reference_plan_id": f"route-reference-{suffix}",
+            "objective_mode": "recommended",
+            "planning_layer": "full_voyage",
+            "source_risk_ids": ["risk-1"],
+            "destination_reached": True,
+            "layer_goal_reached": True,
+            "waypoints": [
+                {
+                    "longitude": 10.0,
+                    "latitude": 70.0,
+                    "eta": "2026-08-25T00:00:00Z",
+                    "recommended_speed_mps": 5.0,
+                }
+            ],
+            "metrics": {
+                "distance_km": 10.0,
+                "eta_hours": 2.0,
+                "avg_risk": avg_risk,
+                "max_risk": 0.2,
+                "integrated_risk_hours": 0.3,
+                "minimum_confidence": 0.9,
+                "hard_constraint_violations": 0,
+                "turn_count": 0,
+                "expanded_nodes": 10,
+                "compute_ms": 4.0,
+                "objective_cost": 2.0,
+            },
+        }
+
+    def plan(document: dict[str, object]) -> SimpleNamespace:
+        metrics = document["metrics"]
+        assert isinstance(metrics, dict)
+        return SimpleNamespace(
+            document=document,
+            metrics=SimpleNamespace(**metrics),
+            waypoints=(
+                SimpleNamespace(
+                    longitude=10.0,
+                    latitude=70.0,
+                    eta=eta,
+                    recommended_speed_mps=5.0,
+                ),
+            ),
+            source_risk_ids=("risk-1",),
+            destination_reached=True,
+            layer_goal_reached=True,
+            reference_plan_id=document["reference_plan_id"],
+        )
+
+    control_plan = plan(route_document(suffix="1"))
+    candidate_plan = plan(route_document(suffix="2"))
+    control_set = {"layers": [{"plans": {"recommended": control_plan.document}}]}
+    candidate_set = {"layers": [{"plans": {"recommended": candidate_plan.document}}]}
+    control = SimpleNamespace()
+    candidate = SimpleNamespace()
+    monkeypatch.setattr(
+        shadow,
+        "four_layer_route_plan_set_to_dict",
+        lambda value: control_set if value is control else candidate_set,
+    )
+    monkeypatch.setattr(
+        shadow,
+        "route_plan_v3_to_dict",
+        lambda value: value.document,
+    )
+    monkeypatch.setattr(
+        shadow,
+        "_plan_pairs",
+        lambda *_: iter([("full_voyage", "recommended", control_plan, candidate_plan)]),
+    )
+
+    runtime_only = shadow._plan_comparison(control, candidate)
+    assert runtime_only["status"] == "PASS"
+    assert runtime_only["pairs"][0]["route_digest_equal"] is True
+    assert runtime_only["pairs"][0]["reference_plan_structure_equal"] is True
+    assert runtime_only["control_plan_set_digest"] == runtime_only["candidate_plan_set_digest"]
+
+    candidate_plan.metrics.avg_risk = 0.4
+    candidate_plan.document["metrics"]["avg_risk"] = 0.4
+    business_change = shadow._plan_comparison(control, candidate)
+    assert business_change["status"] == "FAIL"
+    assert business_change["pairs"][0]["route_digest_equal"] is False
+
+    candidate_plan.metrics.avg_risk = 0.1
+    candidate_plan.document["metrics"]["avg_risk"] = 0.1
+    candidate_plan.reference_plan_id = None
+    candidate_plan.document["reference_plan_id"] = None
+    reference_shape_change = shadow._plan_comparison(control, candidate)
+    assert reference_shape_change["status"] == "FAIL"
+    assert reference_shape_change["pairs"][0]["reference_plan_structure_equal"] is False
+
+
 def test_m2_summary_enforces_12_routes_timing_reuse_rss_and_swap() -> None:
     cells = [
         (layer, objective)
