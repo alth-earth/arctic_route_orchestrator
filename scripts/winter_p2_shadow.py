@@ -2357,6 +2357,25 @@ def _manifest(
     status: str,
 ) -> dict[str, Any]:
     mode_metadata = _mode_metadata(args.candidate_mode)
+    orchestrator_root = Path(__file__).resolve().parents[1]
+    work_package_c_root = _workspace_root() / "work_package_c"
+    repositories = {
+        "orchestrator": _git_environment(orchestrator_root),
+        "work_package_c": _git_environment(work_package_c_root),
+    }
+    implementation_sha256 = {
+        "winter_p2_shadow.py": _file_sha256(Path(__file__).resolve()),
+        "work_package_c_ingress.py": _file_sha256(
+            work_package_c_root / "src" / "arctic_route_planning" / "ingress.py"
+        ),
+        "work_package_c_control_trace_reuse.py": _file_sha256(
+            work_package_c_root
+            / "src"
+            / "arctic_route_planning"
+            / "planners"
+            / "control_trace_reuse.py"
+        ),
+    }
     experiment_key = {
         "script_version": _SCRIPT_VERSION,
         "risk_content_digest": prepared.commit["content_digest"],
@@ -2369,6 +2388,9 @@ def _manifest(
         "execution_order": args.execution_order,
         "candidate_mode": args.candidate_mode,
         "rss_mode": args.rss_mode,
+        "implementation_sha256": implementation_sha256,
+        "orchestrator_commit": repositories["orchestrator"].get("commit"),
+        "work_package_c_commit": repositories["work_package_c"].get("commit"),
     }
     experiment_id = f"winter-p2-shadow-v2-{_canonical_digest(experiment_key)[:16]}"
     return {
@@ -2397,35 +2419,16 @@ def _manifest(
             "execution_spec_sha256": _file_sha256(args.execution_spec),
         },
         "repositories": {
-            "orchestrator": _git_environment(Path(__file__).resolve().parents[1]),
-            "work_package_c": _git_environment(_workspace_root() / "work_package_c"),
+            "orchestrator": repositories["orchestrator"],
+            "work_package_c": repositories["work_package_c"],
         },
         "lock_sha256": {
             "orchestrator_uv_lock": _file_sha256(
-                Path(__file__).resolve().parents[1] / "uv.lock"
+                orchestrator_root / "uv.lock"
             ),
-            "work_package_c_uv_lock": _file_sha256(
-                _workspace_root() / "work_package_c" / "uv.lock"
-            ),
+            "work_package_c_uv_lock": _file_sha256(work_package_c_root / "uv.lock"),
         },
-        "implementation_sha256": {
-            "winter_p2_shadow.py": _file_sha256(Path(__file__).resolve()),
-            "work_package_c_ingress.py": _file_sha256(
-                _workspace_root()
-                / "work_package_c"
-                / "src"
-                / "arctic_route_planning"
-                / "ingress.py"
-            ),
-            "work_package_c_control_trace_reuse.py": _file_sha256(
-                _workspace_root()
-                / "work_package_c"
-                / "src"
-                / "arctic_route_planning"
-                / "planners"
-                / "control_trace_reuse.py"
-            ),
-        },
+        "implementation_sha256": implementation_sha256,
         "m2_policy": {
             "required_candidate_mode": "control-trace",
             "required_rss_mode": "isolated",

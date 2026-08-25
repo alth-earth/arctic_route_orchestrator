@@ -115,6 +115,75 @@ def test_control_trace_refuses_shared_process_m2_measurement() -> None:
         shadow.run(args)
 
 
+def test_manifest_experiment_id_binds_implementation_and_repository_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = {
+        "runner": "runner-sha-1",
+        "ingress": "ingress-sha-1",
+        "reuse": "reuse-sha-1",
+        "orchestrator": "orchestrator-commit-1",
+        "work_package_c": "work-package-c-commit-1",
+    }
+
+    def fake_file_sha256(path: Path) -> str:
+        if path.name == "winter_p2_shadow.py":
+            return state["runner"]
+        if path.name == "ingress.py":
+            return state["ingress"]
+        if path.name == "control_trace_reuse.py":
+            return state["reuse"]
+        return f"fixed-{path.name}"
+
+    def fake_git_environment(repo: Path) -> dict[str, object]:
+        commit_key = "work_package_c" if repo.name == "work_package_c" else "orchestrator"
+        return {
+            "path": str(repo),
+            "commit": state[commit_key],
+            "branch": "test",
+            "dirty": False,
+            "upstream": None,
+            "ahead": None,
+            "behind": None,
+        }
+
+    monkeypatch.setattr(shadow, "_file_sha256", fake_file_sha256)
+    monkeypatch.setattr(shadow, "_git_environment", fake_git_environment)
+    monkeypatch.setattr(shadow, "_workspace_root", lambda: tmp_path)
+    prepared = SimpleNamespace(
+        commit={"content_digest": "risk-content", "commit_id": "risk-commit"},
+        spec=SimpleNamespace(
+            run_id="run-1",
+            generation_id=1,
+            input_revision=1,
+        ),
+        commit_path=tmp_path / "risk-commit.json",
+        input_identity={"risk_content_digest": "risk-content"},
+    )
+    args = SimpleNamespace(
+        screen_objective="recommended",
+        repetitions=2,
+        execution_order="control-first",
+        candidate_mode="control-trace",
+        rss_mode="isolated",
+        prepare_only=False,
+        worker_timeout_seconds=None,
+        run_context=tmp_path / "run-context.json",
+        execution_spec=tmp_path / "execution-spec.json",
+        output_dir=tmp_path / "output",
+    )
+
+    baseline = shadow._manifest(prepared, args, status="PREPARED")["experiment_id"]
+    assert baseline == shadow._manifest(prepared, args, status="PREPARED")["experiment_id"]
+    for identity_part in state:
+        original = state[identity_part]
+        state[identity_part] = f"{original}-changed"
+        changed = shadow._manifest(prepared, args, status="PREPARED")["experiment_id"]
+        assert changed != baseline, identity_part
+        state[identity_part] = original
+
+
 def test_isolated_worker_command_has_explicit_track_boundary(tmp_path: Path) -> None:
     args = SimpleNamespace(
         risk_store_root=tmp_path / "risk",
