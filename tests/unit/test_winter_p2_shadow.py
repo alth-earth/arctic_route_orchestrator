@@ -233,6 +233,8 @@ def test_control_trace_sidecar_reports_real_hits_and_misses() -> None:
     assert sidecar["zero_search_hit_count"] == 1
     assert sidecar["reuse_miss_count"] == 2
     assert sidecar["reuse_lookup_miss_count"] == 1
+    assert sidecar["candidate_sessions"][2]["certificate"] is None
+    assert sidecar["candidate_sessions"][3]["certificate"] is None
     assert sidecar["reuse_statuses"] == [
         "COLD_CONTROL",
         "FALLBACK_CONTROL",
@@ -269,6 +271,10 @@ def test_shadow_sidecar_records_normalize_trace_and_reuse_counts() -> None:
             ],
         }
     )
+    assert records[0]["certificate"] == {"status": "CERTIFIED_TRACE"}
+    assert records[3]["certificate"]["status"] == "CERTIFIED_TRACE"
+    assert records[6]["certificate"] is None
+    assert records[6]["certificate_status"] is None
     assert shadow._trace_counts(records) == {
         "trace_captured": 3,
         "trace_hits": 3,
@@ -296,13 +302,39 @@ def test_m2_summary_enforces_12_routes_timing_reuse_rss_and_swap() -> None:
         for objective in ("fastest", "low_risk", "recommended")
     ]
     timing_control = [
-        {"layer": layer, "objective": objective, "wall_ms": 100.0}
+        {
+            "layer": layer,
+            "objective": objective,
+            "wall_ms": 100.0,
+            "expanded": 7,
+            "edge": 11,
+            "search_used": True,
+            "reuse_status": "CONTROL_SEARCH",
+        }
         for layer, objective in cells
     ]
-    timing_candidate = [
-        {"layer": layer, "objective": objective, "wall_ms": 70.0}
-        for layer, objective in cells
-    ]
+    timing_candidate = []
+    for layer, objective in cells:
+        status = (
+            "TRACE_CAPTURED"
+            if layer == "full_voyage"
+            else "HIT_TRACE_EQUIVALENT"
+            if layer == "main_corridor_24_72h"
+            else "COLD_CONTROL"
+        )
+        hit = status == "HIT_TRACE_EQUIVALENT"
+        timing_candidate.append(
+            {
+                "layer": layer,
+                "objective": objective,
+                "wall_ms": 70.0,
+                "expanded": 0 if hit else 7,
+                "edge": 0 if hit else 11,
+                "search_used": not hit,
+                "trace_status": "TRACE_CAPTURED" if status == "TRACE_CAPTURED" else None,
+                "reuse_status": status,
+            }
+        )
     sidecar = shadow._shadow_sidecar_records(
         {
             "trace_observations": [
@@ -374,9 +406,48 @@ def test_m2_summary_enforces_12_routes_timing_reuse_rss_and_swap() -> None:
     assert summary["overall"]["p95_gate"] == "PASS"
     assert summary["rss"]["median_ratio"] == pytest.approx(1.05)
     assert summary["swap"]["gate"] == "PASS"
+    assert summary["reuse_timing_gate"] == "PASS"
+    assert summary["trace_source_overhead"]["gate"] == "PASS"
+    assert all(
+        item["gate"] == "PASS"
+        for item in summary["trace_source_overhead"]["objectives"]
+    )
+    assert summary["screening"]["trace_source_overhead"]["gate"] == "PASS"
     assert all(item["gate"] == "PASS" for item in summary["cells"])
     assert summary["screening"]["gate_verdict"] == "PASS"
     assert shadow._m2_summary(cases[:2])["screening"]["gate_verdict"] == "PASS"
+    slow_candidate = [
+        {**record, "wall_ms": 110.0}
+        if record.get("layer") == "full_voyage"
+        else record
+        for record in timing_candidate
+    ]
+    slow_case = {
+        **cases[0],
+        "records": {
+            **cases[0]["records"],
+            "candidate": [*slow_candidate, *sidecar],
+        },
+    }
+    slow_summary = shadow._m2_summary([slow_case] * 3)
+    assert slow_summary["trace_source_overhead"]["gate"] == "FAIL"
+    assert slow_summary["gate_verdict"] == "FAIL"
+    bad_candidate = [
+        {**record, "expanded": 1}
+        if record.get("reuse_status") == "HIT_TRACE_EQUIVALENT"
+        else record
+        for record in timing_candidate
+    ]
+    bad_case = {
+        **cases[0],
+        "records": {
+            **cases[0]["records"],
+            "candidate": [*bad_candidate, *sidecar],
+        },
+    }
+    bad_summary = shadow._m2_summary([bad_case] * 3)
+    assert bad_summary["reuse_timing_gate"] == "FAIL"
+    assert bad_summary["gate_verdict"] == "FAIL"
 
 
 def test_prepared_shadow_track_requires_strict_single_track_api() -> None:

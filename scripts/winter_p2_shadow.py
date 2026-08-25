@@ -110,6 +110,10 @@ _M2_P95_REGRESSION_CEILING_PERCENT = 5.0
 _M2_EXPECTED_TRACE_COUNT = 3
 _M2_EXPECTED_HIT_COUNT = 3
 _M2_EXPECTED_COLD_COUNT = 6
+_M2_TRACE_SOURCE_LAYER = "full_voyage"
+_M2_TRACE_SOURCE_OVERHEAD_CEILING_PERCENT = 5.0
+_TRACE_CAPTURE_STATUS = "TRACE_CAPTURED"
+_TRACE_HIT_STATUSES = frozenset({"HIT_EXACT", "HIT_TRACE_EQUIVALENT"})
 
 
 def _workspace_root() -> Path:
@@ -1013,19 +1017,124 @@ def _timing_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if not isinstance(wall_ms, (int, float)):
             continue
-        rows.append(
-            {
-                "layer": layer,
-                "objective": objective,
-                "wall_ms": float(wall_ms),
-            }
-        )
+        row = {
+            "layer": layer,
+            "objective": objective,
+            "wall_ms": float(wall_ms),
+        }
+        # The formal C timing row carries these fields.  Keep them in the
+        # normalized runner row so a sidecar cannot make a zero-work claim
+        # without the actual timing observation proving it.
+        for key, aliases in {
+            "expanded": ("expanded", "expanded_states", "expanded_labels"),
+            "edge": ("edge", "edge_evaluations"),
+            "search_used": ("search_used",),
+            "trace_status": ("trace_status",),
+            "reuse_status": ("reuse_status",),
+            "route_digest": ("route_digest",),
+        }.items():
+            for alias in aliases:
+                if alias in record:
+                    row[key] = record[alias]
+                    break
+        rows.append(row)
     return rows
 
 
 def _timing_cell_map(records: list[dict[str, Any]]) -> dict[tuple[str, str], float]:
     rows = _timing_rows(records)
     return {(row["layer"], row["objective"]): row["wall_ms"] for row in rows}
+
+
+def _trace_source_overhead(
+    cases: list[dict[str, Any]],
+    *,
+    required_repetitions: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Measure tracing overhead only on the full-voyage source rows.
+
+    The candidate's first full-voyage row is the traced source.  It is paired
+    with the independent control row for the same objective and repetition;
+    reuse rows from later layers are deliberately excluded.
+    """
+
+    objectives = tuple(objective.value for objective in ObjectiveMode)
+    summary: list[dict[str, Any]] = []
+    for objective in objectives:
+        control_values: list[float] = []
+        trace_source_values: list[float] = []
+        overhead_values: list[float] = []
+        for case in cases:
+            if case.get("status") != "PASS":
+                continue
+            control_rows = [
+                row
+                for row in _timing_rows(case.get("records", {}).get("control", []))
+                if row["layer"] == _M2_TRACE_SOURCE_LAYER
+                and row["objective"] == objective
+            ]
+            candidate_rows = [
+                row
+                for row in _timing_rows(case.get("records", {}).get("candidate", []))
+                if row["layer"] == _M2_TRACE_SOURCE_LAYER
+                and row["objective"] == objective
+                and (
+                    row.get("trace_status") == _TRACE_CAPTURE_STATUS
+                    or row.get("reuse_status") == _TRACE_CAPTURE_STATUS
+                )
+            ]
+            if len(control_rows) != 1 or len(candidate_rows) != 1:
+                continue
+            control_wall = float(control_rows[0]["wall_ms"])
+            trace_source_wall = float(candidate_rows[0]["wall_ms"])
+            if control_wall <= 0:
+                continue
+            control_values.append(control_wall)
+            trace_source_values.append(trace_source_wall)
+            overhead_values.append((trace_source_wall - control_wall) / control_wall * 100.0)
+        overhead_median = _nearest_rank(overhead_values, 0.5)
+        summary.append(
+            {
+                "layer": _M2_TRACE_SOURCE_LAYER,
+                "objective": objective,
+                "sample_count": len(overhead_values),
+                "required_repetitions": required_repetitions,
+                "control_wall_median_ms": _nearest_rank(control_values, 0.5),
+                "trace_source_wall_median_ms": _nearest_rank(trace_source_values, 0.5),
+                "overhead_median_percent": overhead_median,
+                "ceiling_percent": _M2_TRACE_SOURCE_OVERHEAD_CEILING_PERCENT,
+                "gate": (
+                    "PASS"
+                    if len(overhead_values) >= required_repetitions
+                    and overhead_median is not None
+                    and overhead_median <= _M2_TRACE_SOURCE_OVERHEAD_CEILING_PERCENT
+                    else "FAIL"
+                    if len(overhead_values) >= required_repetitions
+                    else "NOT_MEASURED"
+                ),
+            }
+        )
+    return summary, bool(summary) and all(item["gate"] == "PASS" for item in summary)
+
+
+def _reuse_timing_evidence(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Validate every reported trace hit against its timing row."""
+
+    rows = _timing_rows(records)
+    hit_rows = [row for row in rows if row.get("reuse_status") in _TRACE_HIT_STATUSES]
+    invalid_rows = [
+        row
+        for row in hit_rows
+        if row.get("search_used") is not False
+        or row.get("expanded") != 0
+        or row.get("edge") != 0
+    ]
+    return {
+        "reported_hit_count": len(hit_rows),
+        "invalid_hit_count": len(invalid_rows),
+        "valid_zero_work_hit_count": len(hit_rows) - len(invalid_rows),
+        "gate": "PASS" if hit_rows and not invalid_rows else "FAIL",
+    }
 
 
 def _trace_counts(records: list[dict[str, Any]]) -> dict[str, int]:
@@ -1138,12 +1247,21 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         )
 
     expected_reuse = []
+    reuse_timing_evidence = []
     semantic_pass = []
     determinism_inputs: dict[str, list[Any]] = {"control": [], "candidate": []}
     rss_ratios: list[float] = []
     swap_deltas: list[dict[str, int]] = []
     for case in cases:
         counts = _trace_counts(case.get("records", {}).get("candidate", []))
+        timing_evidence = _reuse_timing_evidence(
+            case.get("records", {}).get("candidate", [])
+        )
+        reuse_timing_evidence.append(
+            timing_evidence["reported_hit_count"] == counts["trace_hits"]
+            and timing_evidence["reported_hit_count"] == _M2_EXPECTED_HIT_COUNT
+            and timing_evidence["gate"] == "PASS"
+        )
         expected_reuse.append(
             counts == {
                 "trace_captured": _M2_EXPECTED_TRACE_COUNT,
@@ -1201,6 +1319,14 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
     sample_count = len(cases)
     sufficient = sample_count >= _M2_MIN_REPETITIONS
     screening_sufficient = sample_count >= _M2_SCREENING_REPETITIONS
+    trace_source_overhead, trace_source_gate = _trace_source_overhead(
+        cases,
+        required_repetitions=_M2_MIN_REPETITIONS,
+    )
+    screening_trace_source_overhead, screening_trace_source_gate = _trace_source_overhead(
+        cases,
+        required_repetitions=_M2_SCREENING_REPETITIONS,
+    )
     p95_control = _nearest_rank(overall_control, 0.95)
     p95_candidate = _nearest_rank(overall_candidate, 0.95)
     p95_regression = (
@@ -1234,6 +1360,7 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
     )
     semantic_gate = bool(semantic_pass) and all(semantic_pass)
     reuse_gate = bool(expected_reuse) and all(expected_reuse)
+    reuse_timing_gate = bool(reuse_timing_evidence) and all(reuse_timing_evidence)
     resource_gate = independent_rss and (rss_median is not None and rss_median <= 1.10)
     swap_gate = bool(swap_deltas) and all(
         delta["pswpin"] == 0 and delta["pswpout"] == 0 for delta in swap_deltas
@@ -1243,9 +1370,11 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         if sufficient
         and semantic_gate
         and reuse_gate
+        and reuse_timing_gate
         and deterministic
         and overall_gate == "PASS"
         and cell_gate
+        and trace_source_gate
         and resource_gate
         and swap_gate
         else "NOT_EVALUATED_INSUFFICIENT_REPETITIONS"
@@ -1257,11 +1386,13 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         if screening_sufficient
         and semantic_gate
         and reuse_gate
+        and reuse_timing_gate
         and deterministic
         and improvement is not None
         and improvement >= _M2_SCREENING_IMPROVEMENT_FLOOR_PERCENT
         and bool(cell_summary)
         and all(item["gate"] == "PASS" for item in cell_summary)
+        and screening_trace_source_gate
         and resource_gate
         and swap_gate
         else "NOT_EVALUATED_INSUFFICIENT_REPETITIONS"
@@ -1272,16 +1403,18 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         "schema_version": "orchestrator.winter-p2-m2-summary.v1",
         "sample_count": sample_count,
         "minimum_repetitions": _M2_MIN_REPETITIONS,
-        "screening": {
-            "minimum_repetitions": _M2_SCREENING_REPETITIONS,
-            "median_improvement_floor_percent": (
-                _M2_SCREENING_IMPROVEMENT_FLOOR_PERCENT
-            ),
-            "gate_verdict": screening_gate,
-        },
         "semantic_gate": "PASS" if semantic_gate else "FAIL",
         "reuse_matrix_gate": "PASS" if reuse_gate else "FAIL",
+        "reuse_timing_gate": (
+            "PASS" if reuse_timing_gate else "FAIL"
+        ),
         "determinism_gate": "PASS" if deterministic else "FAIL",
+        "trace_source_overhead": {
+            "layer": _M2_TRACE_SOURCE_LAYER,
+            "ceiling_percent": _M2_TRACE_SOURCE_OVERHEAD_CEILING_PERCENT,
+            "objectives": trace_source_overhead,
+            "gate": "PASS" if trace_source_gate else "FAIL",
+        },
         "overall": {
             "control_wall_median_seconds": control_median,
             "candidate_wall_median_seconds": candidate_median,
@@ -1293,6 +1426,7 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
             "gate": overall_gate,
         },
         "cells": cell_summary,
+        "reuse_timing_evidence": reuse_timing_evidence,
         "rss": {
             "comparison": (
                 "independent_child_process"
@@ -1312,6 +1446,19 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
             "trace_hits": _M2_EXPECTED_HIT_COUNT,
             "cold_control": _M2_EXPECTED_COLD_COUNT,
         },
+        "screening": {
+            "minimum_repetitions": _M2_SCREENING_REPETITIONS,
+            "median_improvement_floor_percent": (
+                _M2_SCREENING_IMPROVEMENT_FLOOR_PERCENT
+            ),
+            "trace_source_overhead": {
+                "layer": _M2_TRACE_SOURCE_LAYER,
+                "ceiling_percent": _M2_TRACE_SOURCE_OVERHEAD_CEILING_PERCENT,
+                "objectives": screening_trace_source_overhead,
+                "gate": "PASS" if screening_trace_source_gate else "FAIL",
+            },
+            "gate_verdict": screening_gate,
+        },
         "gate_verdict": gate_verdict,
         "percentile_method": "median exact; p95 nearest-rank ceil(0.95*n)-1",
     }
@@ -1325,11 +1472,28 @@ def _reuse_sidecar(
 ) -> dict[str, Any]:
     mode_metadata = _mode_metadata(candidate_mode)
     if candidate_mode == "control-trace":
+        normalized_records: list[dict[str, Any]] = []
+        for record in candidate_records:
+            normalized = dict(record)
+            certificate = _trace_certificate_document(normalized)
+            # A stale/malformed caller certificate must not turn a cold or
+            # miss outcome into a certified trace claim.
+            normalized["certificate"] = (
+                certificate
+                if certificate is not None
+                else None
+            )
+            normalized["certificate_status"] = (
+                certificate.get("status") if certificate is not None else None
+            )
+            normalized_records.append(normalized)
+        candidate_records = normalized_records
         hits = [record for record in candidate_records if record.get("reuse_hit")]
         trace_records = [
             record
             for record in candidate_records
-            if (record.get("certificate") or {}).get("status") == "CERTIFIED_TRACE"
+            if _trace_certificate_allowed(record)
+            and (record.get("certificate") or {}).get("status") == "CERTIFIED_TRACE"
         ]
         lookup_attempts = [
             record
@@ -1571,6 +1735,32 @@ def _as_document(value: Any) -> Any:
     return str(value)
 
 
+def _trace_certificate_allowed(record: Mapping[str, Any]) -> bool:
+    """Return whether one observation is allowed to carry a trace cert."""
+
+    status = str(record.get("reuse_status", ""))
+    if status == _TRACE_CAPTURE_STATUS:
+        return True
+    return (
+        status in _TRACE_HIT_STATUSES
+        and bool(record.get("reuse_hit", record.get("reused", False)))
+        and record.get("search_used", record.get("used_search")) is False
+    )
+
+
+def _trace_certificate_document(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    if not _trace_certificate_allowed(record):
+        return None
+    document: dict[str, Any] = {"status": "CERTIFIED_TRACE"}
+    digest = record.get("trace_digest", record.get("digest"))
+    if digest is not None:
+        document["trace_digest"] = digest
+    identity_digest = record.get("identity_digest")
+    if identity_digest is not None:
+        document["identity_digest"] = identity_digest
+    return document
+
+
 def _shadow_sidecar_records(metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Normalize C shadow observations for the runner's common sidecar schema."""
 
@@ -1584,17 +1774,26 @@ def _shadow_sidecar_records(metadata: dict[str, Any] | None) -> list[dict[str, A
             {
                 **observation,
                 "record_kind": "shadow_sidecar",
-                "reuse_status": "TRACE_CAPTURED",
+                "reuse_status": _TRACE_CAPTURE_STATUS,
                 "reuse_lookup_status": "TRACE_CAPTURED",
                 "reuse_hit": False,
                 "search_used": True,
                 "certificate": {"status": "CERTIFIED_TRACE"},
+                "certificate_status": "CERTIFIED_TRACE",
             }
         )
     for observation in metadata.get("reuse_outcomes", ()):
         if not isinstance(observation, dict):
             continue
         status = str(observation.get("status", ""))
+        certificate = _trace_certificate_document(
+            {
+                **observation,
+                "reuse_status": status,
+                "reuse_hit": bool(observation.get("reused", False)),
+                "search_used": bool(observation.get("used_search", False)),
+            }
+        )
         records.append(
             {
                 **observation,
@@ -1603,7 +1802,10 @@ def _shadow_sidecar_records(metadata: dict[str, Any] | None) -> list[dict[str, A
                 "reuse_lookup_status": status,
                 "reuse_hit": bool(observation.get("reused", False)),
                 "search_used": bool(observation.get("used_search", False)),
-                "certificate": {"status": "CERTIFIED_TRACE"},
+                "certificate": certificate,
+                "certificate_status": (
+                    certificate.get("status") if certificate is not None else None
+                ),
                 "zero_search_metrics": (
                     {"expanded_states": 0, "edge_evaluations": 0}
                     if observation.get("reused") and not observation.get("used_search")
@@ -2148,6 +2350,9 @@ def _manifest(
             ),
             "overall_median_improvement_floor_percent": _M2_TOTAL_IMPROVEMENT_FLOOR_PERCENT,
             "per_layer_objective_regression_ceiling_percent": _M2_CELL_REGRESSION_CEILING_PERCENT,
+            "full_voyage_trace_source_overhead_ceiling_percent": (
+                _M2_TRACE_SOURCE_OVERHEAD_CEILING_PERCENT
+            ),
             "overall_p95_regression_ceiling_percent": _M2_P95_REGRESSION_CEILING_PERCENT,
             "rss_ratio_ceiling": 1.10,
             "expected_trace_captured": _M2_EXPECTED_TRACE_COUNT,
