@@ -624,6 +624,112 @@ def test_m2_summary_enforces_12_routes_timing_reuse_rss_and_swap() -> None:
     assert bad_summary["gate_verdict"] == "FAIL"
 
 
+def test_cold_path_diagnostic_extracts_paired_timing_without_formal_gate() -> None:
+    cases = []
+    for repetition, execution_order, control_wall, candidate_wall in (
+        (1, "control-first", 100.0, 80.0),
+        (2, "candidate-first", 110.0, 90.0),
+        (3, "control-first", 90.0, 85.0),
+    ):
+        records = {
+            "control": [
+                {
+                    "layer": "rolling_0_24h",
+                    "objective": "fastest",
+                    "wall_ms": control_wall,
+                    "expanded": 20,
+                    "edge": 40,
+                    "search_used": True,
+                    "reuse_status": "CONTROL_SEARCH",
+                    "route_digest": "route-digest",
+                    "pre_ms": 2.0,
+                    "planner_ms": 90.0,
+                    "post_ms": 8.0,
+                    "trace_context_present": False,
+                    "trace_reuse_used": False,
+                    "state_counts": {"expanded_labels": 20},
+                    "identity_digest": "identity-control",
+                }
+            ],
+            "candidate": [
+                {
+                    "layer": "rolling_0_24h",
+                    "objective": "fastest",
+                    "wall_ms": candidate_wall,
+                    "expanded": 18,
+                    "edge": 36,
+                    "search_used": True,
+                    "reuse_status": "COLD_CONTROL",
+                    "route_digest": "route-digest",
+                    "pre_ms": 12.0,
+                    "planner_ms": 90.0,
+                    "post_ms": 8.0,
+                    "trace_context_present": True,
+                    "trace_reuse_used": False,
+                    "state_counts": {"expanded_labels": 20},
+                    "identity_digest": "identity-candidate",
+                }
+            ],
+        }
+        decomposition = shadow._cold_path_timing_decomposition(
+            records,
+            layer="rolling_0_24h",
+            objective="fastest",
+        )
+        assert decomposition["cold_path_observation"]["candidate_is_cold_search"] is True
+        assert decomposition["control"]["planner_ms"] == pytest.approx(90.0)
+        assert decomposition["candidate"]["trace_context_present"] is True
+        assert decomposition["candidate"]["trace_reuse_used"] is False
+        cases.append(
+            {
+                "status": "PASS",
+                "execution_order": execution_order,
+                "timing_decomposition": decomposition,
+                "track_resources": {
+                    "control": {"peak_rss_kib": 100},
+                    "candidate": {"peak_rss_kib": 105},
+                },
+                "repetition": repetition,
+            }
+        )
+
+    summary = shadow._cold_path_diagnostic_summary(
+        cases,
+        layer="rolling_0_24h",
+        objective="fastest",
+    )
+    assert summary["diagnostic_only"] is True
+    assert summary["formal_gate_verdict"] == "NOT_APPLICABLE"
+    assert summary["status"] == "OBSERVED"
+    assert summary["valid_pair_count"] == 3
+    assert summary["execution_order_counts"] == {
+        "control-first": 2,
+        "candidate-first": 1,
+    }
+    assert summary["cold_search_pair_count"] == 3
+    assert summary["route_digest_equal_pair_count"] == 3
+    assert summary["timing"]["control_wall_ms"]["median"] == pytest.approx(100.0)
+    assert summary["timing"]["candidate_wall_ms"]["median"] == pytest.approx(85.0)
+    assert summary["timing"]["phase_ms"]["planner_ms"]["candidate"]["median"] == pytest.approx(
+        90.0
+    )
+    assert summary["timing"]["phase_ms"]["pre_ms"]["candidate_minus_control"][
+        "median"
+    ] == pytest.approx(10.0)
+    assert summary["rss"]["candidate_over_control_ratio"]["median"] == pytest.approx(
+        1.05
+    )
+
+
+def test_cold_path_diagnostic_rejects_missing_or_duplicate_target_row() -> None:
+    with pytest.raises(ValueError, match="expected one timing row"):
+        shadow._diagnostic_timing_row(
+            [],
+            layer="rolling_0_24h",
+            objective="fastest",
+        )
+
+
 def test_prepared_shadow_track_requires_strict_single_track_api() -> None:
     prepared = SimpleNamespace(prepared=SimpleNamespace())
     with pytest.raises(RuntimeError, match="single-track shadow API"):

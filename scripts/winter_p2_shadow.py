@@ -1118,6 +1118,14 @@ def _timing_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "trace_status": ("trace_status",),
             "reuse_status": ("reuse_status",),
             "route_digest": ("route_digest",),
+            "pre_ms": ("pre_ms",),
+            "planner_ms": ("planner_ms",),
+            "post_ms": ("post_ms",),
+            "trace_context_present": ("trace_context_present",),
+            "trace_reuse_used": ("trace_reuse_used",),
+            "state_counts": ("state_counts",),
+            "identity_digest": ("identity_digest",),
+            "identity_summary": ("identity_summary",),
         }.items():
             for alias in aliases:
                 if alias in record:
@@ -1130,6 +1138,196 @@ def _timing_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _timing_cell_map(records: list[dict[str, Any]]) -> dict[tuple[str, str], float]:
     rows = _timing_rows(records)
     return {(row["layer"], row["objective"]): row["wall_ms"] for row in rows}
+
+
+def _diagnostic_timing_row(
+    records: list[dict[str, Any]],
+    *,
+    layer: str,
+    objective: str,
+) -> dict[str, Any]:
+    matches = [
+        row
+        for row in _timing_rows(records)
+        if row["layer"] == layer and row["objective"] == objective
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"cold-path diagnostic expected one timing row for {layer}/{objective}, "
+            f"found {len(matches)}"
+        )
+    return dict(matches[0])
+
+
+def _cold_path_timing_decomposition(
+    records: Mapping[str, list[dict[str, Any]]],
+    *,
+    layer: str,
+    objective: str,
+) -> dict[str, Any]:
+    """Extract one paired control/candidate cold-path observation.
+
+    This is intentionally a pure adapter over records already produced by the
+    isolated runner.  It does not execute planners, publish routes, or apply a
+    formal M2 gate.
+    """
+
+    control = _diagnostic_timing_row(
+        records.get("control", []), layer=layer, objective=objective
+    )
+    candidate = _diagnostic_timing_row(
+        records.get("candidate", []), layer=layer, objective=objective
+    )
+    control_wall = float(control["wall_ms"])
+    candidate_wall = float(candidate["wall_ms"])
+    return {
+        "target": {"layer": layer, "objective": objective},
+        "control": control,
+        "candidate": candidate,
+        "paired": {
+            "wall_delta_ms": candidate_wall - control_wall,
+            "candidate_over_control_percent": (
+                (candidate_wall - control_wall) / control_wall * 100.0
+                if control_wall > 0
+                else None
+            ),
+            "route_digest_equal": (
+                control.get("route_digest") is not None
+                and control.get("route_digest") == candidate.get("route_digest")
+            ),
+        },
+        "cold_path_observation": {
+            "candidate_reuse_status": candidate.get("reuse_status"),
+            "candidate_search_used": candidate.get("search_used"),
+            "candidate_is_cold_search": (
+                candidate.get("reuse_status") == "COLD_CONTROL"
+                and candidate.get("search_used") is True
+            ),
+        },
+    }
+
+
+def _cold_path_diagnostic_summary(
+    cases: list[dict[str, Any]],
+    *,
+    layer: str,
+    objective: str,
+) -> dict[str, Any]:
+    """Summarize paired cold-path observations without a formal gate."""
+
+    valid_cases = [
+        case
+        for case in cases
+        if case.get("status") == "PASS"
+        and isinstance(case.get("timing_decomposition"), dict)
+        and case["timing_decomposition"].get("target")
+        == {"layer": layer, "objective": objective}
+        and isinstance(case["timing_decomposition"].get("control"), dict)
+        and isinstance(case["timing_decomposition"].get("candidate"), dict)
+    ]
+    control_rows = [case["timing_decomposition"]["control"] for case in valid_cases]
+    candidate_rows = [case["timing_decomposition"]["candidate"] for case in valid_cases]
+    control_wall = [float(row["wall_ms"]) for row in control_rows]
+    candidate_wall = [float(row["wall_ms"]) for row in candidate_rows]
+    wall_deltas = [
+        candidate - control
+        for candidate, control in zip(candidate_wall, control_wall, strict=True)
+    ]
+    overheads = [
+        (candidate - control) / control * 100.0
+        for candidate, control in zip(candidate_wall, control_wall, strict=True)
+        if control > 0
+    ]
+
+    def _series(values: list[float]) -> dict[str, float | None]:
+        return {
+            "median": _nearest_rank(values, 0.5),
+            "p95": _nearest_rank(values, 0.95),
+        }
+
+    rss_ratios: list[float] = []
+    for case in valid_cases:
+        resources = case.get("track_resources", {})
+        control_rss = resources.get("control", {}).get("peak_rss_kib")
+        candidate_rss = resources.get("candidate", {}).get("peak_rss_kib")
+        if isinstance(control_rss, (int, float)) and control_rss > 0 and isinstance(
+            candidate_rss, (int, float)
+        ):
+            rss_ratios.append(float(candidate_rss) / float(control_rss))
+
+    candidate_statuses: dict[str, int] = {}
+    cold_search_pair_count = 0
+    route_digest_equal_count = 0
+    for row in candidate_rows:
+        status = str(row.get("reuse_status", "UNSPECIFIED"))
+        candidate_statuses[status] = candidate_statuses.get(status, 0) + 1
+    for case in valid_cases:
+        decomposition = case["timing_decomposition"]
+        if decomposition["cold_path_observation"]["candidate_is_cold_search"]:
+            cold_search_pair_count += 1
+        if decomposition["paired"]["route_digest_equal"]:
+            route_digest_equal_count += 1
+    order_counts: dict[str, int] = {}
+    for case in cases:
+        order = str(case.get("execution_order", "UNSPECIFIED"))
+        order_counts[order] = order_counts.get(order, 0) + 1
+    return {
+        "schema_version": "orchestrator.winter-cold-path-diagnostic-summary.v1",
+        "diagnostic_only": True,
+        "formal_gate_verdict": "NOT_APPLICABLE",
+        "status": (
+            "OBSERVED" if cases and len(valid_cases) == len(cases) else "INCOMPLETE"
+        ),
+        "target": {"layer": layer, "objective": objective},
+        "sample_count": len(cases),
+        "valid_pair_count": len(valid_cases),
+        "execution_order_counts": order_counts,
+        "candidate_reuse_status_counts": candidate_statuses,
+        "cold_search_pair_count": cold_search_pair_count,
+        "route_digest_equal_pair_count": route_digest_equal_count,
+        "timing": {
+            "control_wall_ms": _series(control_wall),
+            "candidate_wall_ms": _series(candidate_wall),
+            "candidate_minus_control_wall_ms": _series(wall_deltas),
+            "candidate_over_control_percent": _series(overheads),
+            "control_expanded": _series(
+                [float(row.get("expanded", 0)) for row in control_rows]
+            ),
+            "candidate_expanded": _series(
+                [float(row.get("expanded", 0)) for row in candidate_rows]
+            ),
+            "control_edge": _series(
+                [float(row.get("edge", 0)) for row in control_rows]
+            ),
+            "candidate_edge": _series(
+                [float(row.get("edge", 0)) for row in candidate_rows]
+            ),
+            "phase_ms": {
+                phase: {
+                    "control": _series(
+                        [float(row.get(phase, 0.0)) for row in control_rows]
+                    ),
+                    "candidate": _series(
+                        [float(row.get(phase, 0.0)) for row in candidate_rows]
+                    ),
+                    "candidate_minus_control": _series(
+                        [
+                            float(candidate.get(phase, 0.0))
+                            - float(control.get(phase, 0.0))
+                            for control, candidate in zip(
+                                control_rows, candidate_rows, strict=True
+                            )
+                        ]
+                    ),
+                }
+                for phase in ("pre_ms", "planner_ms", "post_ms")
+            },
+        },
+        "rss": {
+            "comparison": "independent_child_process",
+            "candidate_over_control_ratio": _series(rss_ratios),
+        },
+    }
 
 
 def _trace_source_overhead(
@@ -1969,6 +2167,8 @@ def _prepared_shadow_track(
         "scratch_published": bool(getattr(result, "scratch_published", False)),
         "reuse_outcomes": _as_document(getattr(result, "reuse_outcomes", ())),
         "trace_observations": _as_document(getattr(result, "trace_observations", ())),
+        "status_counts": _as_document(getattr(result, "status_counts", {})),
+        "identity_digests": _as_document(getattr(result, "identity_digests", ())),
         "scratch_proof": scratch_proof,
         "api": (
             "RiskSourcePlanningIngress.prepare/"
