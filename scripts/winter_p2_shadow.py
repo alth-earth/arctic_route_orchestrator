@@ -220,12 +220,16 @@ def _swap_counters() -> dict[str, int] | None:
     counters: dict[str, int] = {}
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
-            name, _, value = line.partition(" ")
-            if name in {"pswpin", "pswpout"}:
-                counters[name] = int(value.strip())
+            parts = line.split()
+            if len(parts) != 2 or parts[0] not in {"pswpin", "pswpout"}:
+                continue
+            value = int(parts[1])
+            if value < 0:
+                return None
+            counters[parts[0]] = value
     except (OSError, ValueError):
         return None
-    return counters if counters else None
+    return counters if set(counters) == {"pswpin", "pswpout"} else None
 
 
 def _process_swap_kib(pid: int | None = None) -> int | None:
@@ -236,7 +240,10 @@ def _process_swap_kib(pid: int | None = None) -> int | None:
     missing host counter from being mistaken for a zero-swap observation.
     """
 
-    process_id = os.getpid() if pid is None else int(pid)
+    try:
+        process_id = os.getpid() if pid is None else int(pid)
+    except (TypeError, ValueError):
+        return None
     path = Path(f"/proc/{process_id}/status")
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -246,12 +253,14 @@ def _process_swap_kib(pid: int | None = None) -> int | None:
             if len(parts) < 2:
                 return None
             value = int(parts[1])
+            if value < 0:
+                return None
             unit = parts[2].lower() if len(parts) >= 3 else "kb"
             if unit in {"kb", "kib"}:
                 return value
-            if unit == "mb":
+            if unit in {"mb", "mib"}:
                 return value * 1024
-            return value
+            return None
     except (OSError, ValueError, IndexError):
         return None
     return None
@@ -290,10 +299,127 @@ def _swap_delta(
 ) -> dict[str, int] | None:
     if before is None or after is None:
         return None
-    return {
-        name: max(0, int(after.get(name, 0)) - int(before.get(name, 0)))
+    names = ("pswpin", "pswpout")
+    if set(before) != set(names) or set(after) != set(names):
+        return None
+    values: dict[str, int] = {}
+    for name in names:
+        before_value = before[name]
+        after_value = after[name]
+        if (
+            isinstance(before_value, bool)
+            or not isinstance(before_value, int)
+            or before_value < 0
+            or isinstance(after_value, bool)
+            or not isinstance(after_value, int)
+            or after_value < 0
+            or after_value < before_value
+        ):
+            return None
+        values[name] = after_value - before_value
+    return values
+
+
+def _process_swap_delta(
+    before_kib: int | None,
+    after_kib: int | None,
+) -> int | None:
+    if (
+        before_kib is None
+        or after_kib is None
+        or isinstance(before_kib, bool)
+        or not isinstance(before_kib, int)
+        or isinstance(after_kib, bool)
+        or not isinstance(after_kib, int)
+        or before_kib < 0
+        or after_kib < 0
+        or after_kib < before_kib
+    ):
+        return None
+    return after_kib - before_kib
+
+
+def _swap_measurement_status(
+    *,
+    swap_before: dict[str, int] | None,
+    swap_after: dict[str, int] | None,
+    process_swap_before_kib: int | None,
+    process_swap_after_kib: int | None,
+) -> str:
+    """Classify swap evidence without turning unavailable data into zero."""
+
+    if (
+        swap_before is None
+        or swap_after is None
+        or process_swap_before_kib is None
+        or process_swap_after_kib is None
+    ):
+        return "NOT_MEASURED"
+    host_delta = _swap_delta(swap_before, swap_after)
+    process_delta = _process_swap_delta(
+        process_swap_before_kib,
+        process_swap_after_kib,
+    )
+    if host_delta is None or process_delta is None:
+        return "FAIL"
+    if any(host_delta[name] != 0 for name in ("pswpin", "pswpout")) or process_delta != 0:
+        return "FAIL"
+    return "PASS"
+
+
+def _valid_swap_delta(value: Any) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {"pswpin", "pswpout"}:
+        return False
+    return all(
+        isinstance(value[name], int)
+        and not isinstance(value[name], bool)
+        and value[name] >= 0
         for name in ("pswpin", "pswpout")
-    }
+    )
+
+
+def _valid_process_swap_delta(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _swap_measurement_complete(resources: Mapping[str, Any]) -> bool:
+    measurement = resources.get("swap_measurement")
+    return (
+        isinstance(measurement, Mapping)
+        and measurement.get("status") == "PASS"
+        and _valid_swap_delta(resources.get("swap_delta"))
+        and _valid_process_swap_delta(resources.get("process_swap_delta_kib"))
+    )
+
+
+def _swap_observation_pass(resources: Mapping[str, Any]) -> bool:
+    if not _swap_measurement_complete(resources):
+        return False
+    host_delta = resources["swap_delta"]
+    return (
+        host_delta["pswpin"] == 0
+        and host_delta["pswpout"] == 0
+        and resources["process_swap_delta_kib"] == 0
+    )
+
+
+def _cpu_measurement_status(
+    *,
+    cpu_pin_cpu: Any,
+    cpu_pin_succeeded: Any,
+    cpu_affinity: Any,
+) -> str:
+    if cpu_pin_succeeded is None or cpu_pin_cpu is None or cpu_affinity is None:
+        return "NOT_MEASURED"
+    if (
+        cpu_pin_succeeded is not True
+        or isinstance(cpu_pin_cpu, bool)
+        or not isinstance(cpu_pin_cpu, int)
+        or not isinstance(cpu_affinity, list)
+        or cpu_affinity != [cpu_pin_cpu]
+    ):
+        return "FAIL"
+    return "PASS"
 
 
 def _nearest_rank(values: list[float], percentile: float) -> float | None:
@@ -1182,6 +1308,9 @@ def _timing_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "state_counts": ("state_counts",),
             "identity_digest": ("identity_digest",),
             "identity_summary": ("identity_summary",),
+            "edge_geometry_cache_before": ("edge_geometry_cache_before",),
+            "edge_geometry_cache_after": ("edge_geometry_cache_after",),
+            "edge_geometry_cache_delta": ("edge_geometry_cache_delta",),
         }.items():
             for alias in aliases:
                 if alias in record:
@@ -1594,6 +1723,9 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
     swap_deltas: list[dict[str, int]] = []
     swap_measurement_statuses: list[str] = []
     swap_measurement_incomplete = False
+    cpu_observations: list[dict[str, Any]] = []
+    cpu_measurement_statuses: list[str] = []
+    cpu_measurement_incomplete = False
     for case in cases:
         counts = _trace_counts(case.get("records", {}).get("candidate", []))
         timing_evidence = _reuse_timing_evidence(
@@ -1637,26 +1769,53 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         resources = case.get("track_resources", {})
         case_track_resources = [
             resources.get(track) for track in ("control", "candidate")
-        ] if isinstance(resources, dict) else []
-        for track_resources in case_track_resources:
+        ] if isinstance(resources, dict) else [None, None]
+        for track, track_resources in zip(
+            ("control", "candidate"), case_track_resources, strict=True
+        ):
             if not isinstance(track_resources, dict):
+                swap_measurement_statuses.append("NOT_MEASURED")
                 swap_measurement_incomplete = True
-                continue
-            measurement = track_resources.get("swap_measurement")
-            if isinstance(measurement, dict) and measurement.get("status") is not None:
-                swap_measurement_statuses.append(str(measurement["status"]))
-            elif swap_measurement_statuses:
-                # Once a new-format track reports a status, a peer track that
-                # omits it is incomplete evidence, even if it has a legacy
-                # counter delta.
-                swap_measurement_incomplete = True
-            if isinstance(track_resources.get("swap_delta"), dict):
-                swap_deltas.append(
+                cpu_measurement_statuses.append("NOT_MEASURED")
+                cpu_measurement_incomplete = True
+                cpu_observations.append(
                     {
-                        name: int(track_resources["swap_delta"].get(name, 0))
-                        for name in ("pswpin", "pswpout")
+                        "case_id": case.get("case_id"),
+                        "track": track,
+                        "status": "NOT_MEASURED",
                     }
                 )
+                continue
+            measurement = track_resources.get("swap_measurement")
+            reported_swap_status = (
+                str(measurement.get("status"))
+                if isinstance(measurement, dict) and measurement.get("status") is not None
+                else "NOT_MEASURED"
+            )
+            swap_measurement_statuses.append(reported_swap_status)
+            if _valid_swap_delta(track_resources.get("swap_delta")):
+                swap_deltas.append(dict(track_resources["swap_delta"]))
+            if not _swap_observation_pass(track_resources):
+                swap_measurement_incomplete = True
+
+            cpu_status = _cpu_measurement_status(
+                cpu_pin_cpu=track_resources.get("cpu_pin_cpu"),
+                cpu_pin_succeeded=track_resources.get("cpu_pin_succeeded"),
+                cpu_affinity=track_resources.get("cpu_affinity"),
+            )
+            cpu_measurement_statuses.append(cpu_status)
+            if cpu_status != "PASS":
+                cpu_measurement_incomplete = True
+            cpu_observations.append(
+                {
+                    "case_id": case.get("case_id"),
+                    "track": track,
+                    "pin_cpu": track_resources.get("cpu_pin_cpu"),
+                    "pin_succeeded": track_resources.get("cpu_pin_succeeded"),
+                    "affinity": track_resources.get("cpu_affinity"),
+                    "status": cpu_status,
+                }
+            )
         if case.get("rss_scope") == "independent_child_process":
             control_rss = resources.get("control", {}).get("peak_rss_kib")
             candidate_rss = resources.get("candidate", {}).get("peak_rss_kib")
@@ -1716,17 +1875,38 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
     reuse_gate = bool(expected_reuse) and all(expected_reuse)
     reuse_timing_gate = bool(reuse_timing_evidence) and all(reuse_timing_evidence)
     resource_gate = independent_rss and (rss_median is not None and rss_median <= 1.10)
-    swap_gate = bool(swap_deltas) and all(
-        delta["pswpin"] == 0 and delta["pswpout"] == 0 for delta in swap_deltas
+    swap_measurement_incomplete = swap_measurement_incomplete or (
+        len(swap_measurement_statuses) != 2 * len(cases)
     )
-    if swap_measurement_statuses:
-        swap_measurement_incomplete = swap_measurement_incomplete or (
-            len(swap_measurement_statuses) != 2 * len(cases)
+    swap_gate = (
+        bool(cases)
+        and len(swap_deltas) == 2 * len(cases)
+        and len(swap_measurement_statuses) == 2 * len(cases)
+        and all(status == "PASS" for status in swap_measurement_statuses)
+        and not swap_measurement_incomplete
+        and all(delta["pswpin"] == 0 and delta["pswpout"] == 0 for delta in swap_deltas)
+    )
+    cpu_measurement_incomplete = cpu_measurement_incomplete or (
+        len(cpu_measurement_statuses) != 2 * len(cases)
+    )
+    cpu_affinity_gate = (
+        bool(cases)
+        and len(cpu_observations) == 2 * len(cases)
+        and all(status == "PASS" for status in cpu_measurement_statuses)
+        and not cpu_measurement_incomplete
+        and len(
+            {
+                (
+                    observation.get("pin_cpu"),
+                    tuple(observation["affinity"])
+                    if isinstance(observation.get("affinity"), list)
+                    else None,
+                )
+                for observation in cpu_observations
+            }
         )
-        swap_gate = swap_gate and all(
-            status == "PASS" for status in swap_measurement_statuses
-        )
-        swap_gate = swap_gate and not swap_measurement_incomplete
+        == 1
+    )
     gate_verdict = (
         "PASS"
         if sufficient
@@ -1739,6 +1919,7 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         and trace_source_gate
         and resource_gate
         and swap_gate
+        and cpu_affinity_gate
         else "NOT_EVALUATED_INSUFFICIENT_REPETITIONS"
         if not sufficient
         else "FAIL"
@@ -1757,6 +1938,7 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         and screening_trace_source_gate
         and resource_gate
         and swap_gate
+        and cpu_affinity_gate
         else "NOT_EVALUATED_INSUFFICIENT_REPETITIONS"
         if not screening_sufficient
         else "FAIL"
@@ -1771,6 +1953,7 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
             "PASS" if reuse_timing_gate else "FAIL"
         ),
         "determinism_gate": "PASS" if deterministic else "FAIL",
+        "cpu_affinity_gate": "PASS" if cpu_affinity_gate else "FAIL",
         "trace_source_overhead": {
             "layer": _M2_TRACE_SOURCE_LAYER,
             "ceiling_percent": _M2_TRACE_SOURCE_OVERHEAD_CEILING_PERCENT,
@@ -1803,6 +1986,17 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
             "observations": swap_deltas,
             "measurement_statuses": swap_measurement_statuses,
             "gate": "PASS" if swap_gate else "FAIL" if sufficient else "NOT_MEASURED",
+        },
+        "cpu": {
+            "observations": cpu_observations,
+            "measurement_statuses": cpu_measurement_statuses,
+            "gate": (
+                "PASS"
+                if cpu_affinity_gate
+                else "FAIL"
+                if sufficient
+                else "NOT_MEASURED"
+            ),
         },
         "expected_trace_hit_cold": {
             "trace_captured": _M2_EXPECTED_TRACE_COUNT,
@@ -2044,18 +2238,19 @@ def _resource_snapshot(
     swap_after: dict[str, int] | None = None,
     process_swap_before_kib: int | None = None,
     process_swap_after_kib: int | None = None,
+    cpu_pin_cpu: int | None = None,
+    cpu_pin_succeeded: bool | None = None,
 ) -> dict[str, Any]:
     usage = resource.getrusage(resource.RUSAGE_SELF)
-    process_swap_delta = None
-    if process_swap_before_kib is not None and process_swap_after_kib is not None:
-        process_swap_delta = max(
-            0,
-            int(process_swap_after_kib) - int(process_swap_before_kib),
-        )
+    process_swap_delta = _process_swap_delta(
+        process_swap_before_kib,
+        process_swap_after_kib,
+    )
     kernel_measured = swap_before is not None and swap_after is not None
     process_measured = (
         process_swap_before_kib is not None and process_swap_after_kib is not None
     )
+    cpu_affinity = _worker_cpu_affinity()
     return {
         "wall_seconds": time.perf_counter() - started,
         "cpu_seconds": usage.ru_utime + usage.ru_stime,
@@ -2066,11 +2261,26 @@ def _resource_snapshot(
         "process_swap_before_kib": process_swap_before_kib,
         "process_swap_after_kib": process_swap_after_kib,
         "process_swap_delta_kib": process_swap_delta,
-        "cpu_affinity": _worker_cpu_affinity(),
+        "pid": os.getpid(),
+        "cpu_pin_cpu": cpu_pin_cpu,
+        "cpu_pin_succeeded": cpu_pin_succeeded,
+        "cpu_affinity": cpu_affinity,
+        "cpu_measurement": {
+            "status": _cpu_measurement_status(
+                cpu_pin_cpu=cpu_pin_cpu,
+                cpu_pin_succeeded=cpu_pin_succeeded,
+                cpu_affinity=cpu_affinity,
+            )
+        },
         "swap_measurement": {
             "kernel_counters": kernel_measured,
             "process_vm_swap": process_measured,
-            "status": "PASS" if kernel_measured and process_measured else "NOT_MEASURED",
+            "status": _swap_measurement_status(
+                swap_before=swap_before,
+                swap_after=swap_after,
+                process_swap_before_kib=process_swap_before_kib,
+                process_swap_after_kib=process_swap_after_kib,
+            ),
         },
     }
 
@@ -2205,6 +2415,8 @@ def _prepared_shadow_track(
     prepared: _PreparedShadow,
     track: str,
     candidate_mode: str,
+    cpu_pin_cpu: int | None = None,
+    cpu_pin_succeeded: bool | None = None,
 ) -> tuple[Any, list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     """Execute exactly one formal-prepared shadow track.
 
@@ -2265,6 +2477,8 @@ def _prepared_shadow_track(
         swap_after=swap_after,
         process_swap_before_kib=process_swap_before_kib,
         process_swap_after_kib=process_swap_after_kib,
+        cpu_pin_cpu=cpu_pin_cpu,
+        cpu_pin_succeeded=cpu_pin_succeeded,
     )
     metadata = {
         "production_published": False,
@@ -2483,7 +2697,8 @@ def _run_isolated_case(
 def _run_track_worker(args: argparse.Namespace) -> int:
     if args._worker_result is None or args._track_worker is None:
         raise ValueError("track worker requires --_worker-result and --_track-worker")
-    _pin_worker_cpu()
+    cpu_pin_cpu = _pin_worker_cpu()
+    cpu_pin_succeeded = cpu_pin_cpu is not None
     started = time.perf_counter()
     swap_before = _swap_counters()
     process_swap_before_kib = _process_swap_kib()
@@ -2496,6 +2711,8 @@ def _run_track_worker(args: argparse.Namespace) -> int:
                 prepared=prepared,
                 track=args._track_worker,
                 candidate_mode=args.candidate_mode,
+                cpu_pin_cpu=cpu_pin_cpu,
+                cpu_pin_succeeded=cpu_pin_succeeded,
             )
             payload = {
                 "ok": True,
@@ -2551,6 +2768,8 @@ def _run_track_worker(args: argparse.Namespace) -> int:
                         swap_after=_swap_counters(),
                         process_swap_before_kib=process_swap_before_kib,
                         process_swap_after_kib=_process_swap_kib(),
+                        cpu_pin_cpu=cpu_pin_cpu,
+                        cpu_pin_succeeded=cpu_pin_succeeded,
                     ),
                 }
     except Exception as error:
@@ -2565,6 +2784,8 @@ def _run_track_worker(args: argparse.Namespace) -> int:
                 swap_after=_swap_counters(),
                 process_swap_before_kib=process_swap_before_kib,
                 process_swap_after_kib=_process_swap_kib(),
+                cpu_pin_cpu=cpu_pin_cpu,
+                cpu_pin_succeeded=cpu_pin_succeeded,
             ),
         }
     _write_json(args._worker_result, payload)

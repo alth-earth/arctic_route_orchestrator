@@ -1,10 +1,9 @@
 """Run a bounded, target-only Winter cold-path diagnostic.
 
 This is a research-only companion to ``winter_p2_shadow.py``.  It keeps the
-formal runner unchanged and executes only the known failing
-``rolling_0_24h x fastest`` cold search in fresh child processes.  The target
-is intentionally not a four-layer publication and the output is never a
-formal M2 verdict.
+formal runner unchanged and executes one selected rolling or executable cold
+search in fresh child processes.  The target is intentionally not a
+four-layer publication and the output is never a formal M2 verdict.
 """
 
 from __future__ import annotations
@@ -59,7 +58,8 @@ def _prepare_args(args: argparse.Namespace) -> SimpleNamespace:
 
 
 def _worker(args: argparse.Namespace) -> int:
-    shadow._pin_worker_cpu()
+    cpu_pin_cpu = shadow._pin_worker_cpu()
+    cpu_pin_succeeded = cpu_pin_cpu is not None
     prepared = shadow._prepare(_prepare_args(args))
     planner_config = prepared.configuration.planner
     target_layer = str(args.target_layer)
@@ -138,27 +138,33 @@ def _worker(args: argparse.Namespace) -> int:
     record["swap_delta"] = shadow._swap_delta(swap_before, swap_after)
     record["process_swap_before_kib"] = process_swap_before_kib
     record["process_swap_after_kib"] = process_swap_after_kib
-    record["process_swap_delta_kib"] = (
-        max(0, process_swap_after_kib - process_swap_before_kib)
-        if process_swap_before_kib is not None and process_swap_after_kib is not None
-        else None
+    record["process_swap_delta_kib"] = shadow._process_swap_delta(
+        process_swap_before_kib,
+        process_swap_after_kib,
     )
     record["swap_measurement"] = {
         "kernel_counters": swap_before is not None and swap_after is not None,
         "process_vm_swap": (
             process_swap_before_kib is not None and process_swap_after_kib is not None
         ),
-        "status": (
-            "PASS"
-            if swap_before is not None
-            and swap_after is not None
-            and process_swap_before_kib is not None
-            and process_swap_after_kib is not None
-            else "NOT_MEASURED"
+        "status": shadow._swap_measurement_status(
+            swap_before=swap_before,
+            swap_after=swap_after,
+            process_swap_before_kib=process_swap_before_kib,
+            process_swap_after_kib=process_swap_after_kib,
         ),
     }
     record["pid"] = os.getpid()
+    record["cpu_pin_cpu"] = cpu_pin_cpu
+    record["cpu_pin_succeeded"] = cpu_pin_succeeded
     record["cpu_affinity"] = shadow._worker_cpu_affinity()
+    record["cpu_measurement"] = {
+        "status": shadow._cpu_measurement_status(
+            cpu_pin_cpu=cpu_pin_cpu,
+            cpu_pin_succeeded=cpu_pin_succeeded,
+            cpu_affinity=record["cpu_affinity"],
+        )
+    }
     record["python"] = platform.python_version()
     args.worker_output.write_text(
         json.dumps(record, ensure_ascii=False, sort_keys=True), encoding="utf-8"
@@ -229,7 +235,9 @@ def _run_pair(
             "expanded_equal": control.get("expanded") == candidate.get("expanded"),
             "edge_equal": control.get("edge") == candidate.get("edge"),
             "cache_delta_equal": (
-                control.get("edge_geometry_cache_delta")
+                control.get("edge_geometry_cache_delta") is not None
+                and candidate.get("edge_geometry_cache_delta") is not None
+                and control.get("edge_geometry_cache_delta")
                 == candidate.get("edge_geometry_cache_delta")
             ),
             "candidate_regression_percent": ((candidate_wall / control_wall) - 1.0) * 100.0,
@@ -237,22 +245,53 @@ def _run_pair(
             "pre_delta_ms": float(candidate["pre_ms"]) - float(control["pre_ms"]),
             "post_delta_ms": float(candidate["post_ms"]) - float(control["post_ms"]),
             "swap_zero": all(
-                int((record.get("swap_delta") or {}).get(name, 0)) == 0
+                shadow._swap_observation_pass(record)
                 for record in (control, candidate)
-                for name in ("pswpin", "pswpout")
             ),
             "swap_measured": all(
                 isinstance(record.get("swap_measurement"), dict)
                 and record["swap_measurement"].get("status") == "PASS"
                 for record in (control, candidate)
             ),
+            "cpu_affinity_equal": (
+                shadow._cpu_measurement_status(
+                    cpu_pin_cpu=control.get("cpu_pin_cpu"),
+                    cpu_pin_succeeded=control.get("cpu_pin_succeeded"),
+                    cpu_affinity=control.get("cpu_affinity"),
+                )
+                == "PASS"
+                and shadow._cpu_measurement_status(
+                    cpu_pin_cpu=candidate.get("cpu_pin_cpu"),
+                    cpu_pin_succeeded=candidate.get("cpu_pin_succeeded"),
+                    cpu_affinity=candidate.get("cpu_affinity"),
+                )
+                == "PASS"
+                and control.get("cpu_pin_cpu") == candidate.get("cpu_pin_cpu")
+                and control.get("cpu_affinity") == candidate.get("cpu_affinity")
+            ),
         },
         "status": "PASS"
-        if control.get("route_digest") == candidate.get("route_digest")
+        if control.get("route_digest") is not None
+        and control.get("route_digest") == candidate.get("route_digest")
         and control.get("expanded") == candidate.get("expanded")
         and control.get("edge") == candidate.get("edge")
+        and control.get("edge_geometry_cache_delta") is not None
+        and candidate.get("edge_geometry_cache_delta") is not None
         and control.get("edge_geometry_cache_delta")
         == candidate.get("edge_geometry_cache_delta")
+        and all(
+            shadow._swap_observation_pass(record)
+            for record in (control, candidate)
+        )
+        and all(
+            shadow._cpu_measurement_status(
+                cpu_pin_cpu=record.get("cpu_pin_cpu"),
+                cpu_pin_succeeded=record.get("cpu_pin_succeeded"),
+                cpu_affinity=record.get("cpu_affinity"),
+            )
+            == "PASS"
+            for record in (control, candidate)
+        )
         else "FAIL",
     }
     return pair
@@ -322,6 +361,11 @@ def _run(args: argparse.Namespace) -> int:
         median_regression <= 3.0
         and swap_zero_pair_count == len(pairs)
         and swap_measured_pair_count == len(pairs)
+        and all(pair["paired"]["cache_delta_equal"] for pair in pairs)
+        and all(
+            pair["paired"].get("cpu_affinity_equal", False)
+            for pair in pairs
+        )
     )
     summary = {
         "schema_version": "orchestrator.winter-cold-target-summary.v1",
@@ -353,6 +397,9 @@ def _run(args: argparse.Namespace) -> int:
         "edge_equal_pair_count": sum(pair["paired"]["edge_equal"] for pair in pairs),
         "cache_delta_equal_pair_count": sum(
             pair["paired"]["cache_delta_equal"] for pair in pairs
+        ),
+        "cpu_affinity_equal_pair_count": sum(
+            pair["paired"]["cpu_affinity_equal"] for pair in pairs
         ),
         "swap_zero_pair_count": swap_zero_pair_count,
         "swap_measured_pair_count": swap_measured_pair_count,

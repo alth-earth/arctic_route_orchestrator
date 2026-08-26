@@ -111,6 +111,56 @@ def test_resource_snapshot_records_process_swap_measurement() -> None:
     assert snapshot["process_swap_delta_kib"] == 0
 
 
+def test_swap_and_cpu_measurements_fail_closed_on_invalid_evidence() -> None:
+    assert shadow._swap_delta({"pswpin": 1}, {"pswpin": 1, "pswpout": 2}) is None
+    assert shadow._swap_delta(
+        {"pswpin": 3, "pswpout": 4}, {"pswpin": 2, "pswpout": 4}
+    ) is None
+    assert shadow._process_swap_delta(8, 7) is None
+    assert (
+        shadow._swap_measurement_status(
+            swap_before=None,
+            swap_after={"pswpin": 1, "pswpout": 1},
+            process_swap_before_kib=0,
+            process_swap_after_kib=0,
+        )
+        == "NOT_MEASURED"
+    )
+    assert (
+        shadow._swap_measurement_status(
+            swap_before={"pswpin": 1, "pswpout": 1},
+            swap_after={"pswpin": 2, "pswpout": 1},
+            process_swap_before_kib=0,
+            process_swap_after_kib=0,
+        )
+        == "FAIL"
+    )
+    assert (
+        shadow._cpu_measurement_status(
+            cpu_pin_cpu=3,
+            cpu_pin_succeeded=True,
+            cpu_affinity=[3],
+        )
+        == "PASS"
+    )
+    assert (
+        shadow._cpu_measurement_status(
+            cpu_pin_cpu=3,
+            cpu_pin_succeeded=True,
+            cpu_affinity=[2, 3],
+        )
+        == "FAIL"
+    )
+    assert (
+        shadow._cpu_measurement_status(
+            cpu_pin_cpu=None,
+            cpu_pin_succeeded=None,
+            cpu_affinity=None,
+        )
+        == "NOT_MEASURED"
+    )
+
+
 def test_swap_gate_fails_when_measurement_is_explicitly_unavailable() -> None:
     # Start from the complete synthetic fixture built by the main summary test
     # and alter only one track's measurement status.  A zero counter delta is
@@ -582,6 +632,9 @@ def test_m2_summary_enforces_12_routes_timing_reuse_rss_and_swap() -> None:
             "edge": 11,
             "search_used": True,
             "reuse_status": "CONTROL_SEARCH",
+            "edge_geometry_cache_before": 0,
+            "edge_geometry_cache_after": 1,
+            "edge_geometry_cache_delta": 1,
         }
         for layer, objective in cells
     ]
@@ -605,6 +658,9 @@ def test_m2_summary_enforces_12_routes_timing_reuse_rss_and_swap() -> None:
                 "search_used": not hit,
                 "trace_status": "TRACE_CAPTURED" if status == "TRACE_CAPTURED" else None,
                 "reuse_status": status,
+                "edge_geometry_cache_before": 0,
+                "edge_geometry_cache_after": 1,
+                "edge_geometry_cache_delta": 1,
             }
         )
     sidecar = shadow._shadow_sidecar_records(
@@ -657,11 +713,21 @@ def test_m2_summary_enforces_12_routes_timing_reuse_rss_and_swap() -> None:
                     "wall_seconds": 1.0,
                     "peak_rss_kib": 100,
                     "swap_delta": {"pswpin": 0, "pswpout": 0},
+                    "process_swap_delta_kib": 0,
+                    "swap_measurement": {"status": "PASS"},
+                    "cpu_pin_cpu": 0,
+                    "cpu_pin_succeeded": True,
+                    "cpu_affinity": [0],
                 },
                 "candidate": {
                     "wall_seconds": 0.7,
                     "peak_rss_kib": 105,
                     "swap_delta": {"pswpin": 0, "pswpout": 0},
+                    "process_swap_delta_kib": 0,
+                    "swap_measurement": {"status": "PASS"},
+                    "cpu_pin_cpu": 0,
+                    "cpu_pin_succeeded": True,
+                    "cpu_affinity": [0],
                 },
             },
             "comparison": {"status": "PASS", "pair_count": 12, "pairs": pairs},
