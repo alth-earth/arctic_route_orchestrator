@@ -87,12 +87,18 @@ from arctic_route_risk import PersistentRiskStore
 from arctic_route_orchestrator.models import ExecutionSpec
 from arctic_route_orchestrator.replay.route_integrity import audit_route
 
-_SCRIPT_VERSION = "winter-p2-shadow.v3"
+_SCRIPT_VERSION = "winter-p2-shadow.v4"
 _CANDIDATE_VERSION = "temporal-label-astar.shadow.v1"
 _CONTROL_TRACE_VERSION = "time-dependent-a-star.control-trace.v1"
 _ORDER_VALUES = ("control-first", "candidate-first", "alternate")
 _CANDIDATE_MODE_VALUES = ("exact-temporal", "control-trace")
 _RSS_MODE_VALUES = ("in-process", "isolated")
+_EVIDENCE_MODE_VALUES = ("auto", "diagnostic", "screening", "formal")
+_DIAGNOSTIC_PROFILE_VALUES = (
+    "baseline",
+    "force-main-cold",
+    "post-main-normalize",
+)
 _CONTROL_TRACE_LAYER_NAMES = (
     "full_voyage",
     "main_corridor_24_72h",
@@ -493,6 +499,36 @@ def _validate_rss_mode(value: str) -> str:
     if normalized not in _RSS_MODE_VALUES:
         raise ValueError("rss-mode must be in-process or isolated")
     return normalized
+
+
+def _validate_evidence_mode(value: str) -> str:
+    normalized = str(value).strip().lower().replace("_", "-")
+    if normalized not in _EVIDENCE_MODE_VALUES:
+        raise ValueError(
+            "evidence-mode must be auto, diagnostic, screening, or formal"
+        )
+    return normalized
+
+
+def _validate_diagnostic_profile(value: str) -> str:
+    normalized = str(value).strip().lower().replace("_", "-")
+    if normalized not in _DIAGNOSTIC_PROFILE_VALUES:
+        raise ValueError(
+            "diagnostic-profile must be baseline, force-main-cold, or "
+            "post-main-normalize"
+        )
+    return normalized
+
+
+def _effective_evidence_mode(args: argparse.Namespace) -> str:
+    mode = _validate_evidence_mode(getattr(args, "evidence_mode", "auto"))
+    if mode != "auto":
+        return mode
+    if args.repetitions == _M2_SCREENING_REPETITIONS:
+        return "screening"
+    if args.repetitions >= _M2_MIN_REPETITIONS:
+        return "formal"
+    return "auto"
 
 
 def _mode_metadata(candidate_mode: str) -> dict[str, str]:
@@ -1311,6 +1347,11 @@ def _timing_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "edge_geometry_cache_before": ("edge_geometry_cache_before",),
             "edge_geometry_cache_after": ("edge_geometry_cache_after",),
             "edge_geometry_cache_delta": ("edge_geometry_cache_delta",),
+            "planner_cpu_ms": ("planner_cpu_ms",),
+            "gc_count_before": ("gc_count_before",),
+            "gc_count_after": ("gc_count_after",),
+            "gc_collections_delta": ("gc_collections_delta",),
+            "trace_state": ("trace_state",),
         }.items():
             for alias in aliases:
                 if alias in record:
@@ -1943,6 +1984,7 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         if not screening_sufficient
         else "FAIL"
     )
+    order_stratified = _order_stratified_summary(cases)
     return {
         "schema_version": "orchestrator.winter-p2-m2-summary.v1",
         "sample_count": sample_count,
@@ -2018,7 +2060,234 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "gate_verdict": gate_verdict,
         "percentile_method": "median exact; p95 nearest-rank ceil(0.95*n)-1",
+        "order_stratified": order_stratified,
     }
+
+
+_M2H_FOCUS_CELLS = (
+    ("executable_0_6h", "low_risk"),
+    ("rolling_0_24h", "fastest"),
+    ("rolling_0_24h", "low_risk"),
+    ("rolling_0_24h", "recommended"),
+)
+_DIAGNOSTIC_REGRESSION_CEILING_PERCENT = 3.0
+_DIAGNOSTIC_ORDER_REGRESSION_CEILING_PERCENT = 5.0
+_DIAGNOSTIC_ORDER_GAP_CEILING_PERCENT_POINTS = 5.0
+
+
+def _cell_regressions(
+    cases: list[dict[str, Any]],
+    *,
+    order: str | None = None,
+) -> dict[tuple[str, str], list[float]]:
+    values: dict[tuple[str, str], list[float]] = {}
+    for case in cases:
+        if case.get("status") != "PASS":
+            continue
+        if order is not None and case.get("execution_order") != order:
+            continue
+        control = _timing_cell_map(case.get("records", {}).get("control", []))
+        candidate = _timing_cell_map(case.get("records", {}).get("candidate", []))
+        for cell, control_ms in control.items():
+            candidate_ms = candidate.get(cell)
+            if candidate_ms is None or control_ms <= 0:
+                continue
+            values.setdefault(cell, []).append(
+                (float(candidate_ms) - float(control_ms)) / float(control_ms) * 100.0
+            )
+    return values
+
+
+def _order_stratified_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    """Report paired cell regressions separately for each execution order."""
+
+    orders = ("control-first", "candidate-first")
+    by_order: dict[str, Any] = {}
+    for order in orders:
+        cells = _cell_regressions(cases, order=order)
+        by_order[order] = {
+            "sample_count": sum(
+                1 for case in cases
+                if case.get("status") == "PASS"
+                and case.get("execution_order") == order
+            ),
+            "cells": {
+                f"{layer}::{objective}": {
+                    "sample_count": len(values),
+                    "median_regression_percent": _nearest_rank(values, 0.5),
+                    "p95_regression_percent": _nearest_rank(values, 0.95),
+                }
+                for (layer, objective), values in sorted(cells.items())
+            },
+        }
+    all_cells = _cell_regressions(cases)
+    overall_cells = {
+        f"{layer}::{objective}": {
+            "sample_count": len(values),
+            "median_regression_percent": _nearest_rank(values, 0.5),
+            "p95_regression_percent": _nearest_rank(values, 0.95),
+        }
+        for (layer, objective), values in sorted(all_cells.items())
+    }
+    gaps: dict[str, float | None] = {}
+    for cell in set(_cell_regressions(cases, order=orders[0])) | set(
+        _cell_regressions(cases, order=orders[1])
+    ):
+        key = f"{cell[0]}::{cell[1]}"
+        first = by_order[orders[0]]["cells"].get(key, {}).get(
+            "median_regression_percent"
+        )
+        second = by_order[orders[1]]["cells"].get(key, {}).get(
+            "median_regression_percent"
+        )
+        gaps[key] = (
+            abs(float(first) - float(second))
+            if first is not None and second is not None
+            else None
+        )
+    measured_gaps = [value for value in gaps.values() if value is not None]
+    return {
+        "schema_version": "orchestrator.winter-p2-order-stratified-summary.v1",
+        "orders": by_order,
+        "overall_cells": overall_cells,
+        "order_gap_percent_points": gaps,
+        "max_order_gap_percent_points": max(measured_gaps) if measured_gaps else None,
+        "balanced": (
+            by_order[orders[0]]["sample_count"]
+            == by_order[orders[1]]["sample_count"]
+            and by_order[orders[0]]["sample_count"] > 0
+        ),
+    }
+
+
+def _diagnostic_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    """Evaluate the non-formal, full-track promotion diagnostic."""
+
+    order_summary = _order_stratified_summary(cases)
+    focus_keys = [f"{layer}::{objective}" for layer, objective in _M2H_FOCUS_CELLS]
+    overall = order_summary["overall_cells"]
+    target_cells = {
+        key: overall.get(key, {"median_regression_percent": None})
+        for key in focus_keys
+    }
+    target_complete = all(
+        item.get("median_regression_percent") is not None
+        and item.get("sample_count", 0) >= len(cases)
+        for item in target_cells.values()
+    )
+    target_gate = target_complete and all(
+        float(item["median_regression_percent"])
+        <= _DIAGNOSTIC_REGRESSION_CEILING_PERCENT
+        for item in target_cells.values()
+    )
+    order_gate = True
+    order_cells: dict[str, Any] = {}
+    for key in focus_keys:
+        observations = {}
+        for order in ("control-first", "candidate-first"):
+            observation = order_summary["orders"][order]["cells"].get(key, {})
+            observations[order] = observation
+            value = observation.get("median_regression_percent")
+            if value is None or float(value) > _DIAGNOSTIC_ORDER_REGRESSION_CEILING_PERCENT:
+                order_gate = False
+        order_cells[key] = observations
+    focus_gaps = [
+        order_summary.get("order_gap_percent_points", {}).get(key)
+        for key in focus_keys
+    ]
+    measured_focus_gaps = [value for value in focus_gaps if value is not None]
+    gap = max(measured_focus_gaps) if measured_focus_gaps else None
+    gap_gate = gap is not None and gap <= _DIAGNOSTIC_ORDER_GAP_CEILING_PERCENT_POINTS
+
+    evidence_complete = bool(cases) and len(cases) == 8
+    evidence_failures: list[str] = []
+    for case in cases:
+        if case.get("status") != "PASS":
+            evidence_complete = False
+            evidence_failures.append(f"{case.get('case_id')}:case_status")
+            continue
+        for track in ("control", "candidate"):
+            rows = _timing_rows(case.get("records", {}).get(track, []))
+            if len(rows) != 12:
+                evidence_complete = False
+                evidence_failures.append(f"{case.get('case_id')}:{track}:timing_count")
+            for row in rows:
+                for field in (
+                    "expanded",
+                    "edge",
+                    "planner_cpu_ms",
+                    "gc_count_before",
+                    "gc_count_after",
+                    "gc_collections_delta",
+                    "trace_state",
+                ):
+                    if field not in row:
+                        evidence_complete = False
+                        evidence_failures.append(
+                            f"{case.get('case_id')}:{track}:{field}"
+                        )
+        candidate_counts = _trace_counts(case.get("records", {}).get("candidate", []))
+        if candidate_counts != {
+            "trace_captured": _M2_EXPECTED_TRACE_COUNT,
+            "trace_hits": _M2_EXPECTED_HIT_COUNT,
+            "cold_control": _M2_EXPECTED_COLD_COUNT,
+            "fallback_control": 0,
+            "record_count": 12,
+        }:
+            evidence_complete = False
+            evidence_failures.append(f"{case.get('case_id')}:reuse_counts")
+        for track_resources in case.get("track_resources", {}).values():
+            if not isinstance(track_resources, Mapping):
+                evidence_complete = False
+                evidence_failures.append(f"{case.get('case_id')}:resources")
+                continue
+            if not _swap_observation_pass(track_resources):
+                evidence_complete = False
+                evidence_failures.append(f"{case.get('case_id')}:swap")
+            if _cpu_measurement_status(
+                cpu_pin_cpu=track_resources.get("cpu_pin_cpu"),
+                cpu_pin_succeeded=track_resources.get("cpu_pin_succeeded"),
+                cpu_affinity=track_resources.get("cpu_affinity"),
+            ) != "PASS":
+                evidence_complete = False
+                evidence_failures.append(f"{case.get('case_id')}:cpu")
+            if track_resources.get("peak_rss_kib", 0) <= 0:
+                evidence_complete = False
+                evidence_failures.append(f"{case.get('case_id')}:rss")
+        if case.get("publication_boundary", {}).get("production_published", True):
+            evidence_complete = False
+            evidence_failures.append(f"{case.get('case_id')}:publication")
+    summary = {
+        "schema_version": "orchestrator.winter-p2-m2i-diagnostic-summary.v1",
+        "diagnostic_only": True,
+        "formal_gate_verdict": "NOT_APPLICABLE",
+        "sample_count": len(cases),
+        "required_sample_count": 8,
+        "execution_order_counts": {
+            order: order_summary["orders"][order]["sample_count"]
+            for order in ("control-first", "candidate-first")
+        },
+        "evidence_complete": evidence_complete,
+        "evidence_failures": evidence_failures,
+        "focus_cells": list(focus_keys),
+        "focus_cell_overall": target_cells,
+        "focus_cell_by_order": order_cells,
+        "order_stratified": order_summary,
+        "gates": {
+            "evidence_complete": "PASS" if evidence_complete else "FAIL",
+            "focus_cell_overall_median_regression_le_3_percent": (
+                "PASS" if target_gate else "FAIL"
+            ),
+            "focus_cell_order_median_regression_le_5_percent": (
+                "PASS" if order_gate else "FAIL"
+            ),
+            "focus_cell_order_gap_le_5pp": "PASS" if gap_gate else "FAIL",
+        },
+        "gate_verdict": (
+            "PASS" if evidence_complete and target_gate and order_gate and gap_gate else "FAIL"
+        ),
+    }
+    return summary
 
 
 def _reuse_sidecar(
@@ -2240,6 +2509,7 @@ def _resource_snapshot(
     process_swap_after_kib: int | None = None,
     cpu_pin_cpu: int | None = None,
     cpu_pin_succeeded: bool | None = None,
+    usage_before: resource.struct_rusage | None = None,
 ) -> dict[str, Any]:
     usage = resource.getrusage(resource.RUSAGE_SELF)
     process_swap_delta = _process_swap_delta(
@@ -2251,10 +2521,30 @@ def _resource_snapshot(
         process_swap_before_kib is not None and process_swap_after_kib is not None
     )
     cpu_affinity = _worker_cpu_affinity()
+    rusage_fields = (
+        "ru_utime",
+        "ru_stime",
+        "ru_nvcsw",
+        "ru_nivcsw",
+        "ru_minflt",
+        "ru_majflt",
+    )
+    rusage = {
+        field: getattr(usage, field)
+        for field in rusage_fields
+    }
+    rusage_delta = None
+    if usage_before is not None:
+        rusage_delta = {
+            field: getattr(usage, field) - getattr(usage_before, field)
+            for field in rusage_fields
+        }
     return {
         "wall_seconds": time.perf_counter() - started,
         "cpu_seconds": usage.ru_utime + usage.ru_stime,
         "peak_rss_kib": usage.ru_maxrss,
+        "rusage": rusage,
+        "rusage_delta": rusage_delta,
         "swap_before": swap_before,
         "swap_after": swap_after,
         "swap_delta": _swap_delta(swap_before, swap_after),
@@ -2417,6 +2707,7 @@ def _prepared_shadow_track(
     candidate_mode: str,
     cpu_pin_cpu: int | None = None,
     cpu_pin_succeeded: bool | None = None,
+    diagnostic_profile: str = "baseline",
 ) -> tuple[Any, list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     """Execute exactly one formal-prepared shadow track.
 
@@ -2437,9 +2728,14 @@ def _prepared_shadow_track(
             "execute_four_layer_temporal_shadow_track"
         )
     started = time.perf_counter()
+    usage_before = resource.getrusage(resource.RUSAGE_SELF)
     swap_before = _swap_counters()
     process_swap_before_kib = _process_swap_kib()
-    result = method(track=track, candidate_mode="control_trace")
+    result = method(
+        track=track,
+        candidate_mode="control_trace",
+        diagnostic_profile=diagnostic_profile,
+    )
     elapsed_seconds = time.perf_counter() - started
     swap_after = _swap_counters()
     process_swap_after_kib = _process_swap_kib()
@@ -2479,6 +2775,7 @@ def _prepared_shadow_track(
         process_swap_after_kib=process_swap_after_kib,
         cpu_pin_cpu=cpu_pin_cpu,
         cpu_pin_succeeded=cpu_pin_succeeded,
+        usage_before=usage_before,
     )
     metadata = {
         "production_published": False,
@@ -2493,7 +2790,12 @@ def _prepared_shadow_track(
             "PreparedRiskPlanning.execute_four_layer_temporal_shadow_track"
         ),
         "track": track,
+        "diagnostic_profile": diagnostic_profile,
         "elapsed_seconds": elapsed_seconds,
+        "trace_lifecycle": _as_document(getattr(result, "trace_lifecycle", ())),
+        "trace_normalization_ms": float(
+            getattr(result, "trace_normalization_ms", 0.0)
+        ),
     }
     return outcome, records, resources, metadata
 
@@ -2523,6 +2825,7 @@ def _run_in_process_case(
                 prepared=prepared,
                 track=track,
                 candidate_mode=args.candidate_mode,
+                diagnostic_profile=getattr(args, "diagnostic_profile", "baseline"),
             )
             outcomes[track] = outcome
             records[track] = [
@@ -2596,6 +2899,10 @@ def _worker_command(
         args.candidate_mode,
         "--rss-mode",
         "in-process",
+        "--evidence-mode",
+        getattr(args, "evidence_mode", "auto"),
+        "--diagnostic-profile",
+        getattr(args, "diagnostic_profile", "baseline"),
         "--_track-worker",
         track,
         "--_worker-result",
@@ -2700,6 +3007,7 @@ def _run_track_worker(args: argparse.Namespace) -> int:
     cpu_pin_cpu = _pin_worker_cpu()
     cpu_pin_succeeded = cpu_pin_cpu is not None
     started = time.perf_counter()
+    usage_before = resource.getrusage(resource.RUSAGE_SELF)
     swap_before = _swap_counters()
     process_swap_before_kib = _process_swap_kib()
     try:
@@ -2711,6 +3019,7 @@ def _run_track_worker(args: argparse.Namespace) -> int:
                 prepared=prepared,
                 track=args._track_worker,
                 candidate_mode=args.candidate_mode,
+                diagnostic_profile=getattr(args, "diagnostic_profile", "baseline"),
                 cpu_pin_cpu=cpu_pin_cpu,
                 cpu_pin_succeeded=cpu_pin_succeeded,
             )
@@ -2770,6 +3079,7 @@ def _run_track_worker(args: argparse.Namespace) -> int:
                         process_swap_after_kib=_process_swap_kib(),
                         cpu_pin_cpu=cpu_pin_cpu,
                         cpu_pin_succeeded=cpu_pin_succeeded,
+                        usage_before=usage_before,
                     ),
                 }
     except Exception as error:
@@ -2786,6 +3096,7 @@ def _run_track_worker(args: argparse.Namespace) -> int:
                 process_swap_after_kib=_process_swap_kib(),
                 cpu_pin_cpu=cpu_pin_cpu,
                 cpu_pin_succeeded=cpu_pin_succeeded,
+                usage_before=usage_before,
             ),
         }
     _write_json(args._worker_result, payload)
@@ -2919,11 +3230,16 @@ def _manifest(
         "execution_order": args.execution_order,
         "candidate_mode": args.candidate_mode,
         "rss_mode": args.rss_mode,
+        "evidence_mode": getattr(args, "evidence_mode", "auto"),
+        "evidence_mode_effective": getattr(
+            args, "evidence_mode_effective", getattr(args, "evidence_mode", "auto")
+        ),
+        "diagnostic_profile": getattr(args, "diagnostic_profile", "baseline"),
         "implementation_sha256": implementation_sha256,
         "orchestrator_commit": repositories["orchestrator"].get("commit"),
         "work_package_c_commit": repositories["work_package_c"].get("commit"),
     }
-    experiment_id = f"winter-p2-shadow-v3-{_canonical_digest(experiment_key)[:16]}"
+    experiment_id = f"winter-p2-shadow-v4-{_canonical_digest(experiment_key)[:16]}"
     return {
         "schema_version": "orchestrator.winter-p2-shadow-manifest.v2",
         "experiment_id": experiment_id,
@@ -2931,6 +3247,11 @@ def _manifest(
         "status": status,
         "script_version": _SCRIPT_VERSION,
         "candidate_mode": args.candidate_mode,
+        "evidence_mode": getattr(args, "evidence_mode", "auto"),
+        "evidence_mode_effective": getattr(
+            args, "evidence_mode_effective", getattr(args, "evidence_mode", "auto")
+        ),
+        "diagnostic_profile": getattr(args, "diagnostic_profile", "baseline"),
         "candidate_algorithm": mode_metadata["candidate_algorithm"],
         "candidate_schema": mode_metadata["candidate_schema"],
         "sidecar_schema": mode_metadata["sidecar_schema"],
@@ -2991,6 +3312,11 @@ def _manifest(
             "prepare_only": args.prepare_only,
             "candidate_mode": args.candidate_mode,
             "rss_mode": args.rss_mode,
+            "evidence_mode": getattr(args, "evidence_mode", "auto"),
+            "evidence_mode_effective": getattr(
+                args, "evidence_mode_effective", getattr(args, "evidence_mode", "auto")
+            ),
+            "diagnostic_profile": getattr(args, "diagnostic_profile", "baseline"),
             "worker_timeout_seconds": args.worker_timeout_seconds,
         },
         "runtime": {
@@ -3015,10 +3341,30 @@ def run(args: argparse.Namespace) -> int:
         getattr(args, "candidate_mode", "exact-temporal")
     )
     args.rss_mode = _validate_rss_mode(getattr(args, "rss_mode", "in-process"))
+    args.evidence_mode = _validate_evidence_mode(
+        getattr(args, "evidence_mode", "auto")
+    )
+    args.diagnostic_profile = _validate_diagnostic_profile(
+        getattr(args, "diagnostic_profile", "baseline")
+    )
+    args.evidence_mode_effective = _effective_evidence_mode(args)
     if args.repetitions < 1:
         raise ValueError("repetitions must be positive")
     if args.candidate_mode == "control-trace" and args.rss_mode != "isolated":
         raise ValueError("control-trace M2 requires --rss-mode isolated")
+    if args.diagnostic_profile != "baseline" and args.evidence_mode != "diagnostic":
+        raise ValueError(
+            "non-baseline diagnostic profiles require --evidence-mode diagnostic"
+        )
+    if args.evidence_mode == "diagnostic" and args.candidate_mode != "control-trace":
+        raise ValueError("diagnostic evidence requires --candidate-mode control-trace")
+    if (
+        args.evidence_mode in {"diagnostic", "screening", "formal"}
+        and args.candidate_mode != "control-trace"
+    ):
+        raise ValueError(
+            "diagnostic, screening, and formal evidence require --candidate-mode control-trace"
+        )
     _empty_output_dir(args.output_dir)
     prepared = _prepare(args)
     if args.worker_timeout_seconds is None:
@@ -3056,6 +3402,9 @@ def run(args: argparse.Namespace) -> int:
                 "candidate_algorithm": mode_metadata["candidate_algorithm"],
                 "candidate_schema": mode_metadata["candidate_schema"],
                 "rss_mode": args.rss_mode,
+                "evidence_mode": args.evidence_mode,
+                "evidence_mode_effective": args.evidence_mode_effective,
+                "diagnostic_profile": args.diagnostic_profile,
                 "status": "PASS",
             }
             try:
@@ -3231,20 +3580,51 @@ def run(args: argparse.Namespace) -> int:
     manifest["failed_cases"] = sum(case["status"] != "PASS" for case in cases)
     manifest["p2_reuse_claim"] = _mode_metadata(args.candidate_mode)["p2_reuse_claim"]
     if args.candidate_mode == "control-trace":
-        m2_summary = _m2_summary(cases)
-        manifest["m2_summary"] = m2_summary
-        screening_verdict = m2_summary["screening"]["gate_verdict"]
-        manifest["m2_screening_gate_verdict"] = screening_verdict
-        if (
-            args.repetitions == _M2_SCREENING_REPETITIONS
-            and screening_verdict == "FAIL"
-        ):
-            failures += 1
-            manifest["status"] = "FAIL"
-        if m2_summary["gate_verdict"] == "FAIL" and args.repetitions >= _M2_MIN_REPETITIONS:
-            failures += 1
-            manifest["status"] = "FAIL"
-        manifest["m2_gate_verdict"] = m2_summary["gate_verdict"]
+        if args.evidence_mode_effective == "diagnostic":
+            m2_summary = None
+            diagnostic_summary = _diagnostic_summary(cases)
+            manifest["diagnostic_summary"] = diagnostic_summary
+            manifest["formal_gate_verdict"] = "NOT_APPLICABLE"
+            manifest["m2_gate_verdict"] = "NOT_APPLICABLE"
+            if diagnostic_summary["gate_verdict"] == "FAIL":
+                failures += 1
+                manifest["status"] = "FAIL"
+        else:
+            m2_summary = _m2_summary(cases)
+            manifest["m2_summary"] = m2_summary
+            screening_verdict = m2_summary["screening"]["gate_verdict"]
+            manifest["m2_screening_gate_verdict"] = screening_verdict
+            order_summary = _order_stratified_summary(cases)
+            manifest["order_stratified_summary"] = order_summary
+            order_gate = bool(order_summary.get("balanced")) and (
+                order_summary.get("max_order_gap_percent_points") is not None
+                and order_summary["max_order_gap_percent_points"]
+                <= _DIAGNOSTIC_ORDER_GAP_CEILING_PERCENT_POINTS
+            )
+            manifest["order_consistency_gate"] = "PASS" if order_gate else "FAIL"
+            if args.evidence_mode_effective == "screening":
+                if screening_verdict == "FAIL" or not order_gate:
+                    failures += 1
+                    manifest["status"] = "FAIL"
+                manifest["m2_gate_verdict"] = "NOT_APPLICABLE_SCREENING"
+            elif args.evidence_mode_effective == "formal":
+                if m2_summary["gate_verdict"] == "FAIL" or not order_gate:
+                    failures += 1
+                    manifest["status"] = "FAIL"
+                manifest["m2_gate_verdict"] = (
+                    "PASS" if m2_summary["gate_verdict"] == "PASS" and order_gate else "FAIL"
+                )
+            else:
+                if (
+                    args.repetitions == _M2_SCREENING_REPETITIONS
+                    and screening_verdict == "FAIL"
+                ):
+                    failures += 1
+                    manifest["status"] = "FAIL"
+                if m2_summary["gate_verdict"] == "FAIL" and args.repetitions >= _M2_MIN_REPETITIONS:
+                    failures += 1
+                    manifest["status"] = "FAIL"
+                manifest["m2_gate_verdict"] = m2_summary["gate_verdict"]
     else:
         m2_summary = None
     manifest["failed_cases"] = sum(case["status"] != "PASS" for case in cases)
@@ -3298,7 +3678,12 @@ def run(args: argparse.Namespace) -> int:
             "candidate_mode": args.candidate_mode,
             "rss_mode": args.rss_mode,
             "m2_gate_verdict": manifest.get("m2_gate_verdict", "NOT_APPLICABLE"),
+            "evidence_mode": args.evidence_mode,
+            "evidence_mode_effective": args.evidence_mode_effective,
+            "diagnostic_profile": args.diagnostic_profile,
             "m2_summary": m2_summary,
+            "diagnostic_summary": manifest.get("diagnostic_summary"),
+            "order_stratified_summary": manifest.get("order_stratified_summary"),
         },
     )
     print(json.dumps(manifest, ensure_ascii=False, sort_keys=True), flush=True)
@@ -3344,6 +3729,21 @@ def build_parser() -> argparse.ArgumentParser:
         choices=_RSS_MODE_VALUES,
         default="in-process",
         help="combined in-process RSS or isolated per-track child-process RSS",
+    )
+    parser.add_argument(
+        "--evidence-mode",
+        choices=_EVIDENCE_MODE_VALUES,
+        default="auto",
+        help=(
+            "auto preserves legacy repetition-based gates; diagnostic records "
+            "full-track causal evidence without an M2 performance verdict"
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-profile",
+        choices=_DIAGNOSTIC_PROFILE_VALUES,
+        default="baseline",
+        help="shadow-only diagnostic profile; valid only with --evidence-mode diagnostic",
     )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument(

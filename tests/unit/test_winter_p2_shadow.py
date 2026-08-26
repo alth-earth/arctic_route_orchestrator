@@ -45,6 +45,18 @@ def test_candidate_mode_and_rss_mode_are_explicit() -> None:
         shadow._validate_rss_mode("shared")
 
 
+def test_evidence_modes_and_diagnostic_profiles_are_explicit() -> None:
+    assert shadow._validate_evidence_mode("diagnostic") == "diagnostic"
+    assert shadow._validate_evidence_mode("screening") == "screening"
+    assert shadow._validate_diagnostic_profile("post_main_normalize") == (
+        "post-main-normalize"
+    )
+    with pytest.raises(ValueError, match="evidence-mode"):
+        shadow._validate_evidence_mode("benchmark")
+    with pytest.raises(ValueError, match="diagnostic-profile"):
+        shadow._validate_diagnostic_profile("drop-trace")
+
+
 def test_parser_preserves_exact_temporal_default_and_accepts_control_trace() -> None:
     required = [
         "--risk-store-root",
@@ -61,11 +73,45 @@ def test_parser_preserves_exact_temporal_default_and_accepts_control_trace() -> 
     exact = shadow.build_parser().parse_args(required)
     assert exact.candidate_mode == "exact-temporal"
     assert exact.rss_mode == "in-process"
+    assert exact.evidence_mode == "auto"
+    assert exact.diagnostic_profile == "baseline"
     trace = shadow.build_parser().parse_args(
         [*required, "--candidate-mode", "control-trace", "--rss-mode", "isolated"]
     )
     assert trace.candidate_mode == "control-trace"
     assert trace.rss_mode == "isolated"
+
+
+def test_order_stratified_summary_keeps_execution_orders_separate() -> None:
+    def case(case_id: int, order: str, control: float, candidate: float) -> dict:
+        return {
+            "case_id": f"case-{case_id:03d}",
+            "status": "PASS",
+            "execution_order": order,
+            "records": {
+                "control": [
+                    {"layer": "rolling_0_24h", "objective": "fastest", "wall_ms": control}
+                ],
+                "candidate": [
+                    {"layer": "rolling_0_24h", "objective": "fastest", "wall_ms": candidate}
+                ],
+            },
+        }
+
+    summary = shadow._order_stratified_summary(
+        [
+            case(1, "control-first", 100.0, 102.0),
+            case(2, "control-first", 100.0, 104.0),
+            case(3, "candidate-first", 100.0, 110.0),
+            case(4, "candidate-first", 100.0, 112.0),
+        ]
+    )
+    assert summary["balanced"] is True
+    assert summary["orders"]["control-first"]["sample_count"] == 2
+    assert summary["orders"]["candidate-first"]["sample_count"] == 2
+    assert summary["order_gap_percent_points"]["rolling_0_24h::fastest"] == pytest.approx(
+        8.0
+    )
 
 
 def test_parser_accepts_explicit_worker_timeout() -> None:
