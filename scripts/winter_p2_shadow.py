@@ -2160,8 +2160,30 @@ def _order_stratified_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _diagnostic_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
-    """Evaluate the non-formal, full-track promotion diagnostic."""
+def _diagnostic_summary(
+    cases: list[dict[str, Any]],
+    *,
+    required_sample_count: int = 8,
+    diagnostic_profile: str = "baseline",
+) -> dict[str, Any]:
+    """Evaluate the non-formal, full-track promotion diagnostic.
+
+    The baseline promotion diagnostic uses eight balanced pairs.  The two
+    causal ablations intentionally use six pairs, so their evidence-complete
+    gate is parameterized rather than silently judged against the baseline
+    sample count.
+    """
+
+    diagnostic_profile = _validate_diagnostic_profile(diagnostic_profile)
+    expected_counts = {
+        "trace_captured": _M2_EXPECTED_TRACE_COUNT,
+        "trace_hits": _M2_EXPECTED_HIT_COUNT,
+        "cold_control": _M2_EXPECTED_COLD_COUNT,
+        "fallback_control": 0,
+        "record_count": 12,
+    }
+    if diagnostic_profile == "force-main-cold":
+        expected_counts.update(trace_hits=0, cold_control=9)
 
     order_summary = _order_stratified_summary(cases)
     focus_keys = [f"{layer}::{objective}" for layer, objective in _M2H_FOCUS_CELLS]
@@ -2199,7 +2221,7 @@ def _diagnostic_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
     gap = max(measured_focus_gaps) if measured_focus_gaps else None
     gap_gate = gap is not None and gap <= _DIAGNOSTIC_ORDER_GAP_CEILING_PERCENT_POINTS
 
-    evidence_complete = bool(cases) and len(cases) == 8
+    evidence_complete = bool(cases) and len(cases) == required_sample_count
     evidence_failures: list[str] = []
     for case in cases:
         if case.get("status") != "PASS":
@@ -2227,13 +2249,7 @@ def _diagnostic_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
                             f"{case.get('case_id')}:{track}:{field}"
                         )
         candidate_counts = _trace_counts(case.get("records", {}).get("candidate", []))
-        if candidate_counts != {
-            "trace_captured": _M2_EXPECTED_TRACE_COUNT,
-            "trace_hits": _M2_EXPECTED_HIT_COUNT,
-            "cold_control": _M2_EXPECTED_COLD_COUNT,
-            "fallback_control": 0,
-            "record_count": 12,
-        }:
+        if candidate_counts != expected_counts:
             evidence_complete = False
             evidence_failures.append(f"{case.get('case_id')}:reuse_counts")
         for track_resources in case.get("track_resources", {}).values():
@@ -2262,7 +2278,8 @@ def _diagnostic_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         "diagnostic_only": True,
         "formal_gate_verdict": "NOT_APPLICABLE",
         "sample_count": len(cases),
-        "required_sample_count": 8,
+        "required_sample_count": required_sample_count,
+        "diagnostic_profile": diagnostic_profile,
         "execution_order_counts": {
             order: order_summary["orders"][order]["sample_count"]
             for order in ("control-first", "candidate-first")
@@ -3582,7 +3599,11 @@ def run(args: argparse.Namespace) -> int:
     if args.candidate_mode == "control-trace":
         if args.evidence_mode_effective == "diagnostic":
             m2_summary = None
-            diagnostic_summary = _diagnostic_summary(cases)
+            diagnostic_summary = _diagnostic_summary(
+                cases,
+                required_sample_count=args.repetitions,
+                diagnostic_profile=args.diagnostic_profile,
+            )
             manifest["diagnostic_summary"] = diagnostic_summary
             manifest["formal_gate_verdict"] = "NOT_APPLICABLE"
             manifest["m2_gate_verdict"] = "NOT_APPLICABLE"
