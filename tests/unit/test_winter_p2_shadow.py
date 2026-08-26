@@ -95,6 +95,104 @@ def test_parser_accepts_explicit_worker_timeout() -> None:
     assert args.worker_timeout_seconds == 42.0
 
 
+def test_resource_snapshot_records_process_swap_measurement() -> None:
+    snapshot = shadow._resource_snapshot(
+        shadow.time.perf_counter(),
+        swap_before={"pswpin": 10, "pswpout": 20},
+        swap_after={"pswpin": 10, "pswpout": 20},
+        process_swap_before_kib=4,
+        process_swap_after_kib=4,
+    )
+    assert snapshot["swap_measurement"] == {
+        "kernel_counters": True,
+        "process_vm_swap": True,
+        "status": "PASS",
+    }
+    assert snapshot["process_swap_delta_kib"] == 0
+
+
+def test_swap_gate_fails_when_measurement_is_explicitly_unavailable() -> None:
+    # Start from the complete synthetic fixture built by the main summary test
+    # and alter only one track's measurement status.  A zero counter delta is
+    # not sufficient evidence when the runner reports that its measurement
+    # surface was unavailable.
+    cells = [
+        (layer, objective)
+        for layer in shadow._CONTROL_TRACE_LAYER_NAMES
+        for objective in ("fastest", "low_risk", "recommended")
+    ]
+    control = [
+        {"layer": layer, "objective": objective, "wall_ms": 100.0, "expanded": 1, "edge": 1,
+         "search_used": True, "reuse_status": "CONTROL_SEARCH"}
+        for layer, objective in cells
+    ]
+    candidate = []
+    for layer, objective in cells:
+        status = (
+            "TRACE_CAPTURED" if layer == "full_voyage"
+            else "HIT_TRACE_EQUIVALENT" if layer == "main_corridor_24_72h"
+            else "COLD_CONTROL"
+        )
+        hit = status == "HIT_TRACE_EQUIVALENT"
+        candidate.append({
+            "layer": layer, "objective": objective, "wall_ms": 70.0,
+            "expanded": 0 if hit else 1, "edge": 0 if hit else 1,
+            "search_used": not hit, "trace_status": status if status == "TRACE_CAPTURED" else None,
+            "reuse_status": status,
+        })
+    sidecar = shadow._shadow_sidecar_records(
+        {
+            "trace_observations": [
+                {"objective": value}
+                for value in ("fastest", "low_risk", "recommended")
+            ],
+            "reuse_outcomes": (
+                [
+                    {
+                        "objective": "recommended",
+                        "status": "HIT_TRACE_EQUIVALENT",
+                        "reused": True,
+                        "used_search": False,
+                    }
+                    for _ in range(3)
+                ]
+                + [
+                    {
+                        "objective": "recommended",
+                        "status": "COLD_CONTROL",
+                        "reused": False,
+                        "used_search": True,
+                    }
+                    for _ in range(6)
+                ]
+            ),
+        }
+    )
+    pairs = [{"layer": layer, "objective": objective, "status": "PASS",
+              "control_route_digest": f"route-{i}", "candidate_route_digest": f"route-{i}"}
+             for i, (layer, objective) in enumerate(cells)]
+    cases = []
+    for i in range(3):
+        cases.append({
+            "case_id": f"case-{i}", "status": "PASS", "rss_scope": "independent_child_process",
+            "records": {"control": control, "candidate": [*candidate, *sidecar]},
+            "track_resources": {
+                "control": {"wall_seconds": 1.0, "peak_rss_kib": 100,
+                             "swap_delta": {"pswpin": 0, "pswpout": 0},
+                             "swap_measurement": {"status": "PASS"}},
+                "candidate": {"wall_seconds": 0.7, "peak_rss_kib": 105,
+                               "swap_delta": {"pswpin": 0, "pswpout": 0},
+                               "swap_measurement": {"status": "NOT_MEASURED"}},
+            },
+            "comparison": {"status": "PASS", "pair_count": 12, "pairs": pairs},
+            "route_integrity": {"control": {"status": "PASS", "route_count": 12},
+                                 "candidate": {"status": "PASS", "route_count": 12}},
+        })
+    summary = shadow._m2_summary(cases)
+    assert summary["swap"]["gate"] == "FAIL"
+    assert summary["gate_verdict"] == "FAIL"
+
+
 def test_control_trace_refuses_shared_process_m2_measurement() -> None:
     required = [
         "--risk-store-root",

@@ -87,7 +87,7 @@ from arctic_route_risk import PersistentRiskStore
 from arctic_route_orchestrator.models import ExecutionSpec
 from arctic_route_orchestrator.replay.route_integrity import audit_route
 
-_SCRIPT_VERSION = "winter-p2-shadow.v2"
+_SCRIPT_VERSION = "winter-p2-shadow.v3"
 _CANDIDATE_VERSION = "temporal-label-astar.shadow.v1"
 _CONTROL_TRACE_VERSION = "time-dependent-a-star.control-trace.v1"
 _ORDER_VALUES = ("control-first", "candidate-first", "alternate")
@@ -226,6 +226,62 @@ def _swap_counters() -> dict[str, int] | None:
     except (OSError, ValueError):
         return None
     return counters if counters else None
+
+
+def _process_swap_kib(pid: int | None = None) -> int | None:
+    """Read a process' resident swap amount from ``/proc`` when available.
+
+    The kernel counters above are host-wide and cumulative.  This process
+    scoped value makes the isolated worker evidence explicit and prevents a
+    missing host counter from being mistaken for a zero-swap observation.
+    """
+
+    process_id = os.getpid() if pid is None else int(pid)
+    path = Path(f"/proc/{process_id}/status")
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.startswith("VmSwap:"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                return None
+            value = int(parts[1])
+            unit = parts[2].lower() if len(parts) >= 3 else "kb"
+            if unit in {"kb", "kib"}:
+                return value
+            if unit == "mb":
+                return value * 1024
+            return value
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _pin_worker_cpu() -> int | None:
+    """Pin a worker to the lowest available CPU for paired measurements."""
+
+    if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+        return None
+    try:
+        available = sorted(os.sched_getaffinity(0))
+        if not available:
+            return None
+        cpu = int(available[0])
+        os.sched_setaffinity(0, {cpu})
+        return cpu
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _worker_cpu_affinity() -> list[int] | None:
+    """Return the worker's effective CPU affinity as JSON-safe data."""
+
+    if not hasattr(os, "sched_getaffinity"):
+        return None
+    try:
+        return sorted(int(cpu) for cpu in os.sched_getaffinity(0))
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def _swap_delta(
@@ -1536,6 +1592,8 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
     determinism_inputs: dict[str, list[Any]] = {"control": [], "candidate": []}
     rss_ratios: list[float] = []
     swap_deltas: list[dict[str, int]] = []
+    swap_measurement_statuses: list[str] = []
+    swap_measurement_incomplete = False
     for case in cases:
         counts = _trace_counts(case.get("records", {}).get("candidate", []))
         timing_evidence = _reuse_timing_evidence(
@@ -1577,10 +1635,22 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
                 )
             )
         resources = case.get("track_resources", {})
-        for track_resources in resources.values():
-            if isinstance(track_resources, dict) and isinstance(
-                track_resources.get("swap_delta"), dict
-            ):
+        case_track_resources = [
+            resources.get(track) for track in ("control", "candidate")
+        ] if isinstance(resources, dict) else []
+        for track_resources in case_track_resources:
+            if not isinstance(track_resources, dict):
+                swap_measurement_incomplete = True
+                continue
+            measurement = track_resources.get("swap_measurement")
+            if isinstance(measurement, dict) and measurement.get("status") is not None:
+                swap_measurement_statuses.append(str(measurement["status"]))
+            elif swap_measurement_statuses:
+                # Once a new-format track reports a status, a peer track that
+                # omits it is incomplete evidence, even if it has a legacy
+                # counter delta.
+                swap_measurement_incomplete = True
+            if isinstance(track_resources.get("swap_delta"), dict):
                 swap_deltas.append(
                     {
                         name: int(track_resources["swap_delta"].get(name, 0))
@@ -1649,6 +1719,14 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
     swap_gate = bool(swap_deltas) and all(
         delta["pswpin"] == 0 and delta["pswpout"] == 0 for delta in swap_deltas
     )
+    if swap_measurement_statuses:
+        swap_measurement_incomplete = swap_measurement_incomplete or (
+            len(swap_measurement_statuses) != 2 * len(cases)
+        )
+        swap_gate = swap_gate and all(
+            status == "PASS" for status in swap_measurement_statuses
+        )
+        swap_gate = swap_gate and not swap_measurement_incomplete
     gate_verdict = (
         "PASS"
         if sufficient
@@ -1723,6 +1801,7 @@ def _m2_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "swap": {
             "observations": swap_deltas,
+            "measurement_statuses": swap_measurement_statuses,
             "gate": "PASS" if swap_gate else "FAIL" if sufficient else "NOT_MEASURED",
         },
         "expected_trace_hit_cold": {
@@ -1963,8 +2042,20 @@ def _resource_snapshot(
     *,
     swap_before: dict[str, int] | None = None,
     swap_after: dict[str, int] | None = None,
+    process_swap_before_kib: int | None = None,
+    process_swap_after_kib: int | None = None,
 ) -> dict[str, Any]:
     usage = resource.getrusage(resource.RUSAGE_SELF)
+    process_swap_delta = None
+    if process_swap_before_kib is not None and process_swap_after_kib is not None:
+        process_swap_delta = max(
+            0,
+            int(process_swap_after_kib) - int(process_swap_before_kib),
+        )
+    kernel_measured = swap_before is not None and swap_after is not None
+    process_measured = (
+        process_swap_before_kib is not None and process_swap_after_kib is not None
+    )
     return {
         "wall_seconds": time.perf_counter() - started,
         "cpu_seconds": usage.ru_utime + usage.ru_stime,
@@ -1972,6 +2063,15 @@ def _resource_snapshot(
         "swap_before": swap_before,
         "swap_after": swap_after,
         "swap_delta": _swap_delta(swap_before, swap_after),
+        "process_swap_before_kib": process_swap_before_kib,
+        "process_swap_after_kib": process_swap_after_kib,
+        "process_swap_delta_kib": process_swap_delta,
+        "cpu_affinity": _worker_cpu_affinity(),
+        "swap_measurement": {
+            "kernel_counters": kernel_measured,
+            "process_vm_swap": process_measured,
+            "status": "PASS" if kernel_measured and process_measured else "NOT_MEASURED",
+        },
     }
 
 
@@ -2126,9 +2226,11 @@ def _prepared_shadow_track(
         )
     started = time.perf_counter()
     swap_before = _swap_counters()
+    process_swap_before_kib = _process_swap_kib()
     result = method(track=track, candidate_mode="control_trace")
     elapsed_seconds = time.perf_counter() - started
     swap_after = _swap_counters()
+    process_swap_after_kib = _process_swap_kib()
     outcome = getattr(result, "outcome", None)
     if outcome is None:
         raise RuntimeError("single-track shadow API returned no FourLayerPlanningOutcome")
@@ -2161,6 +2263,8 @@ def _prepared_shadow_track(
         started,
         swap_before=swap_before,
         swap_after=swap_after,
+        process_swap_before_kib=process_swap_before_kib,
+        process_swap_after_kib=process_swap_after_kib,
     )
     metadata = {
         "production_published": False,
@@ -2379,8 +2483,10 @@ def _run_isolated_case(
 def _run_track_worker(args: argparse.Namespace) -> int:
     if args._worker_result is None or args._track_worker is None:
         raise ValueError("track worker requires --_worker-result and --_track-worker")
+    _pin_worker_cpu()
     started = time.perf_counter()
     swap_before = _swap_counters()
+    process_swap_before_kib = _process_swap_kib()
     try:
         prepared = _prepare(args)
         if args.worker_timeout_seconds is None:
@@ -2443,6 +2549,8 @@ def _run_track_worker(args: argparse.Namespace) -> int:
                         started,
                         swap_before=swap_before,
                         swap_after=_swap_counters(),
+                        process_swap_before_kib=process_swap_before_kib,
+                        process_swap_after_kib=_process_swap_kib(),
                     ),
                 }
     except Exception as error:
@@ -2455,6 +2563,8 @@ def _run_track_worker(args: argparse.Namespace) -> int:
                 started,
                 swap_before=swap_before,
                 swap_after=_swap_counters(),
+                process_swap_before_kib=process_swap_before_kib,
+                process_swap_after_kib=_process_swap_kib(),
             ),
         }
     _write_json(args._worker_result, payload)
@@ -2592,7 +2702,7 @@ def _manifest(
         "orchestrator_commit": repositories["orchestrator"].get("commit"),
         "work_package_c_commit": repositories["work_package_c"].get("commit"),
     }
-    experiment_id = f"winter-p2-shadow-v2-{_canonical_digest(experiment_key)[:16]}"
+    experiment_id = f"winter-p2-shadow-v3-{_canonical_digest(experiment_key)[:16]}"
     return {
         "schema_version": "orchestrator.winter-p2-shadow-manifest.v2",
         "experiment_id": experiment_id,
