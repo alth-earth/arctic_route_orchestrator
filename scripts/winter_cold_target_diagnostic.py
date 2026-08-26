@@ -304,6 +304,18 @@ def _run(args: argparse.Namespace) -> int:
         raise ValueError(f"output directory must be new and empty: {args.output_dir}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     prepared = shadow._prepare(_prepare_args(args))
+    diagnostic_script = Path(__file__).resolve()
+    orchestrator_environment = shadow._git_environment(diagnostic_script.parents[1])
+    c_environment = shadow._git_environment(shadow._workspace_root() / "work_package_c")
+    implementation = {
+        "diagnostic_script": str(diagnostic_script),
+        "diagnostic_script_sha256": shadow._file_sha256(diagnostic_script),
+        "winter_p2_shadow_sha256": shadow._file_sha256(
+            diagnostic_script.with_name("winter_p2_shadow.py")
+        ),
+        "orchestrator_commit": orchestrator_environment,
+        "work_package_c_commit": c_environment,
+    }
     key = {
         "script": Path(__file__).name,
         "target_layer": args.target_layer,
@@ -314,6 +326,7 @@ def _run(args: argparse.Namespace) -> int:
         "risk_content_digest": prepared.commit["content_digest"],
         "run_id": prepared.spec.run_id,
         "repetitions": args.repetitions,
+        "implementation": implementation,
     }
     manifest = {
         "schema_version": "orchestrator.winter-cold-target-diagnostic.v1",
@@ -330,13 +343,7 @@ def _run(args: argparse.Namespace) -> int:
         },
         "input_identity": prepared.input_identity,
         "repetitions": args.repetitions,
-        "implementation": {
-            "diagnostic_script": str(Path(__file__).resolve()),
-            "orchestrator_commit": shadow._git_environment(Path(__file__).resolve().parents[1]),
-            "work_package_c_commit": shadow._git_environment(
-                shadow._workspace_root() / "work_package_c"
-            ),
-        },
+        "implementation": implementation,
         "publication_boundary": {
             "formal_latest_store_written": False,
             "frozen_artifact_written": False,
