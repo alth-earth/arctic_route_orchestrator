@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import platform
-import resource
 import sys
 import time
 from collections.abc import Callable
@@ -20,6 +19,12 @@ import arctic_route_data
 import arctic_route_planning
 import arctic_route_risk
 import numpy as np
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - resource is unavailable on Windows.
+    resource = None
+
 from arctic_route_contracts import run_context_to_dict
 from arctic_route_planning import (
     RiskSourcePlanningIngress,
@@ -1018,6 +1023,8 @@ def _optional_sha256(path: Path) -> str | None:
 
 
 def _process_peak_rss_bytes() -> int:
+    if resource is None:
+        return 0
     value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     if sys.platform == "darwin":
         return int(value)

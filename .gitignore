@@ -1,13 +1,32 @@
-.mamba-env/
+# Local Python environments and package-manager state.
+.mamba-env*/
 .mamba-root/
-.venv/
-.uv-cache/
+.mamba-pkgs/
+.conda-envs/
+.venv*/
+.uv-cache*/
 .uv-python/
+
+# Test, lint, type-check, and coverage caches.
 .pytest_cache/
+.pytest-tmp*/
 .ruff_cache/
+.mypy_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Python bytecode, package metadata, and build output.
 __pycache__/
 *.py[cod]
-.coverage
-htmlcov/
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Project-generated runtime data.
 output/
 data/
