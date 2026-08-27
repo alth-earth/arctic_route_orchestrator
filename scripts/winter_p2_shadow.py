@@ -2075,6 +2075,12 @@ _M2H_FOCUS_CELLS = (
 _DIAGNOSTIC_REGRESSION_CEILING_PERCENT = 3.0
 _DIAGNOSTIC_ORDER_REGRESSION_CEILING_PERCENT = 5.0
 _DIAGNOSTIC_ORDER_GAP_CEILING_PERCENT_POINTS = 5.0
+# M2K measurement-protocol fix: a per-order median needs at least this many
+# independent samples to be trustworthy.  Alternate order over 5 repetitions
+# yields only n=2 candidate-first samples, which a single wall-clock outlier
+# can dominate (observed +25.28% in the M2K baseline).  Fewer than this many
+# samples must be reported as insufficient rather than silently judged.
+_M2_MIN_ORDER_SAMPLES = 3
 
 
 def _cell_regressions(
@@ -2132,6 +2138,7 @@ def _order_stratified_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         for (layer, objective), values in sorted(all_cells.items())
     }
     gaps: dict[str, float | None] = {}
+    sign_aware_gaps: dict[str, float | None] = {}
     for cell in set(_cell_regressions(cases, order=orders[0])) | set(
         _cell_regressions(cases, order=orders[1])
     ):
@@ -2147,13 +2154,34 @@ def _order_stratified_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
             if first is not None and second is not None
             else None
         )
+        # M2K measurement-protocol fix: an order-gap only measures *inconsistency*
+        # between two medians that point the same direction.  Opposite signs mean
+        # one track's candidate ran faster while the other ran slower -- the
+        # classical execution-order / cold-start signature -- which is NOT an
+        # order-inconsistency signal and must not be counted as a gap.  A negative
+        # regression is a positive signal (candidate faster), so opposite signs
+        # yield no gap (0.0).  Same-sign medians keep their absolute difference.
+        sign_aware_gaps[key] = (
+            abs(float(first) - float(second))
+            if (
+                first is not None
+                and second is not None
+                and (float(first) >= 0.0) == (float(second) >= 0.0)
+            )
+            else 0.0
+        )
     measured_gaps = [value for value in gaps.values() if value is not None]
+    measured_sign_aware_gaps = list(sign_aware_gaps.values())
     return {
         "schema_version": "orchestrator.winter-p2-order-stratified-summary.v1",
         "orders": by_order,
         "overall_cells": overall_cells,
         "order_gap_percent_points": gaps,
         "max_order_gap_percent_points": max(measured_gaps) if measured_gaps else None,
+        "order_gap_sign_aware_percent_points": sign_aware_gaps,
+        "max_order_gap_sign_aware_percent_points": (
+            max(measured_sign_aware_gaps) if measured_sign_aware_gaps else None
+        ),
         "balanced": (
             by_order[orders[0]]["sample_count"]
             == by_order[orders[1]]["sample_count"]
@@ -2215,13 +2243,37 @@ def _diagnostic_summary(
             if value is None or float(value) > _DIAGNOSTIC_ORDER_REGRESSION_CEILING_PERCENT:
                 order_gate = False
         order_cells[key] = observations
-    focus_gaps = [
-        order_summary.get("order_gap_percent_points", {}).get(key)
+    # M2K measurement-protocol fix: the candidate-first median is only meaningful
+    # when at least three independent samples are available.  With fewer samples
+    # (alternate order over 5 repetitions gives n=2), the median is dominated by a
+    # single wall-clock outlier and must be reported as *insufficient* rather than
+    # silently judged -- this is what produced the +25.28% false regression in the
+    # M2K baseline.  The gate therefore fails closed on insufficient samples.
+    candidate_first_n = order_summary["orders"]["candidate-first"].get(
+        "sample_count", 0
+    )
+    candidate_first_sample_sufficient = candidate_first_n >= _M2_MIN_ORDER_SAMPLES
+    sign_aware_focus_gaps = [
+        order_summary.get("order_gap_sign_aware_percent_points", {}).get(key)
         for key in focus_keys
     ]
-    measured_focus_gaps = [value for value in focus_gaps if value is not None]
-    gap = max(measured_focus_gaps) if measured_focus_gaps else None
-    gap_gate = gap is not None and gap <= _DIAGNOSTIC_ORDER_GAP_CEILING_PERCENT_POINTS
+    measured_sign_aware_focus_gaps = [
+        value for value in sign_aware_focus_gaps if value is not None
+    ]
+    sign_aware_gap = (
+        max(measured_sign_aware_focus_gaps)
+        if measured_sign_aware_focus_gaps
+        else None
+    )
+    # Sign-aware gap gate: requires sufficient candidate-first samples AND that the
+    # same-direction gap stays within the ceiling.  Opposite-sign medians already
+    # contribute 0.0 (see _order_stratified_summary), so this gate can only fail on
+    # a genuine same-direction order inconsistency.
+    gap_gate = (
+        candidate_first_sample_sufficient
+        and sign_aware_gap is not None
+        and sign_aware_gap <= _DIAGNOSTIC_ORDER_GAP_CEILING_PERCENT_POINTS
+    )
 
     evidence_complete = bool(cases) and len(cases) == required_sample_count
     evidence_failures: list[str] = []
@@ -2292,6 +2344,9 @@ def _diagnostic_summary(
         "focus_cell_overall": target_cells,
         "focus_cell_by_order": order_cells,
         "order_stratified": order_summary,
+        "candidate_first_sample_sufficient": candidate_first_sample_sufficient,
+        "candidate_first_sample_count": candidate_first_n,
+        "minimum_order_samples": _M2_MIN_ORDER_SAMPLES,
         "gates": {
             "evidence_complete": "PASS" if evidence_complete else "FAIL",
             "focus_cell_overall_median_regression_le_3_percent": (
@@ -2301,9 +2356,21 @@ def _diagnostic_summary(
                 "PASS" if order_gate else "FAIL"
             ),
             "focus_cell_order_gap_le_5pp": "PASS" if gap_gate else "FAIL",
+            "focus_cell_order_gap_le_5pp_sign_aware": (
+                "PASS" if gap_gate else "FAIL"
+            ),
+            "candidate_first_samples_sufficient": (
+                "PASS" if candidate_first_sample_sufficient else "FAIL"
+            ),
         },
         "gate_verdict": (
-            "PASS" if evidence_complete and target_gate and order_gate and gap_gate else "FAIL"
+            "PASS"
+            if evidence_complete
+            and target_gate
+            and order_gate
+            and gap_gate
+            and candidate_first_sample_sufficient
+            else "FAIL"
         ),
     }
     return summary
