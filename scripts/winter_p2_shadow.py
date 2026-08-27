@@ -52,20 +52,20 @@ from arctic_route_planning.layered import (
     FourLayerPlanningService,
 )
 from arctic_route_planning.planners import PlanningRequest, TimeDependentAStar
-from arctic_route_planning.planners.control_trace_reuse import (
+from arctic_route_planning.planners._archive.control_trace_reuse import (
     trace_plan as control_trace_plan,
 )
-from arctic_route_planning.planners.control_trace_reuse import (
+from arctic_route_planning.planners._archive.control_trace_reuse import (
     try_reuse as try_control_trace_reuse,
 )
 from arctic_route_planning.planners.temporal_label_astar import TemporalLabelAStar
-from arctic_route_planning.planners.temporal_reuse import (
+from arctic_route_planning.planners._archive.temporal_reuse import (
     TemporalCertifiedGoal,
     TemporalReuseOutcome,
     certify_session,
     try_reuse,
 )
-from arctic_route_planning.planners.temporal_session import TemporalSessionIdentity
+from arctic_route_planning.planners._archive.temporal_session import TemporalSessionIdentity
 from arctic_route_planning.publishing import (
     four_layer_route_plan_set_to_dict,
     route_plan_v3_to_dict,
@@ -2727,6 +2727,7 @@ def _prepared_shadow_track(
     cpu_pin_cpu: int | None = None,
     cpu_pin_succeeded: bool | None = None,
     diagnostic_profile: str = "baseline",
+    warmup_runs: int = 0,
 ) -> tuple[Any, list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     """Execute exactly one formal-prepared shadow track.
 
@@ -2734,18 +2735,41 @@ def _prepared_shadow_track(
     ``execute_four_layer_temporal_shadow_track`` and return an object with an
     ``outcome`` and per-layer/objective ``timings``.  Falling back to the old
     combined shadow call would make isolated RSS and timing claims false.
+
+    ``warmup_runs`` (M2K symmetric warm-up): when >0, the same track is run that
+    many times *before* the timed run, discarding results and timings.  This
+    removes the first-track cold-start bias (risk-frame/grid/sampler
+    initialization paid by whichever track runs first) that the M2J
+    ``order-gap`` gate observed as a large candidate-first regression paired
+    with a negative control-first regression.  Both tracks are warmed before
+    their timed measurement, making the comparison symmetric.
     """
 
     if candidate_mode != "control-trace":
         raise ValueError("the single-track formal shadow runner requires control-trace")
     if track not in {"control", "candidate"}:
         raise ValueError("track must be control or candidate")
+    if warmup_runs < 0:
+        raise ValueError("warmup_runs must be non-negative")
     method = getattr(prepared.prepared, "execute_four_layer_temporal_shadow_track", None)
     if not callable(method):
         raise RuntimeError(
             "PreparedRiskPlanning lacks the required single-track shadow API: "
             "execute_four_layer_temporal_shadow_track"
         )
+    for _ in range(warmup_runs):
+        warm = method(
+            track=track,
+            candidate_mode="control_trace",
+            diagnostic_profile=diagnostic_profile,
+        )
+        # Warm-up run must still prove production isolation; discard timing.
+        if getattr(warm, "outcome", None) is None:
+            raise RuntimeError("shadow warm-up run produced no outcome")
+        if bool(getattr(warm, "production_published", False)) or bool(
+            getattr(getattr(warm, "outcome", None), "published", False)
+        ):
+            raise RuntimeError("shadow warm-up crossed the formal publication boundary")
     started = time.perf_counter()
     usage_before = resource.getrusage(resource.RUSAGE_SELF)
     swap_before = _swap_counters()
@@ -2845,6 +2869,7 @@ def _run_in_process_case(
                 track=track,
                 candidate_mode=args.candidate_mode,
                 diagnostic_profile=getattr(args, "diagnostic_profile", "baseline"),
+                warmup_runs=getattr(args, "warmup_runs", 0),
             )
             outcomes[track] = outcome
             records[track] = [
@@ -2939,6 +2964,8 @@ def _worker_command(
         getattr(args, "evidence_mode", "auto"),
         "--diagnostic-profile",
         effective_diagnostic_profile,
+        "--warmup-runs",
+        str(getattr(args, "warmup_runs", 0)),
         "--_track-worker",
         track,
         "--_worker-result",
@@ -3058,6 +3085,7 @@ def _run_track_worker(args: argparse.Namespace) -> int:
                 diagnostic_profile=getattr(args, "diagnostic_profile", "baseline"),
                 cpu_pin_cpu=cpu_pin_cpu,
                 cpu_pin_succeeded=cpu_pin_succeeded,
+                warmup_runs=getattr(args, "warmup_runs", 0),
             )
             payload = {
                 "ok": True,
@@ -3251,6 +3279,7 @@ def _manifest(
             / "src"
             / "arctic_route_planning"
             / "planners"
+            / "_archive"
             / "control_trace_reuse.py"
         ),
     }
@@ -3353,6 +3382,7 @@ def _manifest(
                 args, "evidence_mode_effective", getattr(args, "evidence_mode", "auto")
             ),
             "diagnostic_profile": getattr(args, "diagnostic_profile", "baseline"),
+            "warmup_runs": getattr(args, "warmup_runs", 0),
             "worker_timeout_seconds": args.worker_timeout_seconds,
         },
         "runtime": {
@@ -3753,6 +3783,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=ObjectiveMode.RECOMMENDED.value,
     )
     parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument(
+        "--warmup-runs",
+        type=int,
+        default=0,
+        help=(
+            "M2K symmetric warm-up: run each shadow track this many times before the "
+            "timed run and discard results, removing first-track cold-start bias. "
+            "Default 0 preserves legacy M2J behavior."
+        ),
+    )
     parser.add_argument(
         "--execution-order",
         default="alternate",
