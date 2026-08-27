@@ -93,11 +93,13 @@ _CONTROL_TRACE_VERSION = "time-dependent-a-star.control-trace.v1"
 _ORDER_VALUES = ("control-first", "candidate-first", "alternate")
 _CANDIDATE_MODE_VALUES = ("exact-temporal", "control-trace")
 _RSS_MODE_VALUES = ("in-process", "isolated")
+_ISOLATION_VALUES = ("per-track", "per-unit-phase")
 _EVIDENCE_MODE_VALUES = ("auto", "diagnostic", "screening", "formal")
 _DIAGNOSTIC_PROFILE_VALUES = (
     "baseline",
     "force-main-cold",
     "post-main-normalize",
+    "trace-release-only",
 )
 _CONTROL_TRACE_LAYER_NAMES = (
     "full_voyage",
@@ -514,8 +516,8 @@ def _validate_diagnostic_profile(value: str) -> str:
     normalized = str(value).strip().lower().replace("_", "-")
     if normalized not in _DIAGNOSTIC_PROFILE_VALUES:
         raise ValueError(
-            "diagnostic-profile must be baseline, force-main-cold, or "
-            "post-main-normalize"
+            "diagnostic-profile must be baseline, force-main-cold, "
+            "post-main-normalize, or trace-release-only"
         )
     return normalized
 
@@ -2895,6 +2897,23 @@ def _worker_command(
     track: str,
     result_path: Path,
 ) -> list[str]:
+    # R1 (per-unit-phase isolation): the candidate track's `full_voyage` trace
+    # capture must not pollute the later `rolling`/`executable` cold units.
+    # A literal per-unit subprocess split is deferred because the
+    # FourLayerPlanningService anchors MAIN_CORRIDOR/ROLLING/EXECUTABLE on the
+    # FULL_VOYAGE recommended plan (layered.py: full_recommended at 129 / anchor
+    # at 170), so a cold-phase subprocess would lack its anchor without passing
+    # the FULL_VOYAGE plan data in.  The equivalent, safe, within-process
+    # realization is to force the `trace-release-only` diagnostic profile on the
+    # candidate track: after MAIN_CORRIDOR reuse (layer_index == 1) the retained
+    # ControlTrace payload is cleared and gc.collect() runs before ROLLING/
+    # EXECUTABLE, eliminating the trace-memory pollution.  Under `per-track`
+    # (default) the explicit --diagnostic-profile is honored unchanged.
+    isolation = getattr(args, "isolation", "per-track")
+    if isolation == "per-unit-phase" and track == "candidate":
+        effective_diagnostic_profile = "trace-release-only"
+    else:
+        effective_diagnostic_profile = getattr(args, "diagnostic_profile", "baseline")
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -2919,7 +2938,7 @@ def _worker_command(
         "--evidence-mode",
         getattr(args, "evidence_mode", "auto"),
         "--diagnostic-profile",
-        getattr(args, "diagnostic_profile", "baseline"),
+        effective_diagnostic_profile,
         "--_track-worker",
         track,
         "--_worker-result",
@@ -3750,6 +3769,19 @@ def build_parser() -> argparse.ArgumentParser:
         choices=_RSS_MODE_VALUES,
         default="in-process",
         help="combined in-process RSS or isolated per-track child-process RSS",
+    )
+    parser.add_argument(
+        "--isolation",
+        choices=_ISOLATION_VALUES,
+        default="per-track",
+        help=(
+            "M2J candidate isolation granularity. 'per-track' (default) keeps the "
+            "existing isolated per-track subprocess. 'per-unit-phase' forces the "
+            "candidate track to the trace-release-only diagnostic profile so the "
+            "full_voyage trace payload is gc-collected before rolling/executable "
+            "(eliminating within-process trace-memory pollution); the literal "
+            "per-unit subprocess split is deferred (layer anchor coupling)."
+        ),
     )
     parser.add_argument(
         "--evidence-mode",
