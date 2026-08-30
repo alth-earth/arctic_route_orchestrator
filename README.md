@@ -131,9 +131,11 @@ were environment/import-resolution diagnostics for `numpy`, `geospatial`,
 `presentation.viewer-presentation.v1` metadata to the Viewer bundle. The
 metadata makes the display boundary explicit: risk and hard layers are exact
 authoritative cells with no interpolation, route drawing uses display-only
-geometry with an authoritative-polyline fallback, and vessel position/heading
-are derived from the timeline and active authoritative segment. This export metadata does not alter
-`bc.risk-frame.v2`, route waypoints, ETA, adoption, or causal replay semantics.
+geometry with an authoritative-polyline fallback, and the Viewer may derive
+presentation vessel position/heading from that curve using the timeline's raw
+ETA and active-revision anchors. This export metadata does not alter
+`bc.risk-frame.v2`, route waypoints, ETA, adoption, authoritative vessel-motion,
+or causal replay semantics.
 
 ## Route display smoothing（2026-08-30 23:38 +08:00）
 
@@ -141,7 +143,10 @@ are derived from the timeline and active authoritative segment. This export meta
 constrained local cubic B-spline paint geometry for planned route lines, with
 authoritative-polyline linear densification as fallback. The metadata remains
 presentation-only: it does not alter route waypoints, ETA, route metrics,
-adoption, risk, or vessel-motion semantics; D owns the browser implementation.
+adoption, risk, or authoritative vessel-motion semantics; D owns the browser
+implementation. D may also use the accepted display curve for Viewer-only
+simulated position, heading, trail, and completed-track painting, anchored to
+the raw ETA timeline and never written back to the bundle.
 
 ## 当前状态
 

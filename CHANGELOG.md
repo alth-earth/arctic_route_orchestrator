@@ -16,7 +16,8 @@ Last Verified: 2026-08-30 23:38 +08:00
 - presentation: `presentation.viewer-presentation.v1` declares constrained local
   cubic B-spline paint geometry for planned route lines and authoritative-polyline
   linear densification as its fail-closed fallback；不改变 waypoint、ETA、metrics、
-  risk、adoption 或 vessel-motion 语义；
+  risk、adoption 或权威 vessel-motion 语义；D Viewer 可在本地以原始 ETA 时间锚点让
+  仿真船位/航向/轨迹沿已接受曲线绘制，不写回 bundle，也不构成生产运动资格；
 
 ## Unreleased - Winter Combined Viewer Assembly（2026-08-23 20:14 +08:00）
 
