@@ -7,7 +7,7 @@ Document Role: CANONICAL
 Scope: orchestrator package README
 Canonical For: orchestrator role and ownership
 Branch: research-validation-system
-Last Verified: 2026-08-23
+Last Verified: 2026-08-30 23:38 +08:00
 Related Canonical Docs: ../arctic_route_governance/current/architecture/ARCTIC_ROUTE_SYSTEM.md
 ---
 
@@ -130,10 +130,18 @@ were environment/import-resolution diagnostics for `numpy`, `geospatial`,
 `scripts/replay_viewer_export.py` now adds backward-compatible
 `presentation.viewer-presentation.v1` metadata to the Viewer bundle. The
 metadata makes the display boundary explicit: risk and hard layers are exact
-authoritative cells with no interpolation, route densification is display-only
-and collinear, and vessel position/heading are derived from the timeline and
-active authoritative segment. This export metadata does not alter
+authoritative cells with no interpolation, route drawing uses display-only
+geometry with an authoritative-polyline fallback, and vessel position/heading
+are derived from the timeline and active authoritative segment. This export metadata does not alter
 `bc.risk-frame.v2`, route waypoints, ETA, adoption, or causal replay semantics.
+
+## Route display smoothing（2026-08-30 23:38 +08:00）
+
+`VIEWER_PRESENTATION.route_rendering` now declares that the D Viewer may use
+constrained local cubic B-spline paint geometry for planned route lines, with
+authoritative-polyline linear densification as fallback. The metadata remains
+presentation-only: it does not alter route waypoints, ETA, route metrics,
+adoption, risk, or vessel-motion semantics; D owns the browser implementation.
 
 ## 当前状态
 

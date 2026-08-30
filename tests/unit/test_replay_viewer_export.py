@@ -84,6 +84,12 @@ def test_viewer_presentation_declares_display_only_geometry_policies() -> None:
     assert _viewer_presentation["risk_rendering"]["hard_reason_policy"] == (
         "separate_exact_cells_fail_closed"
     )
+    assert _viewer_presentation["route_rendering"]["geometry_policy"] == (
+        "authoritative_waypoints_constrained_local_cubic_bspline_for_display_only"
+    )
+    assert _viewer_presentation["route_rendering"]["fallback_policy"] == (
+        "authoritative_polyline_linear_densification"
+    )
     assert _viewer_presentation["route_rendering"]["authoritative_semantics_unchanged"]
     assert _viewer_presentation["vessel_rendering"]["pixel_motion"] == "none"
 

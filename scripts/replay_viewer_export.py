@@ -62,7 +62,11 @@ VIEWER_PRESENTATION = {
     },
     "route_rendering": {
         "source": "routes.waypoints",
-        "geometry_policy": "authoritative_polyline_linear_densification_for_display",
+        "geometry_policy": (
+            "authoritative_waypoints_constrained_local_cubic_bspline_"
+            "for_display_only"
+        ),
+        "fallback_policy": "authoritative_polyline_linear_densification",
         "authoritative_semantics_unchanged": True,
         "candidate_source": "route_candidates",
         "candidate_empty_policy": "keep_single_authoritative_route",

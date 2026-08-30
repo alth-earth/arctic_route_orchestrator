@@ -6,10 +6,17 @@ Content Status:
 Document Role: SUPPORTING
 Scope: orchestrator change history
 Branch: research-validation-system
-Last Verified: 2026-08-23
+Last Verified: 2026-08-30 23:38 +08:00
 ---
 
 # Changelog
+
+## Unreleased - Route display smoothing（2026-08-30 23:38 +08:00）
+
+- presentation: `presentation.viewer-presentation.v1` declares constrained local
+  cubic B-spline paint geometry for planned route lines and authoritative-polyline
+  linear densification as its fail-closed fallback；不改变 waypoint、ETA、metrics、
+  risk、adoption 或 vessel-motion 语义；
 
 ## Unreleased - Winter Combined Viewer Assembly（2026-08-23 20:14 +08:00）
 
