@@ -8,6 +8,8 @@ timeline/``vessel_state_at`` path when the sidecar is invalid or unavailable.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -40,6 +42,8 @@ class ResearchRouteMotionState:
     sample_index: int | None
     course_degrees: float | None
     fallback_reason: str | None
+    speed_knots: float = 0.0
+    segment_progress: float | None = None
     interpolation: str = INTERPOLATION
 
 
@@ -90,6 +94,11 @@ def _invalid(reason: str) -> ResearchRouteMotionValidation:
     return ResearchRouteMotionValidation(valid=False, reason=reason)
 
 
+def _canonical_digest(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def validate_research_route_sidecar(
     sidecar: Any,
     *,
@@ -105,6 +114,22 @@ def validate_research_route_sidecar(
         return _invalid("sidecar_not_research_only")
     if sidecar.get("status") != "ACCEPTED" or sidecar.get("applied") is not True:
         return _invalid(str(sidecar.get("fallback_reason") or "sidecar_not_accepted"))
+    if sidecar.get("research_eligible") is not True:
+        return _invalid("research_gate_not_passed")
+    gate = sidecar.get("validation")
+    if not isinstance(gate, dict) or gate.get("research_gate_passed") is not True:
+        return _invalid("research_gate_not_passed")
+    if any(
+        gate.get(name) is not True
+        for name in (
+            "risk_rechecked",
+            "hard_mask_rechecked",
+            "coverage_complete",
+            "eta_recomputed",
+            "speed_checked",
+        )
+    ):
+        return _invalid("research_gate_incomplete")
     raw_digest = sidecar.get("raw_route_digest")
     if not isinstance(raw_digest, str) or not raw_digest:
         return _invalid("missing_raw_route_digest")
@@ -127,6 +152,13 @@ def validate_research_route_sidecar(
         for previous, current in pairwise(typed_samples)
     ):
         return _invalid("non_monotonic_motion_sample_eta")
+    declared_digest = sidecar.get("sidecar_digest")
+    if not isinstance(declared_digest, str):
+        return _invalid("missing_sidecar_digest")
+    digest_payload = dict(sidecar)
+    digest_payload.pop("sidecar_digest", None)
+    if _canonical_digest(digest_payload) != declared_digest:
+        return _invalid("sidecar_digest_invalid")
     return ResearchRouteMotionValidation(valid=True, reason=None, sample_count=len(typed_samples))
 
 
@@ -152,6 +184,20 @@ def _course(start: _Sample, end: _Sample) -> float | None:
         GeoPoint(longitude=start.longitude, latitude=start.latitude),
         GeoPoint(longitude=end.longitude, latitude=end.latitude),
     )
+
+
+def _haversine_km(start: GeoPoint, end: GeoPoint) -> float:
+    from math import asin, cos, radians, sin, sqrt
+
+    lat1 = radians(start.latitude)
+    lat2 = radians(end.latitude)
+    delta_lat = lat2 - lat1
+    delta_lon = radians(end.longitude - start.longitude)
+    haversine = (
+        sin(delta_lat / 2.0) ** 2
+        + cos(lat1) * cos(lat2) * sin(delta_lon / 2.0) ** 2
+    )
+    return 2.0 * 6_371.0088 * asin(min(1.0, sqrt(haversine)))
 
 
 def research_motion_at(
@@ -195,6 +241,8 @@ def research_motion_at(
             sample_index=0,
             course_degrees=None,
             fallback_reason=None,
+            speed_knots=0.0,
+            segment_progress=0.0,
         )
     if tick >= samples[-1].eta:
         return ResearchRouteMotionState(
@@ -204,6 +252,8 @@ def research_motion_at(
             sample_index=len(samples) - 1,
             course_degrees=None,
             fallback_reason=None,
+            speed_knots=0.0,
+            segment_progress=1.0,
         )
     index = 0
     for candidate in range(len(samples) - 1):
@@ -214,6 +264,11 @@ def research_motion_at(
     end = samples[index + 1]
     duration = (end.eta - start.eta).total_seconds()
     fraction = (tick - start.eta).total_seconds() / duration
+    distance_km = _haversine_km(
+        GeoPoint(longitude=start.longitude, latitude=start.latitude),
+        GeoPoint(longitude=end.longitude, latitude=end.latitude),
+    )
+    speed_knots = distance_km / (duration / 3600.0) / 1.852
     return ResearchRouteMotionState(
         valid=True,
         status="UNDERWAY",
@@ -224,6 +279,8 @@ def research_motion_at(
         sample_index=index,
         course_degrees=_course(start, end),
         fallback_reason=None,
+        speed_knots=speed_knots,
+        segment_progress=fraction,
     )
 
 

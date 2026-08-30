@@ -7,17 +7,27 @@ from datetime import UTC, datetime
 import pytest
 
 from arctic_route_orchestrator.replay.research_route_motion import (
+    _canonical_digest,
     research_motion_at,
     validate_research_route_sidecar,
 )
 
 
 def _sidecar() -> dict:
-    return {
+    sidecar = {
         "schema_version": "c.research-route-smoothing-sidecar.v1",
         "status": "ACCEPTED",
         "applied": True,
         "research_only": True,
+        "research_eligible": True,
+        "validation": {
+            "research_gate_passed": True,
+            "risk_rechecked": True,
+            "hard_mask_rechecked": True,
+            "coverage_complete": True,
+            "eta_recomputed": True,
+            "speed_checked": True,
+        },
         "raw_route_digest": "a" * 64,
         "authoritative_route": {"route_digest": "a" * 64},
         "motion_samples": [
@@ -26,6 +36,8 @@ def _sidecar() -> dict:
             {"lon": 1.0, "lat": 1.0, "eta": "2026-01-01T02:00:00Z"},
         ],
     }
+    sidecar["sidecar_digest"] = _canonical_digest(sidecar)
+    return sidecar
 
 
 def test_valid_sidecar_interpolates_and_keeps_explicit_statuses() -> None:

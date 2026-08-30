@@ -359,6 +359,17 @@ def test_optional_route_smoothing_sidecar_is_bound_to_the_authoritative_route(
         "status": "ACCEPTED",
         "applied": True,
         "research_only": True,
+        "research_eligible": True,
+        "plan_revision": route["revision"],
+        "adoption_time": route["effective_adoption_time"],
+        "validation": {
+            "research_gate_passed": True,
+            "risk_rechecked": True,
+            "hard_mask_rechecked": True,
+            "coverage_complete": True,
+            "eta_recomputed": True,
+            "speed_checked": True,
+        },
         "route_id": route["route_id"],
         "raw_route_digest": _EXPORTER._canonical_sha256(
             [[point["lon"], point["lat"]] for point in route["waypoints"]]
@@ -386,6 +397,17 @@ def test_optional_route_smoothing_sidecar_rejects_tampered_digest(tmp_path: Path
         "status": "ACCEPTED",
         "applied": True,
         "research_only": True,
+        "research_eligible": True,
+        "plan_revision": route["revision"],
+        "adoption_time": route["effective_adoption_time"],
+        "validation": {
+            "research_gate_passed": True,
+            "risk_rechecked": True,
+            "hard_mask_rechecked": True,
+            "coverage_complete": True,
+            "eta_recomputed": True,
+            "speed_checked": True,
+        },
         "route_id": route["route_id"],
         "raw_route_digest": "a" * 64,
         "authoritative_route": {"route_digest": "a" * 64},
@@ -408,6 +430,17 @@ def test_optional_route_smoothing_sidecar_rejects_authoritative_waypoint_drift(
         "status": "ACCEPTED",
         "applied": True,
         "research_only": True,
+        "research_eligible": True,
+        "plan_revision": route["revision"],
+        "adoption_time": route["effective_adoption_time"],
+        "validation": {
+            "research_gate_passed": True,
+            "risk_rechecked": True,
+            "hard_mask_rechecked": True,
+            "coverage_complete": True,
+            "eta_recomputed": True,
+            "speed_checked": True,
+        },
         "route_id": route["route_id"],
         "raw_route_digest": _EXPORTER._canonical_sha256(
             [[point["lon"], point["lat"]] for point in route["waypoints"]]

@@ -713,6 +713,26 @@ def _load_route_smoothing_sidecar(
         and sidecar.get("applied") is True,
         "route smoothing sidecar is not an accepted research result",
     )
+    _require(
+        sidecar.get("research_eligible") is True,
+        "route smoothing sidecar did not pass the research qualification gate",
+    )
+    validation = sidecar.get("validation")
+    _require(
+        isinstance(validation, dict)
+        and validation.get("research_gate_passed") is True
+        and all(
+            validation.get(name) is True
+            for name in (
+                "risk_rechecked",
+                "hard_mask_rechecked",
+                "coverage_complete",
+                "eta_recomputed",
+                "speed_checked",
+            )
+        ),
+        "route smoothing sidecar qualification evidence is incomplete",
+    )
     declared_digest = sidecar.get("sidecar_digest")
     _require(isinstance(declared_digest, str), "route smoothing sidecar digest is missing")
     digest_payload = dict(sidecar)
@@ -723,6 +743,19 @@ def _load_route_smoothing_sidecar(
     )
     route_id = sidecar.get("route_id")
     _require(route_id in (None, route.get("route_id")), "route smoothing route identity differs")
+    if sidecar.get("plan_revision") is not None and route.get("revision") is not None:
+        _require(
+            sidecar.get("plan_revision") == route.get("revision"),
+            "route smoothing plan revision differs",
+        )
+    if (
+        sidecar.get("adoption_time") is not None
+        and route.get("effective_adoption_time") is not None
+    ):
+        _require(
+            sidecar.get("adoption_time") == route.get("effective_adoption_time"),
+            "route smoothing adoption time differs",
+        )
     authoritative = sidecar.get("authoritative_route")
     _require(isinstance(authoritative, dict), "route smoothing authoritative route is missing")
     _require(
