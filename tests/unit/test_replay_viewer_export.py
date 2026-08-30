@@ -347,3 +347,106 @@ def test_winter_vessel_timeline_uses_waypoint_eta_and_linear_lon_lat() -> None:
     assert timeline[-1]["v"]["status"] == "ARRIVED"
     assert timeline[-1]["v"]["kn"] == 0.0
     assert timeline[-1]["ctl"] == 2
+
+
+def test_optional_route_smoothing_sidecar_is_bound_to_the_authoritative_route(
+    tmp_path: Path,
+) -> None:
+    route = _EXPORTER._winter_route_meta(_winter_plan())
+    sidecar = {
+        "schema_version": "c.research-route-smoothing-sidecar.v1",
+        "policy": "authoritative_waypoints_adaptive_local_cubic_bspline_motion_research_only",
+        "status": "ACCEPTED",
+        "applied": True,
+        "research_only": True,
+        "route_id": route["route_id"],
+        "raw_route_digest": _EXPORTER._canonical_sha256(
+            [[point["lon"], point["lat"]] for point in route["waypoints"]]
+        ),
+        "authoritative_route": {
+            "route_digest": None,
+            "waypoints": route["waypoints"],
+        },
+        "motion_samples": route["waypoints"],
+    }
+    sidecar["authoritative_route"]["route_digest"] = sidecar["raw_route_digest"]
+    sidecar["sidecar_digest"] = _EXPORTER._canonical_sha256(sidecar)
+    path = tmp_path / "route-smoothing.json"
+    path.write_text(json.dumps(sidecar), encoding="utf-8")
+
+    loaded = _EXPORTER._load_route_smoothing_sidecar(path, route=route)
+
+    assert loaded == sidecar
+
+
+def test_optional_route_smoothing_sidecar_rejects_tampered_digest(tmp_path: Path) -> None:
+    route = _EXPORTER._winter_route_meta(_winter_plan())
+    sidecar = {
+        "schema_version": "c.research-route-smoothing-sidecar.v1",
+        "status": "ACCEPTED",
+        "applied": True,
+        "research_only": True,
+        "route_id": route["route_id"],
+        "raw_route_digest": "a" * 64,
+        "authoritative_route": {"route_digest": "a" * 64},
+        "motion_samples": route["waypoints"],
+        "sidecar_digest": "b" * 64,
+    }
+    path = tmp_path / "tampered-route-smoothing.json"
+    path.write_text(json.dumps(sidecar), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sidecar digest is invalid"):
+        _EXPORTER._load_route_smoothing_sidecar(path, route=route)
+
+
+def test_optional_route_smoothing_sidecar_rejects_authoritative_waypoint_drift(
+    tmp_path: Path,
+) -> None:
+    route = _EXPORTER._winter_route_meta(_winter_plan())
+    sidecar = {
+        "schema_version": "c.research-route-smoothing-sidecar.v1",
+        "status": "ACCEPTED",
+        "applied": True,
+        "research_only": True,
+        "route_id": route["route_id"],
+        "raw_route_digest": _EXPORTER._canonical_sha256(
+            [[point["lon"], point["lat"]] for point in route["waypoints"]]
+        ),
+        "authoritative_route": {
+            "route_digest": None,
+            "waypoints": [dict(point) for point in route["waypoints"]],
+        },
+        "motion_samples": route["waypoints"],
+    }
+    sidecar["authoritative_route"]["route_digest"] = sidecar["raw_route_digest"]
+    sidecar["authoritative_route"]["waypoints"][1]["eta"] = "2026-02-15T00:00:01Z"
+    sidecar["sidecar_digest"] = _EXPORTER._canonical_sha256(sidecar)
+    path = tmp_path / "drifted-route-smoothing.json"
+    path.write_text(json.dumps(sidecar), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="authoritative waypoint differs"):
+        _EXPORTER._load_route_smoothing_sidecar(path, route=route)
+
+
+def test_research_sidecar_digest_changes_combined_presentation_identity() -> None:
+    identity = {
+        "scenario_id": "winter",
+        "dataset_bundle_id": "dataset",
+        "run_id": "run",
+        "risk_window_id": "risk",
+    }
+    route = {"waypoints": [{"eta": "2026-01-01T00:00:00Z"}, {"eta": "2026-01-01T01:00:00Z"}]}
+
+    _, baseline_digest = _EXPORTER._winter_combined_identity(
+        identity,
+        route=route,
+        cadence_seconds=60,
+    )
+    _, sidecar_digest = _EXPORTER._winter_combined_identity(
+        identity,
+        route=route,
+        cadence_seconds=60,
+        route_smoothing_sidecar_digest="a" * 64,
+    )
+
+    assert sidecar_digest != baseline_digest

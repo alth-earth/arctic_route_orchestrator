@@ -4,10 +4,11 @@ Content Status:
   - COMPLETED
   - PLANNED
 Document Role: CANONICAL
+Applicability: CURRENT
 Scope: orchestrator package README
 Canonical For: orchestrator role and ownership
 Branch: research-validation-system
-Last Verified: 2026-08-30 23:38 +08:00
+Last Verified: 2026-08-31 02:33 +08:00
 Related Canonical Docs: ../arctic_route_governance/current/architecture/ARCTIC_ROUTE_SYSTEM.md
 ---
 
@@ -32,6 +33,20 @@ DatasetBundle/RunContext/RiskWindow/candidate identity。任何 identity、geome
 RiskFrame membership 或 route-integrity 不一致均 fail closed。
 
 D 仍是唯一 Viewer runtime owner；本仓库只拥有 assembly、preflight 和 JSON/PNG 输出。
+
+## 研究曲线 sidecar 导出边界（2026-08-31 02:20 +08:00）
+
+`scripts/replay_viewer_export.py` 支持显式的 `--route-smoothing-sidecar PATH` 参数。该参数
+只接受与 Winter authoritative recommended route 身份绑定、状态为 `ACCEPTED` 且带有效
+digest 的 `c.research-route-smoothing-sidecar.v1`；通过后，sidecar 作为
+`bundle.research_validation.route_smoothing` 和 `source_files.route_smoothing_sidecar` 的
+研究构件一并导出。未传该参数时，既有 bundle 结构和默认 Viewer 行为不变。
+
+这条路径只用于隔离研究回放：Orchestrator 不重算曲线风险、hard mask、coverage、正式 ETA
+或船舶操纵性，也不修改 `cd.route-plan.v2/v3`、route metrics、replan adoption、formal
+latest 或 frozen artifact。D 必须由操作员显式打开研究运动开关；缺失、过期、身份不匹配
+或非法样本由 D 回退 timeline。当前 C sidecar 是 `GEOMETRY_ONLY`，不构成生产资格或实际
+航行控制证据。
 
 ## Research Validation role（2026-08-21 23:18）
 

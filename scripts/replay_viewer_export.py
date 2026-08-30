@@ -695,6 +695,88 @@ def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
     return value
 
 
+def _load_route_smoothing_sidecar(
+    path: Path,
+    *,
+    route: dict[str, Any],
+) -> dict[str, Any]:
+    """Load an explicitly requested research-only motion sidecar."""
+
+    sidecar = _read_json_object(path, label="route smoothing sidecar")
+    _require(
+        sidecar.get("schema_version") == "c.research-route-smoothing-sidecar.v1",
+        "route smoothing sidecar schema is unsupported",
+    )
+    _require(
+        sidecar.get("research_only") is True
+        and sidecar.get("status") == "ACCEPTED"
+        and sidecar.get("applied") is True,
+        "route smoothing sidecar is not an accepted research result",
+    )
+    declared_digest = sidecar.get("sidecar_digest")
+    _require(isinstance(declared_digest, str), "route smoothing sidecar digest is missing")
+    digest_payload = dict(sidecar)
+    digest_payload.pop("sidecar_digest", None)
+    _require(
+        declared_digest == _canonical_sha256(digest_payload),
+        "route smoothing sidecar digest is invalid",
+    )
+    route_id = sidecar.get("route_id")
+    _require(route_id in (None, route.get("route_id")), "route smoothing route identity differs")
+    authoritative = sidecar.get("authoritative_route")
+    _require(isinstance(authoritative, dict), "route smoothing authoritative route is missing")
+    _require(
+        authoritative.get("route_digest") == sidecar.get("raw_route_digest"),
+        "route smoothing authoritative digest is inconsistent",
+    )
+    coordinates = [
+        [waypoint["lon"], waypoint["lat"]]
+        for waypoint in route.get("waypoints", [])
+    ]
+    _require(
+        _canonical_sha256(coordinates) == sidecar.get("raw_route_digest"),
+        "route smoothing sidecar does not bind the Winter route",
+    )
+    authoritative_waypoints = authoritative.get("waypoints")
+    _require(
+        isinstance(authoritative_waypoints, list)
+        and len(authoritative_waypoints) == len(route.get("waypoints", [])),
+        "route smoothing authoritative waypoints are incomplete",
+    )
+    for expected, observed in zip(route["waypoints"], authoritative_waypoints, strict=True):
+        _require(
+            isinstance(observed, dict)
+            and observed.get("lon") == expected["lon"]
+            and observed.get("lat") == expected["lat"]
+            and observed.get("eta") == expected["eta"],
+            "route smoothing authoritative waypoint differs from the Winter route",
+        )
+    samples = sidecar.get("motion_samples")
+    _require(isinstance(samples, list) and len(samples) >= 2, "route smoothing samples are missing")
+    previous_eta: datetime | None = None
+    for sample in samples:
+        _require(isinstance(sample, dict), "route smoothing sample is not an object")
+        try:
+            sample_eta = _parse_utc(sample["eta"])
+            sample_lon = float(sample["lon"])
+            sample_lat = float(sample["lat"])
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise ValueError("route smoothing sample is invalid") from None
+        _require(
+            math.isfinite(sample_lon)
+            and math.isfinite(sample_lat)
+            and -180.0 <= sample_lon <= 180.0
+            and -90.0 <= sample_lat <= 90.0,
+            "route smoothing sample coordinates are invalid",
+        )
+        _require(
+            previous_eta is None or sample_eta > previous_eta,
+            "route smoothing sample ETA is not strictly increasing",
+        )
+        previous_eta = sample_eta
+    return sidecar
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -1036,6 +1118,7 @@ def _winter_combined_identity(
     *,
     route: dict[str, Any],
     cadence_seconds: int,
+    route_smoothing_sidecar_digest: str | None = None,
 ) -> tuple[str, str]:
     semantic_identity = {
         **identity,
@@ -1044,6 +1127,8 @@ def _winter_combined_identity(
         "timeline_source": "cd.route-plan.v3.waypoints.eta",
         "timeline_cadence_seconds": cadence_seconds,
     }
+    if route_smoothing_sidecar_digest is not None:
+        semantic_identity["route_smoothing_sidecar_digest"] = route_smoothing_sidecar_digest
     digest = _canonical_sha256(semantic_identity)
     return f"winter-viewer-sha256-{digest}", digest
 
@@ -1082,6 +1167,12 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
     )
     recommended = _winter_recommended_plan(plan_set)
     route = _winter_route_meta(recommended)
+    route_smoothing_sidecar = None
+    if args.route_smoothing_sidecar is not None:
+        route_smoothing_sidecar = _load_route_smoothing_sidecar(
+            args.route_smoothing_sidecar,
+            route=route,
+        )
     timeline = _winter_vessel_timeline(recommended, cadence_seconds=args.cadence_seconds)
     risk_store_root = (
         args.risk_store_root
@@ -1122,11 +1213,34 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         identity,
         route=route,
         cadence_seconds=args.cadence_seconds,
+        route_smoothing_sidecar_digest=(
+            route_smoothing_sidecar.get("sidecar_digest")
+            if route_smoothing_sidecar is not None
+            else None
+        ),
     )
     source_files = {
         name: {"path": str(path), "sha256": _sha256_file(path)}
         for name, path in required_paths.items()
     }
+    if args.route_smoothing_sidecar is not None:
+        source_files["route_smoothing_sidecar"] = {
+            "path": str(args.route_smoothing_sidecar),
+            "sha256": _sha256_file(args.route_smoothing_sidecar),
+        }
+    research_validation = {
+        "label": "Winter C Validation",
+        "scenario_label": "Winter Arctic Research",
+        "dataset_bundle_id": identity["dataset_bundle_id"],
+        "run_context_id": identity["run_id"],
+        "risk_window_id": identity["risk_window_id"],
+        "risk_schema": "bc.risk-frame.v2",
+        "risk_frame_count": identity["risk_frame_count"],
+        "route_schema": "cd.four-layer-route-plan-set.v3",
+        "candidate_schema": "presentation.route-candidates.v1",
+    }
+    if route_smoothing_sidecar is not None:
+        research_validation["route_smoothing"] = route_smoothing_sidecar
     bundle = {
         "schema_version": "replay.viewer-bundle.v1",
         "replay": {
@@ -1155,17 +1269,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             "timeline_source": "cd.route-plan.v3.waypoints.eta",
             "source_replay": None,
         },
-        "research_validation": {
-            "label": "Winter C Validation",
-            "scenario_label": "Winter Arctic Research",
-            "dataset_bundle_id": identity["dataset_bundle_id"],
-            "run_context_id": identity["run_id"],
-            "risk_window_id": identity["risk_window_id"],
-            "risk_schema": "bc.risk-frame.v2",
-            "risk_frame_count": identity["risk_frame_count"],
-            "route_schema": "cd.four-layer-route-plan-set.v3",
-            "candidate_schema": "presentation.route-candidates.v1",
-        },
+        "research_validation": research_validation,
         "basemap": metadata.to_dict(),
         "presentation": VIEWER_PRESENTATION,
         "gates": {
@@ -1276,6 +1380,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--winter-risk-window-commit", type=Path, default=None)
     parser.add_argument("--winter-plan-set", type=Path, default=None)
     parser.add_argument("--winter-route-integrity", type=Path, default=None)
+    parser.add_argument(
+        "--route-smoothing-sidecar",
+        type=Path,
+        default=None,
+        help="optional accepted C research-only route smoothing sidecar",
+    )
     parser.add_argument("--basemap-version", default="gebco-2026-d5a7e2fe3915-7baad866")
     parser.add_argument(
         "--output-dir",
