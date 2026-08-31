@@ -48,6 +48,22 @@ latest 或 frozen artifact。D 必须由操作员显式打开研究运动开关�
 或非法样本由 D 回退 timeline。当前 C sidecar 是 `GEOMETRY_ONLY`，不构成生产资格或实际
 航行控制证据。
 
+## 正式工程 Route Motion 传输（2026-08-31）
+
+Winter assembly 可通过 `--route-motion-set PATH` 接收 C 的
+`cd.route-motion-set.v1`。Orchestrator 会重新校验四层 recommended plan ID、完整
+waypoint/ETA/推荐速度 digest、RiskWindow、RunContext vessel、generation/revision 以及
+initial/replan adoption 起终点。通过后，集合进入 bundle 顶层 `route_motion_sets`，其
+`motion_set_id` 同时进入 assembly semantic identity；`combined_presentation` 用完整
+`route_motion_set_ids` 和逐 revision layer/RiskWindow binding 授权多个重规划集合；研究 sidecar 仍留在
+`research_validation`，两者不会互作 fallback。
+
+包含 plan/motion JSON 的正式输出可使用不可变目录发布器原子写入并由
+`checksums.json` 绑定；目录已存在时拒绝覆盖。Viewer export 的 Winter package 也先写入
+同级 staging 目录、manifest 最后落盘，再原子 rename。任一 motion 校验失败时不得注入
+motion set，原路线仍可按既有 raw waypoint/timeline 发布。本路径只代表工程仿真正式合同，
+不声明实船校准、导航级 corridor 或 UKC。
+
 ## Research Validation role（2026-08-21 23:18）
 
 The Orchestrator is the Pipeline / Artifact / Presentation Adapter. It owns

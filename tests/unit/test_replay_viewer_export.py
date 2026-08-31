@@ -76,7 +76,7 @@ def test_horizon_index_keeps_simulation_time_and_available_keys() -> None:
     assert entries[0]["selections"]["+24h"]["availability"] == "UNAVAILABLE"
 
 
-def test_viewer_presentation_declares_display_only_geometry_policies() -> None:
+def test_viewer_presentation_declares_formal_motion_and_raw_fallback_policies() -> None:
     assert _viewer_presentation["schema_version"] == "presentation.viewer-presentation.v1"
     assert _viewer_presentation["risk_rendering"]["geometry_policy"] == (
         "exact_authoritative_cells_no_interpolation"
@@ -85,10 +85,10 @@ def test_viewer_presentation_declares_display_only_geometry_policies() -> None:
         "separate_exact_cells_fail_closed"
     )
     assert _viewer_presentation["route_rendering"]["geometry_policy"] == (
-        "authoritative_waypoints_constrained_local_cubic_bspline_for_display_only"
+        "producer_motion_samples_when_formally_bound"
     )
     assert _viewer_presentation["route_rendering"]["fallback_policy"] == (
-        "authoritative_polyline_linear_densification"
+        "authoritative_route_waypoints"
     )
     assert _viewer_presentation["route_rendering"]["authoritative_semantics_unchanged"]
     assert _viewer_presentation["vessel_rendering"]["pixel_motion"] == "none"
@@ -552,7 +552,7 @@ def test_optional_route_smoothing_sidecar_rejects_authoritative_waypoint_drift(
         _EXPORTER._load_route_smoothing_sidecar(path, route=route)
 
 
-def test_research_sidecar_digest_changes_combined_presentation_identity() -> None:
+def test_optional_motion_artifacts_change_combined_presentation_identity() -> None:
     identity = {
         "scenario_id": "winter",
         "dataset_bundle_id": "dataset",
@@ -572,5 +572,13 @@ def test_research_sidecar_digest_changes_combined_presentation_identity() -> Non
         cadence_seconds=60,
         route_smoothing_sidecar_digest="a" * 64,
     )
+    _, formal_motion_digest = _EXPORTER._winter_combined_identity(
+        identity,
+        route=route,
+        cadence_seconds=60,
+        route_motion_set_ids=[f"route-motion-set-sha256-{'b' * 64}"],
+    )
 
     assert sidecar_digest != baseline_digest
+    assert formal_motion_digest != baseline_digest
+    assert formal_motion_digest != sidecar_digest

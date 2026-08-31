@@ -16,6 +16,7 @@ import math
 import os
 import struct
 import sys
+import tempfile
 import zlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -35,6 +36,10 @@ from arctic_route_orchestrator.replay.research_route_motion import (
     SIDECAR_SCHEMA_VERSION_V2,
     normalize_research_route_sidecar,
     validate_research_route_sidecar,
+)
+from arctic_route_orchestrator.route_motion import (
+    load_bound_route_motion_set,
+    validate_route_motion_context,
 )
 from arctic_route_orchestrator.route_presentation import load_route_candidates
 
@@ -56,19 +61,16 @@ VIEWER_PRESENTATION = {
         "hard_reason_policy": "separate_exact_cells_fail_closed",
     },
     "route_rendering": {
-        "source": "routes.waypoints",
-        "geometry_policy": (
-            "authoritative_waypoints_constrained_local_cubic_bspline_"
-            "for_display_only"
-        ),
-        "fallback_policy": "authoritative_polyline_linear_densification",
+        "source": "route_motion_sets.motion_samples_or_routes.waypoints",
+        "geometry_policy": "producer_motion_samples_when_formally_bound",
+        "fallback_policy": "authoritative_route_waypoints",
         "authoritative_semantics_unchanged": True,
         "candidate_source": "route_candidates",
         "candidate_empty_policy": "keep_single_authoritative_route",
     },
     "vessel_rendering": {
-        "position_source": "timeline.vessel_at",
-        "heading_source": "active_authoritative_route_segment_bearing",
+        "position_source": "formal_route_motion_or_timeline.vessel_at",
+        "heading_source": "formal_route_motion_course_or_route_segment_bearing",
         "pixel_motion": "none",
     },
 }
@@ -1101,6 +1103,7 @@ def _winter_route_meta(plan: dict[str, Any]) -> dict[str, Any]:
             "lon": waypoint["longitude"],
             "lat": waypoint["latitude"],
             "eta": waypoint["eta"],
+            "recommended_speed_mps": waypoint["recommended_speed_mps"],
         }
         for waypoint in plan["waypoints"]
     ]
@@ -1223,6 +1226,7 @@ def _winter_combined_identity(
     route: dict[str, Any],
     cadence_seconds: int,
     route_smoothing_sidecar_digest: str | None = None,
+    route_motion_set_ids: list[str] | None = None,
 ) -> tuple[str, str]:
     semantic_identity = {
         **identity,
@@ -1233,6 +1237,8 @@ def _winter_combined_identity(
     }
     if route_smoothing_sidecar_digest is not None:
         semantic_identity["route_smoothing_sidecar_digest"] = route_smoothing_sidecar_digest
+    if route_motion_set_ids:
+        semantic_identity["route_motion_set_ids"] = route_motion_set_ids
     digest = _canonical_sha256(semantic_identity)
     return f"winter-viewer-sha256-{digest}", digest
 
@@ -1271,6 +1277,21 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
     )
     recommended = _winter_recommended_plan(plan_set)
     route = _winter_route_meta(recommended)
+    route_motion_set = None
+    if args.route_motion_set is not None:
+        route_motion_set = load_bound_route_motion_set(
+            args.route_motion_set,
+            plan_set_document=plan_set,
+            replay_routes=[route],
+        )
+        validate_route_motion_context(
+            route_motion_set,
+            risk_window_id=identity["risk_window_id"],
+            risk_window_digest=identity["risk_window_digest"],
+            vessel_profile_id=run_context["vessel_profile_id"],
+            vessel_profile_version=run_context["vessel_profile_version"],
+            vessel_profile_digest=run_context["vessel_profile_digest"],
+        )
     route_smoothing_sidecar = None
     if args.route_smoothing_sidecar is not None:
         route_smoothing_sidecar = _load_route_smoothing_sidecar(
@@ -1322,6 +1343,11 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             if route_smoothing_sidecar is not None
             else None
         ),
+        route_motion_set_ids=(
+            [route_motion_set["motion_set_id"]]
+            if route_motion_set is not None
+            else None
+        ),
     )
     source_files = {
         name: {"path": str(path), "sha256": _sha256_file(path)}
@@ -1331,6 +1357,11 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         source_files["route_smoothing_sidecar"] = {
             "path": str(args.route_smoothing_sidecar),
             "sha256": _sha256_file(args.route_smoothing_sidecar),
+        }
+    if args.route_motion_set is not None:
+        source_files["route_motion_set"] = {
+            "path": str(args.route_motion_set),
+            "sha256": _sha256_file(args.route_motion_set),
         }
     research_validation = {
         "label": "Winter C Validation",
@@ -1391,8 +1422,31 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         "risk": risk,
         "acceptance_positions": _winter_acceptance_positions(timeline),
     }
-    output_dir = args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if route_motion_set is not None:
+        bundle["combined_presentation"]["route_motion_set_ids"] = [
+            route_motion_set["motion_set_id"]
+        ]
+        bundle["combined_presentation"]["route_motion_set_bindings"] = [
+            {
+                "motion_set_id": route_motion_set["motion_set_id"],
+                "layer_set_id": route_motion_set["layer_set_id"],
+                "risk_window_id": route_motion_set["risk_window_id"],
+                "risk_window_digest": route_motion_set["risk_window_digest"],
+            }
+        ]
+        bundle["route_motion_sets"] = [route_motion_set]
+    target_output_dir = args.output_dir.resolve()
+    _require(
+        not target_output_dir.exists(),
+        f"immutable Viewer output already exists: {target_output_dir}",
+    )
+    target_output_dir.parent.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{target_output_dir.name}.",
+            dir=target_output_dir.parent,
+        )
+    )
     _write_png(output_dir / "gebco_basemap.png", args.width, args.height, pixels)
     (output_dir / "basemap_metadata.json").write_text(
         json.dumps(metadata.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
@@ -1430,7 +1484,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         "status": "PASS",
         "assembly_id": assembly_id,
         "assembly_digest": assembly_digest,
-        "bundle_path": str(bundle_path),
+        "bundle_path": str(target_output_dir / "bundle.json"),
         "bundle_sha256": _sha256_file(bundle_path),
         "basemap_sha256": _sha256_file(output_dir / "gebco_basemap.png"),
         "preflight_sha256": _sha256_file(preflight_path),
@@ -1439,11 +1493,14 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         "timeline_samples": len(timeline),
         "risk_frames": len(risk["frames"]),
         "route_candidates": len(route_candidates["candidates"]),
+        "route_motion_sets": 1 if route_motion_set is not None else 0,
     }
     (output_dir / "winter-combined-viewer-manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    os.replace(output_dir, target_output_dir)
+    output_dir = target_output_dir
     print(
         "wrote",
         output_dir,
@@ -1490,6 +1547,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="optional accepted C research-only route smoothing sidecar",
     )
+    parser.add_argument(
+        "--route-motion-set",
+        type=Path,
+        default=None,
+        help="optional formally bound cd.route-motion-set.v1 artifact",
+    )
     parser.add_argument("--basemap-version", default="gebco-2026-d5a7e2fe3915-7baad866")
     parser.add_argument(
         "--output-dir",
@@ -1500,6 +1563,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.winter_plan_set is not None:
         return _export_winter_combined(args)
+    if args.route_motion_set is not None:
+        parser.error("--route-motion-set currently requires --winter-plan-set binding")
     if args.manifest is None:
         parser.error("manifest is required unless --winter-plan-set is supplied")
 
