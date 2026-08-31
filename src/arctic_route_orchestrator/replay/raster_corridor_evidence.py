@@ -22,6 +22,65 @@ _UNKNOWN_VALUES = frozenset(
 _COVERED_VALUES = frozenset({"AVAILABLE", "COVERED", "COMPLETE", "VALID", "PRESENT"})
 
 
+class PreparedRasterCorridorEvidence:
+    """Immutable, caller-scoped raster index for repeated corridor checks.
+
+    Preparation normalises the static grid and cell classifications once.  The
+    evaluated evidence is intentionally identical to
+    :func:`evaluate_raster_corridor_evidence`; this only removes repeated
+    parsing and never upgrades raster-resolution evidence into a continuous
+    navigation proof.
+    """
+
+    __slots__ = (
+        "_expected",
+        "_preparation_reason",
+        "_raster_coverage_complete",
+        "_supplied",
+    )
+
+    def __init__(
+        self,
+        raster_metadata: Mapping[str, Any],
+        raster_cells: Mapping[Any, Any] | Sequence[Any],
+    ) -> None:
+        if not isinstance(raster_metadata, Mapping):
+            self._expected = {}
+            self._supplied = {}
+            self._raster_coverage_complete = False
+            self._preparation_reason = "invalid_raster_metadata"
+            return
+        self._expected = _metadata_cell_bounds(raster_metadata)
+        supplied = _supplied_cells(raster_cells)
+        self._supplied = {
+            key: _cell_status(value) for key, value in supplied.items()
+        }
+        self._raster_coverage_complete = (
+            raster_metadata.get("coverage_complete", True) is True
+        )
+        if not self._expected:
+            self._preparation_reason = "invalid_raster_cell_bounds"
+        elif not self._raster_coverage_complete:
+            self._preparation_reason = "raster_coverage_incomplete"
+        else:
+            self._preparation_reason = None
+
+    def evaluate(
+        self,
+        span_convex_hulls: Sequence[Any],
+        *,
+        expansion_m: float = 500.0,
+    ) -> dict[str, Any]:
+        return _evaluate_prepared_raster_corridor_evidence(
+            self._expected,
+            self._supplied,
+            self._raster_coverage_complete,
+            self._preparation_reason,
+            span_convex_hulls,
+            expansion_m=expansion_m,
+        )
+
+
 def _number(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -244,21 +303,15 @@ def _supplied_cells(
     return {}
 
 
-def evaluate_raster_corridor_evidence(
-    raster_metadata: Mapping[str, Any],
-    raster_cells: Mapping[Any, Any] | Sequence[Any],
+def _evaluate_prepared_raster_corridor_evidence(
+    expected: Mapping[tuple[str, Any], Mapping[str, Any]],
+    supplied: Mapping[tuple[str, Any], tuple[str, bool]],
+    raster_coverage_complete: bool,
+    preparation_reason: str | None,
     span_convex_hulls: Sequence[Any],
     *,
     expansion_m: float = 500.0,
 ) -> dict[str, Any]:
-    """Evaluate supplied raster cells against expanded span-hull bboxes.
-
-    ``raster_metadata`` must describe either ``cell_bounds`` records or a
-    regular grid using origin, cell size, and row/column counts.  Coordinates
-    are caller-owned local metre coordinates; this function intentionally does
-    not perform a CRS or degree-to-metre conversion.
-    """
-
     base: dict[str, Any] = {
         "accepted": False,
         "complete": False,
@@ -275,7 +328,7 @@ def evaluate_raster_corridor_evidence(
         "unknown_cells": [],
         "missing_coverage_cells": [],
     }
-    if not isinstance(raster_metadata, Mapping):
+    if preparation_reason == "invalid_raster_metadata":
         base["reason"] = "invalid_raster_metadata"
         return base
     try:
@@ -303,12 +356,9 @@ def evaluate_raster_corridor_evidence(
     if not expanded:
         base["reason"] = "missing_span_convex_hulls"
         return base
-    expected = _metadata_cell_bounds(raster_metadata)
-    supplied = _supplied_cells(raster_cells)
     if not expected:
         base["reason"] = "invalid_raster_cell_bounds"
         return base
-    raster_coverage_complete = raster_metadata.get("coverage_complete", True) is True
     if not raster_coverage_complete:
         base["reason"] = "raster_coverage_incomplete"
 
@@ -339,7 +389,7 @@ def evaluate_raster_corridor_evidence(
             coverage_complete = False
             base["missing_coverage_cells"].append(_public_cell_id(cell_id))
         else:
-            status, coverage_complete = _cell_status(supplied[key])
+            status, coverage_complete = supplied[key]
             if not coverage_complete:
                 base["missing_coverage_cells"].append(_public_cell_id(cell_id))
             elif status == "LAND":
@@ -384,13 +434,43 @@ def evaluate_raster_corridor_evidence(
     return base
 
 
+def prepare_raster_corridor_evidence(
+    raster_metadata: Mapping[str, Any],
+    raster_cells: Mapping[Any, Any] | Sequence[Any],
+) -> PreparedRasterCorridorEvidence:
+    """Prepare immutable static raster state for repeated R2 shadow checks."""
+
+    return PreparedRasterCorridorEvidence(raster_metadata, raster_cells)
+
+
+def evaluate_raster_corridor_evidence(
+    raster_metadata: Mapping[str, Any],
+    raster_cells: Mapping[Any, Any] | Sequence[Any],
+    span_convex_hulls: Sequence[Any],
+    *,
+    expansion_m: float = 500.0,
+) -> dict[str, Any]:
+    """Evaluate supplied raster cells against expanded span-hull bboxes.
+
+    ``raster_metadata`` must describe either ``cell_bounds`` records or a
+    regular grid using origin, cell size, and row/column counts.  Coordinates
+    are caller-owned local metre coordinates; this function intentionally does
+    not perform a CRS or degree-to-metre conversion.
+    """
+
+    prepared = prepare_raster_corridor_evidence(raster_metadata, raster_cells)
+    return prepared.evaluate(span_convex_hulls, expansion_m=expansion_m)
+
+
 build_raster_corridor_evidence = evaluate_raster_corridor_evidence
 raster_corridor_evidence = evaluate_raster_corridor_evidence
 
 
 __all__ = [
     "METHOD",
+    "PreparedRasterCorridorEvidence",
     "build_raster_corridor_evidence",
     "evaluate_raster_corridor_evidence",
+    "prepare_raster_corridor_evidence",
     "raster_corridor_evidence",
 ]

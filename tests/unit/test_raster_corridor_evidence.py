@@ -5,6 +5,7 @@ import json
 from arctic_route_orchestrator.replay.raster_corridor_evidence import (
     METHOD,
     evaluate_raster_corridor_evidence,
+    prepare_raster_corridor_evidence,
 )
 
 
@@ -76,3 +77,33 @@ def test_missing_cell_is_missing_coverage_and_rejects_containment() -> None:
     assert evidence["accepted"] is False
     assert evidence["missing_coverage_cells"] == [[1, 1]]
     assert evidence["coverage_complete"] is False
+
+
+def test_prepared_evidence_is_byte_equivalent_and_input_isolated() -> None:
+    metadata = _metadata()
+    cells = {
+        (row, column): {"status": "SEA", "coverage_complete": True}
+        for row in range(3)
+        for column in range(3)
+    }
+    expected = evaluate_raster_corridor_evidence(
+        metadata, cells, [_hull()], expansion_m=0.0
+    )
+    prepared = prepare_raster_corridor_evidence(metadata, cells)
+
+    metadata["rows"] = 1
+    cells[(1, 1)]["status"] = "LAND"
+    actual = prepared.evaluate([_hull()], expansion_m=0.0)
+
+    assert actual == expected
+    assert json.dumps(actual, sort_keys=True) == json.dumps(expected, sort_keys=True)
+
+
+def test_prepared_evidence_preserves_fail_closed_invalid_metadata() -> None:
+    prepared = prepare_raster_corridor_evidence({}, {})
+
+    evidence = prepared.evaluate([_hull()], expansion_m=0.0)
+
+    assert evidence["accepted"] is False
+    assert evidence["reason"] == "invalid_raster_cell_bounds"
+    assert evidence["continuous_containment_proved"] is False
