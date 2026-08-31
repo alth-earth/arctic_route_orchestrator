@@ -201,6 +201,67 @@ def _winter_plan() -> dict:
     }
 
 
+def _v2_sidecar_for_route(route: dict) -> dict:
+    coordinates = [[point["lon"], point["lat"]] for point in route["waypoints"]]
+    route_digest = _EXPORTER._canonical_sha256(coordinates)
+    samples = [
+        {
+            "lon": point["lon"],
+            "lat": point["lat"],
+            "eta": point["eta"],
+            "course_degrees": 90.0,
+            "speed_knots": 10.0 if index < len(route["waypoints"]) - 1 else 0.0,
+        }
+        for index, point in enumerate(route["waypoints"])
+    ]
+    sidecar = {
+        "schema_version": "c.research-route-smoothing-sidecar.v2",
+        "status": "ACCEPTED",
+        "applied": True,
+        "research_only": True,
+        "research_eligible": True,
+        "production_qualified": False,
+        "calibration_status": "NOT_CALIBRATED",
+        "manoeuvring_qualification": "SYNTHETIC_ASSUMPTION_ONLY",
+        "route_id": route["route_id"],
+        "raw_route_digest": route_digest,
+        "curve_digest": "c" * 64,
+        "route_identity": {
+            "route_id": route["route_id"],
+            "route_digest": route_digest,
+        },
+        "authoritative_route": {
+            "route_id": route["route_id"],
+            "route_digest": route_digest,
+            "waypoints": route["waypoints"],
+        },
+        "validation": {
+            "research_gate_passed": True,
+            "risk_rechecked": True,
+            "hard_mask_rechecked": True,
+            "coverage_complete": True,
+            "eta_recomputed": True,
+            "speed_checked": True,
+            "curvature_checked": True,
+            "corridor_checked": True,
+            "kinematics_checked": True,
+        },
+        "motion_samples": samples,
+    }
+    sidecar["same_geometry_motion_digest"] = _EXPORTER._canonical_sha256(
+        {
+            "curve_digest": sidecar["curve_digest"],
+            "motion_samples": samples,
+        }
+    )
+    sidecar["same_geometry_motion_evidence"] = {
+        "same_geometry_motion_digest": sidecar["same_geometry_motion_digest"],
+        "sample_count": len(samples),
+    }
+    sidecar["sidecar_digest"] = _EXPORTER._canonical_sha256(sidecar)
+    return sidecar
+
+
 def _winter_identity_documents() -> tuple[dict, ...]:
     plan = _winter_plan()
     candidate_ids = [plan["plan_id"]] + [
@@ -388,6 +449,36 @@ def test_optional_route_smoothing_sidecar_is_bound_to_the_authoritative_route(
     loaded = _EXPORTER._load_route_smoothing_sidecar(path, route=route)
 
     assert loaded == sidecar
+
+
+def test_optional_v2_route_smoothing_sidecar_is_validated_and_bound(
+    tmp_path: Path,
+) -> None:
+    route = _EXPORTER._winter_route_meta(_winter_plan())
+    sidecar = _v2_sidecar_for_route(route)
+    path = tmp_path / "route-smoothing-v2.json"
+    path.write_text(json.dumps(sidecar), encoding="utf-8")
+
+    loaded = _EXPORTER._load_route_smoothing_sidecar(path, route=route)
+
+    assert loaded == sidecar
+    assert loaded["schema_version"] == "c.research-route-smoothing-sidecar.v2"
+
+
+def test_optional_v2_route_smoothing_sidecar_rejects_route_digest_mismatch(
+    tmp_path: Path,
+) -> None:
+    route = _EXPORTER._winter_route_meta(_winter_plan())
+    sidecar = _v2_sidecar_for_route(route)
+    sidecar["raw_route_digest"] = "c" * 64
+    sidecar["route_identity"]["route_digest"] = "c" * 64
+    sidecar["authoritative_route"]["route_digest"] = "c" * 64
+    sidecar["sidecar_digest"] = _EXPORTER._canonical_sha256(sidecar)
+    path = tmp_path / "route-smoothing-v2-mismatch.json"
+    path.write_text(json.dumps(sidecar), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="validation failed"):
+        _EXPORTER._load_route_smoothing_sidecar(path, route=route)
 
 
 def test_optional_route_smoothing_sidecar_rejects_tampered_digest(tmp_path: Path) -> None:

@@ -24,16 +24,6 @@ from typing import Any
 
 import numpy as np
 
-
-def _workspace_root() -> Path:
-    env = os.environ.get("ARCTIC_ROUTE_ROOT")
-    if env and Path(env).is_dir():
-        return Path(env)
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "arctic_route_contracts").is_dir():
-            return parent
-    return Path.home()
-
 from arctic_route_orchestrator.replay.geospatial import (
     BasemapMetadata,
     find_land_sea_mask,
@@ -41,6 +31,11 @@ from arctic_route_orchestrator.replay.geospatial import (
 )
 from arctic_route_orchestrator.replay.preflight import run_viewer_preflight
 from arctic_route_orchestrator.replay.presentation import PresentationAdapter
+from arctic_route_orchestrator.replay.research_route_motion import (
+    SIDECAR_SCHEMA_VERSION_V2,
+    normalize_research_route_sidecar,
+    validate_research_route_sidecar,
+)
 from arctic_route_orchestrator.route_presentation import load_route_candidates
 
 SEA_RGB = (46, 102, 150)
@@ -87,6 +82,16 @@ ROUTE_CANDIDATES_PACKAGE = {
 
 WINTER_COMBINED_SCHEMA = "presentation.winter-combined-viewer.v1"
 WINTER_MANIFEST_SCHEMA = "presentation.winter-combined-manifest.v1"
+
+
+def _workspace_root() -> Path:
+    env = os.environ.get("ARCTIC_ROUTE_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "arctic_route_contracts").is_dir():
+            return parent
+    return Path.home()
 
 
 def _route_candidates_package(
@@ -695,6 +700,70 @@ def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
     return value
 
 
+def _load_v2_route_smoothing_sidecar(
+    sidecar: dict[str, Any],
+    *,
+    route: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and bind an R1 v2 sidecar without changing the formal route."""
+
+    coordinates = [
+        [waypoint["lon"], waypoint["lat"]]
+        for waypoint in route.get("waypoints", [])
+    ]
+    expected_route_digest = _canonical_sha256(coordinates)
+    validation = validate_research_route_sidecar(
+        sidecar,
+        expected_route_digest=expected_route_digest,
+    )
+    _require(
+        validation.valid,
+        "route smoothing sidecar v2 validation failed: "
+        f"{validation.reason or 'unknown_reason'}",
+    )
+    normalized = normalize_research_route_sidecar(
+        sidecar,
+        expected_route_digest=expected_route_digest,
+    )
+    _require(normalized is not None, "route smoothing sidecar v2 motion view is invalid")
+
+    route_identity = sidecar["route_identity"]
+    _require(
+        route_identity.get("route_id") == route.get("route_id"),
+        "route smoothing route identity differs",
+    )
+    if sidecar.get("plan_revision") is not None and route.get("revision") is not None:
+        _require(
+            sidecar["plan_revision"] == route["revision"],
+            "route smoothing plan revision differs",
+        )
+    if (
+        sidecar.get("adoption_time") is not None
+        and route.get("effective_adoption_time") is not None
+    ):
+        _require(
+            sidecar["adoption_time"] == route["effective_adoption_time"],
+            "route smoothing adoption time differs",
+        )
+
+    authoritative = sidecar["authoritative_route"]
+    authoritative_waypoints = authoritative.get("waypoints")
+    _require(
+        isinstance(authoritative_waypoints, list)
+        and len(authoritative_waypoints) == len(route.get("waypoints", [])),
+        "route smoothing authoritative waypoints are incomplete",
+    )
+    for expected, observed in zip(route["waypoints"], authoritative_waypoints, strict=True):
+        _require(
+            isinstance(observed, dict)
+            and observed.get("lon") == expected["lon"]
+            and observed.get("lat") == expected["lat"]
+            and observed.get("eta") == expected["eta"],
+            "route smoothing authoritative waypoint differs from the Winter route",
+        )
+    return sidecar
+
+
 def _load_route_smoothing_sidecar(
     path: Path,
     *,
@@ -703,6 +772,8 @@ def _load_route_smoothing_sidecar(
     """Load an explicitly requested research-only motion sidecar."""
 
     sidecar = _read_json_object(path, label="route smoothing sidecar")
+    if sidecar.get("schema_version") == SIDECAR_SCHEMA_VERSION_V2:
+        return _load_v2_route_smoothing_sidecar(sidecar, route=route)
     _require(
         sidecar.get("schema_version") == "c.research-route-smoothing-sidecar.v1",
         "route smoothing sidecar schema is unsupported",
