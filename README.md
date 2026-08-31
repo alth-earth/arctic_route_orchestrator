@@ -34,23 +34,23 @@ RiskFrame membership 或 route-integrity 不一致均 fail closed。
 
 D 仍是唯一 Viewer runtime owner；本仓库只拥有 assembly、preflight 和 JSON/PNG 输出。
 
-## 研究曲线 sidecar 导出边界（2026-08-31 02:20 +08:00）
+## 研究曲线 sidecar 导出边界（历史兼容，2026-08-31）
 
 `scripts/replay_viewer_export.py` 支持显式的 `--route-smoothing-sidecar PATH` 参数。该参数
 只接受与 Winter authoritative recommended route 身份绑定、状态为 `ACCEPTED` 且带有效
 digest 的 `c.research-route-smoothing-sidecar.v1`；通过后，sidecar 作为
 `bundle.research_validation.route_smoothing` 和 `source_files.route_smoothing_sidecar` 的
-研究构件一并导出。未传该参数时，既有 bundle 结构和默认 Viewer 行为不变。
+研究构件一并导出。它只为历史实验和显式研究工具保留，默认 Viewer 不加载该 reader，
+也不能作为正式 motion 失效时的生产 fallback。
 
 这条路径只用于隔离研究回放：Orchestrator 不重算曲线风险、hard mask、coverage、正式 ETA
 或船舶操纵性，也不修改 `cd.route-plan.v2/v3`、route metrics、replan adoption、formal
-latest 或 frozen artifact。D 必须由操作员显式打开研究运动开关；缺失、过期、身份不匹配
-或非法样本由 D 回退 timeline。当前 C sidecar 是 `GEOMETRY_ONLY`，不构成生产资格或实际
+latest 或 frozen artifact。当前 C sidecar 是 `GEOMETRY_ONLY`，不构成生产资格或实际
 航行控制证据。
 
 ## 正式工程 Route Motion 传输（2026-08-31）
 
-Winter assembly 可通过 `--route-motion-set PATH` 接收 C 的
+Winter assembly 通过 `--route-motion-set PATH --require-route-motion` 接收 C 的
 `cd.route-motion-set.v1`。Orchestrator 会重新校验四层 recommended plan ID、完整
 waypoint/ETA/推荐速度 digest、RiskWindow、RunContext vessel、generation/revision 以及
 initial/replan adoption 起终点。通过后，集合进入 bundle 顶层 `route_motion_sets`，其
@@ -58,10 +58,13 @@ initial/replan adoption 起终点。通过后，集合进入 bundle 顶层 `rout
 `route_motion_set_ids` 和逐 revision layer/RiskWindow binding 授权多个重规划集合；研究 sidecar 仍留在
 `research_validation`，两者不会互作 fallback。
 
+默认 `work_package_d/viewer/` 目标会自动要求正式 motion；缺少参数会在导出前明确失败。
 包含 plan/motion JSON 的正式输出可使用不可变目录发布器原子写入并由
-`checksums.json` 绑定；目录已存在时拒绝覆盖。Viewer export 的 Winter package 也先写入
+`checksums.json` 绑定；Winter package 会同时保存四层 plan set 和
+`route-motion-set.json` 传输副本（正式 motion 存在时），目录已存在时拒绝覆盖。Viewer export 也先写入
 同级 staging 目录、manifest 最后落盘，再原子 rename。任一 motion 校验失败时不得注入
-motion set，原路线仍可按既有 raw waypoint/timeline 发布。本路径只代表工程仿真正式合同，
+motion set；默认生产导出拒绝发布，已运行 bundle 在 D 运行时仍按 fail-closed 使用 raw
+waypoint/timeline。本路径只代表工程仿真正式合同，
 不声明实船校准、导航级 corridor 或 UKC。
 
 ## Research Validation role（2026-08-21 23:18）

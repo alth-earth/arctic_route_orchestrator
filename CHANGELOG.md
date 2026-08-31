@@ -11,6 +11,17 @@ Last Verified: 2026-08-30 23:38 +08:00
 
 # Changelog
 
+## Unreleased - Formal route motion default transport（2026-08-31）
+
+- production/default Winter export now requires a validated `cd.route-motion-set.v1`
+  via `--require-route-motion`; the preflight records the formal-motion gate and the
+  immutable manifest records whether the requirement was active;
+- immutable Winter packages now carry the bound four-layer plan set and formal motion
+  JSON as checksum-covered transport files;
+- historical research smoothing sidecars remain export-compatible for explicit research
+  use but are not a production fallback;
+- no RoutePlan, ETA, risk, R1/R2, or historical sidecar artifact was rewritten.
+
 ## Unreleased - Route display smoothing（2026-08-30 23:38 +08:00）
 
 - presentation: `presentation.viewer-presentation.v1` declares constrained local

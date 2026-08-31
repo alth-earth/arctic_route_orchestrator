@@ -2,6 +2,7 @@ import importlib.util
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -582,3 +583,20 @@ def test_optional_motion_artifacts_change_combined_presentation_identity() -> No
     assert sidecar_digest != baseline_digest
     assert formal_motion_digest != baseline_digest
     assert formal_motion_digest != sidecar_digest
+
+
+def test_production_winter_export_requires_formal_motion_artifact() -> None:
+    args = SimpleNamespace(
+        output_dir=Path("/root/my_project/work_package_d/viewer"),
+        require_route_motion=False,
+        route_motion_set=None,
+    )
+
+    with pytest.raises(ValueError, match="requires --route-motion-set"):
+        _EXPORTER._export_winter_combined(args)
+
+
+def test_viewer_presentation_declares_formal_motion_fail_closed_policy() -> None:
+    route_rendering = _EXPORTER.VIEWER_PRESENTATION["route_rendering"]
+    assert route_rendering["formal_motion_required_for_production_default"] is True
+    assert route_rendering["formal_motion_failure_policy"] == "RAW_WAYPOINT_TIMELINE_FAIL_CLOSED"

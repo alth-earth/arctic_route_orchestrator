@@ -65,6 +65,8 @@ VIEWER_PRESENTATION = {
         "geometry_policy": "producer_motion_samples_when_formally_bound",
         "fallback_policy": "authoritative_route_waypoints",
         "authoritative_semantics_unchanged": True,
+        "formal_motion_required_for_production_default": True,
+        "formal_motion_failure_policy": "RAW_WAYPOINT_TIMELINE_FAIL_CLOSED",
         "candidate_source": "route_candidates",
         "candidate_empty_policy": "keep_single_authoritative_route",
     },
@@ -1244,6 +1246,17 @@ def _winter_combined_identity(
 
 
 def _export_winter_combined(args: argparse.Namespace) -> int:
+    default_viewer_dir = (_workspace_root() / "work_package_d" / "viewer").resolve()
+    formal_motion_required = (
+        getattr(args, "require_route_motion", False)
+        or args.output_dir.resolve() == default_viewer_dir
+    )
+    if formal_motion_required and args.route_motion_set is None:
+        raise ValueError(
+            "production Winter export requires --route-motion-set; "
+            "use a separately generated formal cd.route-motion-set.v1 artifact"
+        )
+
     required_paths = {
         "dataset_bundle": args.winter_dataset_bundle,
         "run_context": args.winter_run_context,
@@ -1378,6 +1391,33 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         research_validation["route_smoothing"] = route_smoothing_sidecar
     bundle = {
         "schema_version": "replay.viewer-bundle.v1",
+        "formal_motion_inspection": {
+            "valid": route_motion_set is not None,
+            "source": "orchestrator_binding_preflight",
+            "schema_version": (
+                route_motion_set.get("schema_version")
+                if route_motion_set is not None
+                else None
+            ),
+            "motion_set_id": (
+                route_motion_set.get("motion_set_id")
+                if route_motion_set is not None
+                else None
+            ),
+            "record_count": (
+                len(route_motion_set.get("records", []))
+                if route_motion_set is not None
+                else 0
+            ),
+            "record_layers": (
+                [record["planning_layer"] for record in route_motion_set["records"]]
+                if route_motion_set is not None
+                else []
+            ),
+            "reason": (
+                None if route_motion_set is not None else "missing_formal_motion_set"
+            ),
+        },
         "replay": {
             "replay_id": assembly_id,
             "scenario_id": identity["scenario_id"],
@@ -1435,6 +1475,11 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             }
         ]
         bundle["route_motion_sets"] = [route_motion_set]
+    bundle["combined_presentation"]["formal_motion_policy"] = {
+        "required_for_production_default": True,
+        "runtime_failure_fallback": "RAW_WAYPOINT_TIMELINE",
+        "provided": route_motion_set is not None,
+    }
     target_output_dir = args.output_dir.resolve()
     _require(
         not target_output_dir.exists(),
@@ -1457,6 +1502,18 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         json.dumps(bundle, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
     )
+    plan_set_transport_path = output_dir / "four-layer-route-plan-set-v3.json"
+    plan_set_transport_path.write_text(
+        json.dumps(plan_set, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    motion_set_transport_path = None
+    if route_motion_set is not None:
+        motion_set_transport_path = output_dir / "route-motion-set.json"
+        motion_set_transport_path.write_text(
+            json.dumps(route_motion_set, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
     preflight_path = output_dir / "replay-viewer-preflight.json"
     preflight_path.write_text(
         json.dumps(
@@ -1471,6 +1528,11 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
                     "route_candidate_binding": "PASS",
                     "route_integrity": "PASS",
                     "timeline_eta_projection": "PASS",
+                    "formal_route_motion": (
+                        "PASS"
+                        if route_motion_set is not None
+                        else "NOT_PROVIDED_OPTIONAL_LEGACY_EXPORT"
+                    ),
                 },
             },
             ensure_ascii=False,
@@ -1494,9 +1556,38 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         "risk_frames": len(risk["frames"]),
         "route_candidates": len(route_candidates["candidates"]),
         "route_motion_sets": 1 if route_motion_set is not None else 0,
+        "formal_motion_required": formal_motion_required,
+        "transport_files": {
+            "plan_set": plan_set_transport_path.name,
+            "route_motion_set": (
+                motion_set_transport_path.name
+                if motion_set_transport_path is not None
+                else None
+            ),
+        },
     }
     (output_dir / "winter-combined-viewer-manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    checksum_names = [
+        "bundle.json",
+        "four-layer-route-plan-set-v3.json",
+        "basemap_metadata.json",
+        "gebco_basemap.png",
+        "replay-viewer-preflight.json",
+        "winter-combined-viewer-manifest.json",
+    ]
+    if motion_set_transport_path is not None:
+        checksum_names.insert(2, motion_set_transport_path.name)
+    checksums = {
+        "schema_version": "presentation.winter-combined-checksums.v1",
+        "files": {
+            name: _sha256_file(output_dir / name) for name in checksum_names
+        },
+    }
+    (output_dir / "checksums.json").write_text(
+        json.dumps(checksums, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
     os.replace(output_dir, target_output_dir)
@@ -1551,7 +1642,15 @@ def main(argv: list[str] | None = None) -> int:
         "--route-motion-set",
         type=Path,
         default=None,
-        help="optional formally bound cd.route-motion-set.v1 artifact",
+        help="formally bound cd.route-motion-set.v1 artifact",
+    )
+    parser.add_argument(
+        "--require-route-motion",
+        action="store_true",
+        help=(
+            "require a valid formal motion set for the production/default Winter export; "
+            "runtime still fails closed to the raw timeline"
+        ),
     )
     parser.add_argument("--basemap-version", default="gebco-2026-d5a7e2fe3915-7baad866")
     parser.add_argument(
