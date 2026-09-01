@@ -8,7 +8,7 @@ Applicability: CURRENT
 Scope: orchestrator package README
 Canonical For: orchestrator role and ownership
 Branch: research-validation-system
-Last Verified: 2026-08-31 02:33 +08:00
+Last Verified: 2026-09-01
 Related Canonical Docs: ../arctic_route_governance/current/architecture/ARCTIC_ROUTE_SYSTEM.md
 ---
 
@@ -26,13 +26,25 @@ Related Canonical Docs: ../arctic_route_governance/current/architecture/ARCTIC_R
 `cd.four-layer-route-plan-set.v3`、`presentation.route-candidates.v1` 和 12-route
 integrity evidence，然后输出与既有 D runtime 向后兼容的 `replay.viewer-bundle.v1`。
 
-该模式不调用 A/B/C，不生成 causal replay，也不把 Summer timeline 与 Winter artifact
-混装。航行仿真时间线只投影 C 已发布 full-voyage recommended route 的 waypoint ETA，
-并显式发布 `identity_kind=combined_presentation_assembly`、`source_replay=null` 与完整
-DatasetBundle/RunContext/RiskWindow/candidate identity。任何 identity、geometry、metrics、
-RiskFrame membership 或 route-integrity 不一致均 fail closed。
+该模式不调用 A/B/C，也不把 Summer timeline 与 Winter artifact 混装。没有通过
+`--winter-replay-manifest` 提供同身份 causal replay 时，航行仿真时间线只投影 C 已发布
+full-voyage recommended route 的 waypoint ETA，并显式发布
+`replanning_status=UNAVAILABLE_IDENTITY_BOUND_CAUSAL_REPLAY_REQUIRED`、空事件列表和
+`source_replay=null`；不会伪造 `PLAN_COMPUTED` 或重规划事件。传入严格身份绑定的
+`orchestrator.replay-manifest.v1` 后，才从真实快照/事件原样消费多个 revision、pending/
+superseded 状态，并发布 `replanning_status=PUBLISHED_CAUSAL_REPLAY`。任何 identity、
+geometry、metrics、RiskFrame membership 或 route-integrity 不一致均 fail closed。
 
 D 仍是唯一 Viewer runtime owner；本仓库只拥有 assembly、preflight 和 JSON/PNG 输出。
+
+## risk-explanation.v1 传输（2026-09-01）
+
+`--risk-explanation-manifest` 只接受 B 发布的
+`risk-explanation-manifest.v1`。Orchestrator 在传入 Viewer 前复核 manifest/status、sidecar
+schema、相对 artifact 路径、artifact SHA-256，以及 `risk_window_id`、run/scenario/corridor/
+vessel identity；失败时不嵌入 sidecar。Orchestrator 不计算 contributor、不修补缺测，D
+继续可选消费并在缺失/错配时显示 `Explanation unavailable`。sidecar 的
+`demo_unvalidated` / `research_unvalidated` 标识保持不变。
 
 ## 研究曲线 sidecar 导出边界（历史兼容，2026-08-31）
 

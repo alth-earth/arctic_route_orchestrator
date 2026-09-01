@@ -534,6 +534,32 @@ class ReplayRunner:
                 "replay_end": _iso(self.replay_end),
                 "tick_cadence_hours": self.tick_cadence_hours,
                 "scenario_mode": "causal_replay",
+                # A replay can be transported into a combined Viewer only
+                # when this exact source identity is carried with it.  Older
+                # manifests without this block remain valid replay artifacts
+                # but are intentionally ineligible for combined publication.
+                "presentation_identity": {
+                    "run_id": self.risk_commit.run_id if self.risk_commit else None,
+                    "scenario_id": self.scenario_id,
+                    "dataset_bundle_id": (
+                        self.run_context.dataset_bundle_id if self.run_context else None
+                    ),
+                    "dataset_bundle_digest": (
+                        self.run_context.dataset_bundle_digest if self.run_context else None
+                    ),
+                    "risk_window_id": (
+                        self.risk_commit.commit_id if self.risk_commit else None
+                    ),
+                    "risk_window_digest": (
+                        self.risk_commit.content_digest if self.risk_commit else None
+                    ),
+                    "layer_set_id": (
+                        self.current_plan_set.layer_set_id
+                        if self.current_plan_set is not None
+                        else None
+                    ),
+                    "candidate_set_id": None,
+                },
             },
         )
         _write_json(self.paths.manifest_path, manifest.to_dict())

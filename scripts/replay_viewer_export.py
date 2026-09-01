@@ -25,6 +25,7 @@ from typing import Any
 
 import numpy as np
 
+from arctic_route_orchestrator.replay.digests import replay_semantic_digest
 from arctic_route_orchestrator.replay.geospatial import (
     BasemapMetadata,
     find_land_sea_mask,
@@ -184,17 +185,26 @@ def _iso(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _route_meta(adapter: PresentationAdapter, revision: int) -> dict:
+def _route_meta(
+    adapter: PresentationAdapter,
+    revision: int,
+    *,
+    route_id_override: str | None = None,
+) -> dict:
     entry = adapter._routes_by_revision[revision]
     route = entry["route"]
-    waypoints = [
-        {
+    snapshot_ship = (entry.get("snapshot") or {}).get("ship_state") or {}
+    route_id = entry.get("route_id") or route.get("route_id") or route.get("plan_id")
+    waypoints = []
+    for item in route["waypoints"]:
+        waypoint = {
             "lon": item["longitude"],
             "lat": item["latitude"],
             "eta": item["eta"],
         }
-        for item in route["waypoints"]
-    ]
+        if item.get("recommended_speed_mps") is not None:
+            waypoint["recommended_speed_mps"] = item["recommended_speed_mps"]
+        waypoints.append(waypoint)
     decision_time = None
     adopt_time = None
     mode = "INITIAL"
@@ -212,6 +222,8 @@ def _route_meta(adapter: PresentationAdapter, revision: int) -> dict:
         adopt_time = adapter.replay_start.isoformat().replace("+00:00", "Z")
     return {
         "revision": revision,
+        "route_id": route_id or route_id_override,
+        "plan_digest": snapshot_ship.get("accepted_plan_digest"),
         "layer": "full_voyage",
         "objective": "recommended",
         "decision_time": decision_time,
@@ -601,6 +613,10 @@ def _presentation_risk(
             "risk_id": document.get("risk_id"),
             "as_of_time": document.get("as_of_time"),
             "provenance": document.get("provenance"),
+            "run_id": document.get("run_id"),
+            "corridor_id": document.get("corridor_id"),
+            "vessel_profile_id": document.get("vessel_profile_id"),
+            "risk_window_id": document.get("risk_window_id"),
             "coordinates": {"latitude": latitudes, "longitude": longitudes},
             **flattened,
         }
@@ -645,6 +661,10 @@ def _presentation_risk(
             "provenance": sorted(
                 {str(frame["provenance"]) for frame in frames}
             ),
+            "run_id": first.get("run_id"),
+            "corridor_id": first.get("corridor_id"),
+            "vessel_profile_id": first.get("vessel_profile_id"),
+            "risk_window_id": first.get("risk_window_id"),
         },
         "grid": risk_grid,
         "hard_reasons": hard_reasons,
@@ -891,6 +911,208 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _load_risk_explanation_manifest(
+    manifest_path: Path,
+    *,
+    expected_identity: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load a B immutable explanation artifact through its manifest.
+
+    Orchestrator transports the already-produced sidecar; it never computes
+    contributors or repairs a missing explanation.  Every identity field that
+    is available at this assembly boundary is compared before the sidecar is
+    allowed into the Viewer bundle.
+    """
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"risk explanation manifest is missing or invalid: {manifest_path}"
+        ) from exc
+    _require(
+        isinstance(manifest, dict)
+        and manifest.get("schema_version") == "risk-explanation-manifest.v1"
+        and manifest.get("status") == "PUBLISHED"
+        and manifest.get("sidecar_schema_version") == "risk-explanation.v1",
+        "risk explanation manifest is unsupported",
+    )
+    relative = manifest.get("artifact_path")
+    _require(
+        isinstance(relative, str) and not Path(relative).is_absolute(),
+        "risk explanation artifact path must be relative",
+    )
+    artifact_path = (manifest_path.parent / relative).resolve()
+    store_root = manifest_path.parent.parent.resolve()
+    try:
+        artifact_path.relative_to(store_root)
+    except ValueError as exc:
+        raise ValueError("risk explanation artifact escapes manifest directory") from exc
+    _require(artifact_path.is_file(), f"risk explanation artifact is missing: {artifact_path}")
+    artifact_bytes = artifact_path.read_bytes()
+    artifact_sha256 = manifest.get("artifact_sha256")
+    _require(
+        isinstance(artifact_sha256, str)
+        and len(artifact_sha256) == 64
+        and all(character in "0123456789abcdef" for character in artifact_sha256)
+        and _sha256_bytes(artifact_bytes) == artifact_sha256,
+        "risk explanation artifact digest mismatch",
+    )
+    artifact_id = manifest.get("artifact_id")
+    _require(
+        artifact_id == f"risk-explanation-sha256-{artifact_sha256}"
+        and artifact_path.name == f"{artifact_id}.json",
+        "risk explanation artifact identity mismatch",
+    )
+    try:
+        sidecar = json.loads(artifact_bytes)
+    except json.JSONDecodeError as exc:
+        raise ValueError("risk explanation artifact is invalid JSON") from exc
+    _require(
+        isinstance(sidecar, dict)
+        and sidecar.get("schema_version") == "risk-explanation.v1"
+        and sidecar.get("identity") == manifest.get("identity"),
+        "risk explanation artifact identity or schema mismatch",
+    )
+    identity = sidecar["identity"]
+    _require(
+        isinstance(identity, dict)
+        and isinstance(identity.get("risk_window_id"), str)
+        and manifest_path.name == f"{identity['risk_window_id']}.json",
+        "risk explanation manifest identity is invalid",
+    )
+    for name, expected in expected_identity.items():
+        if expected is not None:
+            _require(
+                identity.get(name) == expected,
+                f"risk explanation {name} does not match assembly",
+            )
+    return manifest, sidecar
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _load_causal_replay_source(
+    manifest_path: Path,
+    *,
+    snapshots_dir: Path | None,
+    expected_identity: dict[str, Any],
+    expected_route: dict[str, Any],
+) -> tuple[PresentationAdapter, dict[str, Any], Path]:
+    """Load only a real, identity-bound causal replay for Winter assembly."""
+
+    manifest = _read_json_object(manifest_path, label="causal replay manifest")
+    _require(
+        manifest.get("schema_version") == "orchestrator.replay-manifest.v1"
+        and manifest.get("scenario_mode") == "causal_replay",
+        "Winter source replay is not an orchestrator causal replay",
+    )
+    snapshots_root = snapshots_dir or manifest_path.parent / "snapshots"
+    entries = manifest.get("snapshots")
+    _require(isinstance(entries, list) and entries, "causal replay snapshots are missing")
+    snapshots = []
+    for entry in entries:
+        _require(isinstance(entry, dict) and isinstance(entry.get("resource"), str),
+                 "causal replay snapshot resource is invalid")
+        resource = Path(entry["resource"])
+        # Runner manifests use ``snapshots/0000.json`` relative to the
+        # manifest directory.  A caller may instead pass a copied snapshots
+        # directory and use ``0000.json``.  Accept both spellings, but keep
+        # the resolved file inside the selected source root.
+        relative = (
+            Path(*resource.parts[1:])
+            if resource.parts
+            and resource.parts[0] in {"snapshots", snapshots_root.name}
+            else resource
+        )
+        snapshot_path = (snapshots_root / relative).resolve()
+        if not snapshot_path.is_file() and not resource.is_absolute():
+            manifest_relative = (manifest_path.parent / resource).resolve()
+            if manifest_relative.is_file():
+                snapshot_path = manifest_relative
+        try:
+            snapshot_path.relative_to(snapshots_root.resolve())
+        except ValueError as exc:
+            raise ValueError("causal replay snapshot escapes source directory") from exc
+        _require(snapshot_path.is_file(), f"causal replay snapshot is missing: {snapshot_path}")
+        snapshot = _read_json_object(snapshot_path, label="causal replay snapshot")
+        declared_digest = entry.get("digest")
+        if declared_digest is not None:
+            # ``ReplayRunner`` publishes the semantic snapshot digest (the
+            # same value checked by replay.validation), not the filesystem
+            # byte hash.  Recompute it from the loaded document so real
+            # runner-produced manifests remain consumable and mutations of
+            # business fields fail closed.
+            snapshot_digest = snapshot.get("snapshot_digest")
+            _require(
+                isinstance(declared_digest, str)
+                and snapshot_digest == declared_digest
+                and replay_semantic_digest(
+                    {
+                        key: value
+                        for key, value in snapshot.items()
+                        if key != "snapshot_digest"
+                    }
+                ) == snapshot_digest,
+                "causal replay snapshot digest mismatch",
+            )
+        snapshots.append(snapshot)
+    provenance = manifest.get("provenance") or {}
+    bound = provenance.get("presentation_identity") or provenance.get("identity")
+    _require(isinstance(bound, dict), "causal replay has no presentation identity binding")
+    for name, expected in expected_identity.items():
+        if expected is not None:
+            _require(
+                bound.get(name) == expected,
+                f"causal replay {name} does not match Winter assembly",
+            )
+    expected_start = _parse_utc(expected_route["waypoints"][0]["eta"])
+    expected_end = _parse_utc(expected_route["waypoints"][-1]["eta"])
+    replay_start = _parse_utc(str(manifest.get("replay_start")))
+    replay_end = _parse_utc(str(manifest.get("replay_end")))
+    _require(
+        manifest.get("scenario_id") == expected_identity.get("scenario_id")
+        and replay_start == expected_start
+        and expected_start <= replay_end <= expected_end,
+        "causal replay time or scenario identity differs from Winter route",
+    )
+    events = manifest.get("events") or []
+    observed_events = [
+        event for event in events
+        if isinstance(event, dict) and event.get("observed") is True
+    ]
+    types = [event.get("type") for event in observed_events]
+    _require("REPLAN_DECIDED" in types and "REPLAN_ADOPTED" in types,
+             "causal replay does not contain an observed replan decision/adoption")
+    adapter = PresentationAdapter(manifest, snapshots)
+    revisions = sorted(adapter._routes_by_revision)
+    _require(len(revisions) > 1, "causal replay has only one route revision")
+    initial = _route_meta(adapter, revisions[0])
+    _require(
+        (
+            initial.get("route_id") in (None, expected_route.get("route_id"))
+            and [
+            {key: point[key] for key in ("lon", "lat", "eta")}
+            for point in initial.get("waypoints", [])
+            ] == [
+            {"lon": point["lon"], "lat": point["lat"], "eta": point["eta"]}
+            for point in expected_route["waypoints"]
+            ]
+        ),
+        "causal replay initial route differs from Winter authoritative route",
+    )
+    return adapter, {
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": _sha256_file(manifest_path),
+        "replay_id": manifest.get("replay_id"),
+        "semantic_digest": manifest.get("semantic_digest"),
+        "revision_count": len(revisions),
+        "event_types": sorted(set(types)),
+    }, manifest_path
 
 
 def _canonical_sha256(value: object) -> str:
@@ -1229,18 +1451,25 @@ def _winter_combined_identity(
     cadence_seconds: int,
     route_smoothing_sidecar_digest: str | None = None,
     route_motion_set_ids: list[str] | None = None,
+    timeline_source: str = "cd.route-plan.v3.waypoints.eta",
+    source_replay_digest: str | None = None,
+    risk_explanation_digest: str | None = None,
 ) -> tuple[str, str]:
     semantic_identity = {
         **identity,
         "simulation_start": route["waypoints"][0]["eta"],
         "simulation_end": route["waypoints"][-1]["eta"],
-        "timeline_source": "cd.route-plan.v3.waypoints.eta",
+        "timeline_source": timeline_source,
         "timeline_cadence_seconds": cadence_seconds,
     }
     if route_smoothing_sidecar_digest is not None:
         semantic_identity["route_smoothing_sidecar_digest"] = route_smoothing_sidecar_digest
     if route_motion_set_ids:
         semantic_identity["route_motion_set_ids"] = route_motion_set_ids
+    if source_replay_digest is not None:
+        semantic_identity["source_replay_digest"] = source_replay_digest
+    if risk_explanation_digest is not None:
+        semantic_identity["risk_explanation_digest"] = risk_explanation_digest
     digest = _canonical_sha256(semantic_identity)
     return f"winter-viewer-sha256-{digest}", digest
 
@@ -1311,7 +1540,64 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             args.route_smoothing_sidecar,
             route=route,
         )
-    timeline = _winter_vessel_timeline(recommended, cadence_seconds=args.cadence_seconds)
+    replay_adapter = None
+    source_replay = None
+    if args.winter_replay_manifest is not None:
+        replay_adapter, source_replay, _ = _load_causal_replay_source(
+            args.winter_replay_manifest,
+            snapshots_dir=args.winter_replay_snapshots_dir,
+            expected_identity={
+                "run_id": identity["run_id"],
+                "scenario_id": identity["scenario_id"],
+                "dataset_bundle_id": identity["dataset_bundle_id"],
+                "dataset_bundle_digest": identity["dataset_bundle_digest"],
+                "risk_window_id": identity["risk_window_id"],
+                "risk_window_digest": identity["risk_window_digest"],
+                "layer_set_id": identity["layer_set_id"],
+            },
+            expected_route=route,
+        )
+        timeline = _timeline(replay_adapter, args.cadence_seconds)
+        replay_revisions = sorted(replay_adapter._routes_by_revision)
+        replay_routes = []
+        for revision in replay_revisions:
+            replay_routes.append(
+                _route_meta(
+                    replay_adapter,
+                    revision,
+                    # The v1 snapshot route payload has no C plan ID.  Once
+                    # the strict initial geometry comparison above succeeds,
+                    # bind that first revision to Winter's authoritative ID so
+                    # a matching formal motion set can still be selected.
+                    route_id_override=(
+                        route["route_id"] if revision == replay_revisions[0] else None
+                    ),
+                )
+            )
+        replay_events = [
+            {
+                "t": event["simulation_time"],
+                "type": event["type"],
+                "rev": event.get("revision"),
+                "observed": bool(event.get("observed", False)),
+                "description": event.get("description", ""),
+            }
+            for event in replay_adapter._events
+        ]
+        route = replay_routes[0]
+        # The strict loader already compared the initial route; subsequent
+        # revisions and pending/superseded state are taken verbatim from the
+        # adapter, never synthesized by the exporter.
+    else:
+        timeline = _winter_vessel_timeline(recommended, cadence_seconds=args.cadence_seconds)
+        replay_routes = [route]
+        # A waypoint projection is not a causal replay.  Do not manufacture a
+        # PLAN_COMPUTED (or any replan) event merely to populate the timeline;
+        # the Viewer will display an explicit unavailable status until a real,
+        # identity-bound replay is supplied.
+        replay_events = []
+    risk_explanation_manifest = None
+    risk_explanation = None
     risk_store_root = (
         args.risk_store_root
         or required_paths["risk_frame_index"].parent / "risk-store"
@@ -1338,6 +1624,17 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             "risk_window_digest": identity["risk_window_digest"],
         }
     )
+    if args.risk_explanation_manifest is not None:
+        risk_explanation_manifest, risk_explanation = _load_risk_explanation_manifest(
+            args.risk_explanation_manifest,
+            expected_identity={
+                "risk_window_id": identity["risk_window_id"],
+                "run_id": identity["run_id"],
+                "scenario_id": identity["scenario_id"],
+                "corridor_id": identity["corridor_id"],
+                "vessel_profile_id": identity["vessel_profile_id"],
+            },
+        )
 
     land_mask_path = args.land_mask or find_land_sea_mask(args.route_id, args.data_root)
     _require(land_mask_path is not None, "no local GEBCO land_sea_mask found")
@@ -1361,6 +1658,15 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             if route_motion_set is not None
             else None
         ),
+        timeline_source=(
+            "orchestrator.presentation_adapter.causal_replay"
+            if replay_adapter is not None
+            else "cd.route-plan.v3.waypoints.eta"
+        ),
+        source_replay_digest=(source_replay or {}).get("manifest_sha256"),
+        risk_explanation_digest=(
+            risk_explanation_manifest or {}
+        ).get("artifact_sha256"),
     )
     source_files = {
         name: {"path": str(path), "sha256": _sha256_file(path)}
@@ -1375,6 +1681,24 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         source_files["route_motion_set"] = {
             "path": str(args.route_motion_set),
             "sha256": _sha256_file(args.route_motion_set),
+        }
+    if args.winter_replay_manifest is not None:
+        source_files["causal_replay_manifest"] = {
+            "path": str(args.winter_replay_manifest),
+            "sha256": _sha256_file(args.winter_replay_manifest),
+        }
+    if args.risk_explanation_manifest is not None:
+        source_files["risk_explanation_manifest"] = {
+            "path": str(args.risk_explanation_manifest),
+            "sha256": _sha256_file(args.risk_explanation_manifest),
+        }
+        artifact_path = (
+            args.risk_explanation_manifest.parent
+            / risk_explanation_manifest["artifact_path"]
+        )
+        source_files["risk_explanation_artifact"] = {
+            "path": str(artifact_path),
+            "sha256": risk_explanation_manifest["artifact_sha256"],
         }
     research_validation = {
         "label": "Winter C Validation",
@@ -1441,8 +1765,26 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             "layer_set_id": identity["layer_set_id"],
             "candidate_set_id": identity["candidate_set_id"],
             "selected_candidate_id": identity["selected_candidate_id"],
-            "timeline_source": "cd.route-plan.v3.waypoints.eta",
-            "source_replay": None,
+            "timeline_source": (
+                "orchestrator.presentation_adapter.causal_replay"
+                if replay_adapter is not None
+                else "cd.route-plan.v3.waypoints.eta"
+            ),
+            "replanning_status": (
+                "PUBLISHED_CAUSAL_REPLAY"
+                if replay_adapter is not None
+                else "UNAVAILABLE_IDENTITY_BOUND_CAUSAL_REPLAY_REQUIRED"
+            ),
+            "source_replay": source_replay,
+            "risk_explanation_manifest": (
+                {
+                    "artifact_id": risk_explanation_manifest["artifact_id"],
+                    "artifact_sha256": risk_explanation_manifest["artifact_sha256"],
+                    "manifest_path": str(args.risk_explanation_manifest),
+                }
+                if risk_explanation_manifest is not None
+                else None
+            ),
         },
         "research_validation": research_validation,
         "basemap": metadata.to_dict(),
@@ -1453,11 +1795,9 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             "source": "winter_identity_and_existing_route_integrity",
             "route_integrity_count": len(integrity_value),
         },
-        "routes": [route],
+        "routes": replay_routes,
         "route_candidates": route_candidates,
-        "events": [
-            {"t": route["waypoints"][0]["eta"], "type": "PLAN_COMPUTED", "rev": 1}
-        ],
+        "events": replay_events,
         "timeline": timeline,
         "risk": risk,
         "acceptance_positions": _winter_acceptance_positions(timeline),
@@ -1475,6 +1815,16 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             }
         ]
         bundle["route_motion_sets"] = [route_motion_set]
+    if risk_explanation is not None:
+        bundle["risk_explanation"] = risk_explanation
+        bundle["risk_explanation_transport"] = {
+            "schema_version": "risk-explanation-transport.v1",
+            "status": "PUBLISHED",
+            "manifest_path": str(args.risk_explanation_manifest),
+            "manifest_sha256": _sha256_file(args.risk_explanation_manifest),
+            "artifact_id": risk_explanation_manifest["artifact_id"],
+            "artifact_sha256": risk_explanation_manifest["artifact_sha256"],
+        }
     bundle["combined_presentation"]["formal_motion_policy"] = {
         "required_for_production_default": True,
         "runtime_failure_fallback": "RAW_WAYPOINT_TIMELINE",
@@ -1564,6 +1914,16 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
                 if motion_set_transport_path is not None
                 else None
             ),
+            "causal_replay_manifest": (
+                str(args.winter_replay_manifest)
+                if args.winter_replay_manifest is not None
+                else None
+            ),
+            "risk_explanation_manifest": (
+                str(args.risk_explanation_manifest)
+                if args.risk_explanation_manifest is not None
+                else None
+            ),
         },
     }
     (output_dir / "winter-combined-viewer-manifest.json").write_text(
@@ -1645,6 +2005,27 @@ def main(argv: list[str] | None = None) -> int:
         help="formally bound cd.route-motion-set.v1 artifact",
     )
     parser.add_argument(
+        "--winter-replay-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "identity-bound causal replay manifest for Winter publication; "
+            "events/routes are consumed verbatim when present"
+        ),
+    )
+    parser.add_argument(
+        "--winter-replay-snapshots-dir",
+        type=Path,
+        default=None,
+        help="optional snapshots directory for --winter-replay-manifest",
+    )
+    parser.add_argument(
+        "--risk-explanation-manifest",
+        type=Path,
+        default=None,
+        help="B immutable risk-explanation-manifest.v1 transport artifact",
+    )
+    parser.add_argument(
         "--require-route-motion",
         action="store_true",
         help=(
@@ -1662,6 +2043,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.winter_plan_set is not None:
         return _export_winter_combined(args)
+    if args.winter_replay_manifest is not None or args.winter_replay_snapshots_dir is not None:
+        parser.error("--winter-replay-manifest requires --winter-plan-set")
     if args.route_motion_set is not None:
         parser.error("--route-motion-set currently requires --winter-plan-set binding")
     if args.manifest is None:
@@ -1731,6 +2114,19 @@ def main(argv: list[str] | None = None) -> int:
         args.route_candidates,
         scenario_id=str(manifest_doc.get("scenario_id", "")),
     )
+    risk_explanation_manifest = None
+    risk_explanation = None
+    if args.risk_explanation_manifest is not None:
+        risk_explanation_manifest, risk_explanation = _load_risk_explanation_manifest(
+            args.risk_explanation_manifest,
+            expected_identity={
+                "risk_window_id": risk.get("source", {}).get("risk_window_id"),
+                "run_id": risk.get("source", {}).get("run_id"),
+                "scenario_id": manifest_doc.get("scenario_id"),
+                "corridor_id": risk.get("source", {}).get("corridor_id"),
+                "vessel_profile_id": risk.get("source", {}).get("vessel_profile_id"),
+            },
+        )
     bundle = {
         "schema_version": "replay.viewer-bundle.v1",
         "replay": {
@@ -1761,6 +2157,16 @@ def main(argv: list[str] | None = None) -> int:
         "risk": risk,
         "acceptance_positions": positions,
     }
+    if risk_explanation is not None:
+        bundle["risk_explanation"] = risk_explanation
+        bundle["risk_explanation_transport"] = {
+            "schema_version": "risk-explanation-transport.v1",
+            "status": "PUBLISHED",
+            "manifest_path": str(args.risk_explanation_manifest),
+            "manifest_sha256": _sha256_file(args.risk_explanation_manifest),
+            "artifact_id": risk_explanation_manifest["artifact_id"],
+            "artifact_sha256": risk_explanation_manifest["artifact_sha256"],
+        }
     (output_dir / "bundle.json").write_text(
         json.dumps(bundle, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",

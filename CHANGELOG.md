@@ -6,10 +6,22 @@ Content Status:
 Document Role: SUPPORTING
 Scope: orchestrator change history
 Branch: research-validation-system
-Last Verified: 2026-08-30 23:38 +08:00
+Last Verified: 2026-09-01
 ---
 
 # Changelog
+
+## Unreleased - identity-bound replay and risk explanation transport（2026-09-01）
+
+- Winter export accepts only a strict `causal_replay` manifest with matching
+  DatasetBundle/RunContext/RiskWindow/layer identity; real observed
+  `REPLAN_DECIDED` + `REPLAN_ADOPTED`, multiple revisions and route state are consumed
+  verbatim. Without that source, the default export publishes no synthetic events and an
+  explicit unavailable replanning status.
+- `--risk-explanation-manifest` transports B's immutable sidecar only after digest/schema/
+  identity verification; Orchestrator never reconstructs contributors.
+- Existing route, risk, ETA, and Viewer fallback semantics remain unchanged; no Winter causal
+  replay is claimed until a matching source artifact is supplied.
 
 ## Unreleased - Formal route motion default transport（2026-08-31）
 

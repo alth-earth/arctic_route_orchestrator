@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from arctic_route_orchestrator.replay.digests import replay_semantic_digest
+
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "replay_viewer_export.py"
 _SPEC = importlib.util.spec_from_file_location("replay_viewer_export", _SCRIPT)
 assert _SPEC is not None and _SPEC.loader is not None
@@ -16,6 +18,9 @@ _risk_horizon_selections = _EXPORTER._risk_horizon_selections
 _select_risk_horizon = _EXPORTER._select_risk_horizon
 _viewer_presentation = _EXPORTER.VIEWER_PRESENTATION
 _risk_forecast_summary = _EXPORTER._risk_forecast_summary
+_load_risk_explanation_manifest = _EXPORTER._load_risk_explanation_manifest
+_sha256_bytes = _EXPORTER._sha256_bytes
+_load_causal_replay_source = _EXPORTER._load_causal_replay_source
 
 
 def _frames() -> list[dict]:
@@ -153,6 +158,207 @@ def test_exporter_accepts_only_validated_optional_route_candidates(
 
 def test_exporter_preserves_not_published_fallback_without_candidate_artifact() -> None:
     assert _EXPORTER._route_candidates_package(None) == _EXPORTER.ROUTE_CANDIDATES_PACKAGE
+
+
+def _write_explanation_artifact(tmp_path: Path, *, identity: dict) -> Path:
+    root = tmp_path / "risk-explanation"
+    artifacts = root / "artifacts"
+    manifests = root / "manifests"
+    artifacts.mkdir(parents=True)
+    manifests.mkdir(parents=True)
+    sidecar = {
+        "schema_version": "risk-explanation.v1",
+        "publication_status": "UNAVAILABLE",
+        "identity": identity,
+    }
+    payload = json.dumps(sidecar, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = _sha256_bytes(payload.encode("utf-8"))
+    artifact = artifacts / f"risk-explanation-sha256-{digest}.json"
+    artifact.write_text(payload, encoding="utf-8")
+    manifest = {
+        "schema_version": "risk-explanation-manifest.v1",
+        "status": "PUBLISHED",
+        "artifact_id": artifact.stem,
+        "artifact_sha256": digest,
+        "artifact_path": f"../artifacts/{artifact.name}",
+        "sidecar_schema_version": "risk-explanation.v1",
+        "identity": identity,
+    }
+    manifest_path = manifests / f"{identity['risk_window_id']}.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def test_orchestrator_transports_only_digest_verified_risk_explanation(tmp_path: Path) -> None:
+    identity = {
+        "risk_window_id": "risk-window-sha256-" + "a" * 64,
+        "run_id": "run-00000000-0000-0000-0000-000000000000",
+        "scenario_id": "winter",
+        "corridor_id": "corridor",
+        "vessel_profile_id": "vessel",
+    }
+    path = _write_explanation_artifact(tmp_path, identity=identity)
+
+    manifest, sidecar = _load_risk_explanation_manifest(
+        path,
+        expected_identity=identity,
+    )
+
+    assert manifest["status"] == "PUBLISHED"
+    assert sidecar["identity"] == identity
+
+    artifact = path.parent.parent / "artifacts" / f"{manifest['artifact_id']}.json"
+    artifact.write_text(artifact.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="digest mismatch"):
+        _load_risk_explanation_manifest(path, expected_identity=identity)
+
+
+def test_orchestrator_rejects_explanation_identity_drift(tmp_path: Path) -> None:
+    identity = {
+        "risk_window_id": "risk-window-sha256-" + "b" * 64,
+        "run_id": "run-00000000-0000-0000-0000-000000000000",
+        "scenario_id": "winter",
+        "corridor_id": "corridor",
+        "vessel_profile_id": "vessel",
+    }
+    path = _write_explanation_artifact(tmp_path, identity=identity)
+    expected = dict(identity)
+    expected["scenario_id"] = "another-scenario"
+
+    with pytest.raises(ValueError, match="scenario_id does not match"):
+        _load_risk_explanation_manifest(path, expected_identity=expected)
+
+
+def test_causal_replay_source_requires_identity_and_consumes_real_revisions(
+    tmp_path: Path,
+) -> None:
+    route_one = {
+        "route_id": "route-v3-sha256-" + "a" * 64,
+        "distance_km": 10.0,
+        "waypoints": [
+            {
+                "longitude": 18.0,
+                "latitude": 70.0,
+                "eta": "2026-02-15T00:00:00Z",
+                "recommended_speed_mps": 5.0,
+            },
+            {
+                "longitude": 18.0,
+                "latitude": 71.0,
+                "eta": "2026-02-15T01:00:00Z",
+                "recommended_speed_mps": 5.0,
+            },
+        ],
+    }
+    route_two = {
+        **route_one,
+        "route_id": "route-v3-sha256-" + "b" * 64,
+        "waypoints": [
+            dict(route_one["waypoints"][0]),
+            {
+                **route_one["waypoints"][1],
+                "longitude": 19.0,
+            },
+        ],
+    }
+    identity = {
+        "run_id": "run-00000000-0000-0000-0000-000000000000",
+        "scenario_id": "winter",
+        "dataset_bundle_id": "dataset",
+        "dataset_bundle_digest": "c" * 64,
+        "risk_window_id": "risk-window-sha256-" + "d" * 64,
+        "risk_window_digest": "e" * 64,
+        "layer_set_id": "layer-set",
+    }
+    snapshots_dir = tmp_path / "snapshots"
+    snapshots_dir.mkdir()
+    snapshots = []
+    for index, route in enumerate((route_one, route_two)):
+        route_payload = {key: value for key, value in route.items() if key != "route_id"}
+        payload = {
+            "simulation_time": f"2026-02-15T{index:02d}:00:00Z",
+            "snapshot_index": index,
+            "ship_state": {
+                "accepted_plan_revision": index + 1,
+                # NavigationExecutionState v1 carries the route identity next
+                # to (rather than inside) the compact accepted_route payload.
+                "accepted_plan_digest": route["route_id"].removeprefix("route-v3-sha256-"),
+                "accepted_route": route_payload,
+            },
+        }
+        payload["snapshot_digest"] = replay_semantic_digest(payload)
+        snapshot_path = snapshots_dir / f"{index:04d}.json"
+        snapshot_path.write_text(json.dumps(payload), encoding="utf-8")
+        snapshots.append(
+            {
+                "index": index,
+                "simulation_time": payload["simulation_time"],
+                "resource": f"snapshots/{index:04d}.json",
+                "digest": payload["snapshot_digest"],
+            }
+        )
+    manifest = {
+        "schema_version": "orchestrator.replay-manifest.v1",
+        "replay_id": "winter-replay",
+        "scenario_id": "winter",
+        "scenario_mode": "causal_replay",
+        "replay_start": "2026-02-15T00:00:00Z",
+        "replay_end": "2026-02-15T01:00:00Z",
+        "snapshots": snapshots,
+        "events": [
+            {
+                "type": "REPLAN_DECIDED",
+                "simulation_time": "2026-02-15T00:30:00Z",
+                "revision": "2",
+                "observed": True,
+            },
+            {
+                "type": "REPLAN_ADOPTED",
+                "simulation_time": "2026-02-15T01:00:00Z",
+                "revision": "2",
+                "observed": True,
+            },
+        ],
+        "provenance": {"presentation_identity": identity},
+    }
+    manifest_path = tmp_path / "causal-replay-manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    adapter, source, _ = _load_causal_replay_source(
+        manifest_path,
+        snapshots_dir=None,
+        expected_identity=identity,
+        expected_route={
+            "route_id": route_one["route_id"],
+            "waypoints": [
+                {"lon": item["longitude"], "lat": item["latitude"], "eta": item["eta"]}
+                for item in route_one["waypoints"]
+            ],
+        },
+    )
+
+    assert sorted(adapter._routes_by_revision) == [1, 2]
+    assert source["revision_count"] == 2
+    assert {"REPLAN_DECIDED", "REPLAN_ADOPTED"}.issubset(source["event_types"])
+
+    manifest["provenance"].pop("presentation_identity")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="no presentation identity binding"):
+        _load_causal_replay_source(
+            manifest_path,
+            snapshots_dir=None,
+            expected_identity=identity,
+            expected_route={
+                "route_id": route_one["route_id"],
+                "waypoints": [
+                    {"lon": item["longitude"], "lat": item["latitude"], "eta": item["eta"]}
+                    for item in route_one["waypoints"]
+                ],
+            },
+        )
 
 
 def test_exporter_rejects_candidate_sidecar_from_another_scenario(
