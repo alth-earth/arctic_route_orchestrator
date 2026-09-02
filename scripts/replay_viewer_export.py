@@ -40,12 +40,14 @@ from arctic_route_orchestrator.replay.research_route_motion import (
     validate_research_route_sidecar,
 )
 from arctic_route_orchestrator.route_motion import (
+    load_bound_route_motion_candidate_set,
     load_bound_route_motion_set,
     validate_route_motion_context,
 )
 from arctic_route_orchestrator.route_presentation import (
     load_route_candidates,
     project_route_candidates,
+    project_runtime_route_candidates,
 )
 
 SEA_RGB = (46, 102, 150)
@@ -1409,6 +1411,31 @@ def _revision_candidate_sets(
     return result
 
 
+def _revision_runtime_candidate_sets(
+    plan_sets_by_revision: dict[int, dict[str, Any]],
+    revision_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project authoritative C waypoint/ETA candidates for every replay revision."""
+
+    states = {
+        int(entry["plan_revision"]): entry.get("state")
+        for entry in revision_entries
+    }
+    result = []
+    for revision in sorted(plan_sets_by_revision):
+        package = project_runtime_route_candidates(
+            four_layer_route_plan_set_from_dict(plan_sets_by_revision[revision])
+        )
+        result.append(
+            {
+                "revision": revision,
+                "state": states.get(revision),
+                "runtime_route_candidates": package,
+            }
+        )
+    return result
+
+
 def _validate_winter_identity(
     *,
     dataset_bundle: dict[str, Any],
@@ -1711,6 +1738,8 @@ def _winter_combined_identity(
     cadence_seconds: int,
     route_smoothing_sidecar_digest: str | None = None,
     route_motion_set_ids: list[str] | None = None,
+    route_motion_candidate_set_ids: list[str] | None = None,
+    runtime_route_candidate_set_ids: list[str] | None = None,
     timeline_source: str = "cd.route-plan.v3.waypoints.eta",
     source_replay_digest: str | None = None,
     risk_explanation_digest: str | None = None,
@@ -1728,6 +1757,10 @@ def _winter_combined_identity(
         semantic_identity["route_smoothing_sidecar_digest"] = route_smoothing_sidecar_digest
     if route_motion_set_ids:
         semantic_identity["route_motion_set_ids"] = route_motion_set_ids
+    if route_motion_candidate_set_ids:
+        semantic_identity["route_motion_candidate_set_ids"] = route_motion_candidate_set_ids
+    if runtime_route_candidate_set_ids:
+        semantic_identity["runtime_route_candidate_set_ids"] = runtime_route_candidate_set_ids
     if source_replay_digest is not None:
         semantic_identity["source_replay_digest"] = source_replay_digest
     if risk_explanation_digest is not None:
@@ -1783,6 +1816,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
     route = _winter_route_meta(recommended)
     authoritative_route = dict(route)
     route_motion_sets: list[dict[str, Any]] = []
+    route_motion_candidate_sets: list[dict[str, Any]] = []
     motion_context_by_layer_set = {
         identity["layer_set_id"]: {
             "risk_window_id": identity["risk_window_id"],
@@ -1797,6 +1831,9 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         }
     ]
     plan_sets_by_revision: dict[int, dict[str, Any]] = {1: plan_set}
+    runtime_route_candidate_sets = _revision_runtime_candidate_sets(
+        plan_sets_by_revision, []
+    )
     route_smoothing_sidecar = None
     if args.route_smoothing_sidecar is not None:
         route_smoothing_sidecar = _load_route_smoothing_sidecar(
@@ -1851,6 +1888,10 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
                 )
             )
         route_candidate_sets = _revision_candidate_sets(
+            plan_sets_by_revision,
+            source_replay.get("plan_revision_resources", []),
+        )
+        runtime_route_candidate_sets = _revision_runtime_candidate_sets(
             plan_sets_by_revision,
             source_replay.get("plan_revision_resources", []),
         )
@@ -1916,6 +1957,18 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         # identity-bound replay is supplied.
         replay_events = []
 
+    # Runtime candidates are derived directly from each immutable C plan set;
+    # unlike the compact v1 projection they carry the authoritative waypoint
+    # ETA and are therefore safe to use for an explicit pre-run choice.
+    runtime_by_layer_set = {
+        item["runtime_route_candidates"]["layer_set_id"]: item
+        for item in runtime_route_candidate_sets
+    }
+    _require(
+        len(runtime_by_layer_set) == len(runtime_route_candidate_sets),
+        "runtime route candidate layer bindings are duplicated",
+    )
+
     layer_sets = {
         document.get("layer_set_id"): document
         for document in plan_sets_by_revision.values()
@@ -1955,6 +2008,45 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             "route motion set ID or layer binding is duplicated",
         )
         route_motion_sets.append(motion_set)
+
+    for motion_path in getattr(args, "route_motion_candidate_set", ()) or ():
+        motion_document = _read_json_object(
+            motion_path, label="route motion candidate set"
+        )
+        motion_layer_set_id = motion_document.get("layer_set_id")
+        runtime_entry = runtime_by_layer_set.get(motion_layer_set_id)
+        bound_plan_set = layer_sets.get(motion_layer_set_id)
+        _require(
+            bound_plan_set is not None and runtime_entry is not None,
+            f"route motion candidate set {motion_path} has no matching C revision",
+        )
+        motion_set = load_bound_route_motion_candidate_set(
+            motion_path,
+            plan_set_document=bound_plan_set,
+            runtime_candidates_document=runtime_entry["runtime_route_candidates"],
+        )
+        motion_context = motion_context_by_layer_set.get(motion_layer_set_id)
+        _require(
+            motion_context is not None,
+            f"route motion candidate set {motion_path} has no RiskWindow binding",
+        )
+        validate_route_motion_context(
+            motion_set,
+            risk_window_id=motion_context["risk_window_id"],
+            risk_window_digest=motion_context["risk_window_digest"],
+            vessel_profile_id=run_context["vessel_profile_id"],
+            vessel_profile_version=run_context["vessel_profile_version"],
+            vessel_profile_digest=run_context["vessel_profile_digest"],
+        )
+        _require(
+            all(
+                existing["motion_candidate_set_id"] != motion_set["motion_candidate_set_id"]
+                and existing["layer_set_id"] != motion_set["layer_set_id"]
+                for existing in route_motion_candidate_sets
+            ),
+            "route motion candidate set ID or layer binding is duplicated",
+        )
+        route_motion_candidate_sets.append(motion_set)
     if formal_motion_required:
         covered_plan_ids = {
             record["plan_id"]
@@ -2031,6 +2123,13 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             else None
         ),
         route_motion_set_ids=[item["motion_set_id"] for item in route_motion_sets],
+        route_motion_candidate_set_ids=[
+            item["motion_candidate_set_id"] for item in route_motion_candidate_sets
+        ],
+        runtime_route_candidate_set_ids=[
+            item["runtime_route_candidates"]["runtime_candidate_set_id"]
+            for item in runtime_route_candidate_sets
+        ],
         timeline_source=(
             (
                 "orchestrator.presentation_adapter.retrospective_dynamic_replay"
@@ -2063,6 +2162,13 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             "path": str(motion_path),
             "sha256": _sha256_file(motion_path),
         }
+    for index, motion_path in enumerate(
+        getattr(args, "route_motion_candidate_set", ()) or (), start=1
+    ):
+        source_files[f"route_motion_candidate_set_{index}"] = {
+            "path": str(motion_path),
+            "sha256": _sha256_file(motion_path),
+        }
     if args.winter_replay_manifest is not None:
         source_files["causal_replay_manifest"] = {
             "path": str(args.winter_replay_manifest),
@@ -2091,6 +2197,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         "risk_frame_count": identity["risk_frame_count"],
         "route_schema": "cd.four-layer-route-plan-set.v3",
         "candidate_schema": "presentation.route-candidates.v1",
+        "runtime_candidate_schema": "presentation.runtime-route-candidates.v1",
     }
     if route_smoothing_sidecar is not None:
         research_validation["route_smoothing"] = route_smoothing_sidecar
@@ -2198,6 +2305,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         "routes": replay_routes,
         "route_candidates": route_candidates,
         "route_candidate_sets": route_candidate_sets,
+        "runtime_route_candidate_sets": runtime_route_candidate_sets,
         "events": replay_events,
         "timeline": timeline,
         "risk": risk,
@@ -2217,6 +2325,38 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             for item in route_motion_sets
         ]
         bundle["route_motion_sets"] = route_motion_sets
+    if route_motion_candidate_sets:
+        bundle["combined_presentation"]["route_motion_candidate_set_ids"] = [
+            item["motion_candidate_set_id"] for item in route_motion_candidate_sets
+        ]
+        bundle["combined_presentation"]["route_motion_candidate_set_bindings"] = [
+            {
+                "motion_candidate_set_id": item["motion_candidate_set_id"],
+                "layer_set_id": item["layer_set_id"],
+                "risk_window_id": item["risk_window_id"],
+                "risk_window_digest": item["risk_window_digest"],
+            }
+            for item in route_motion_candidate_sets
+        ]
+        bundle["route_motion_candidate_sets"] = route_motion_candidate_sets
+    bundle["combined_presentation"]["runtime_route_candidate_set_bindings"] = [
+        {
+            "revision": item["revision"],
+            "state": item.get("state"),
+            "layer_set_id": item["runtime_route_candidates"]["layer_set_id"],
+            "runtime_candidate_set_id": item["runtime_route_candidates"][
+                "runtime_candidate_set_id"
+            ],
+            "selected_candidate_id": item["runtime_route_candidates"][
+                "selected_candidate_id"
+            ],
+        }
+        for item in runtime_route_candidate_sets
+    ]
+    bundle["combined_presentation"]["runtime_route_candidate_set_ids"] = [
+        item["runtime_route_candidates"]["runtime_candidate_set_id"]
+        for item in runtime_route_candidate_sets
+    ]
     bundle["combined_presentation"]["route_candidate_set_bindings"] = [
         {
             "revision": item["revision"],
@@ -2243,6 +2383,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         "required_for_production_default": True,
         "runtime_failure_fallback": "RAW_WAYPOINT_TIMELINE",
         "provided": bool(route_motion_sets),
+        "runtime_candidate_motion_sets": len(route_motion_candidate_sets),
     }
     target_output_dir = args.output_dir.resolve()
     _require(
@@ -2279,6 +2420,18 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
         motion_set_transport_paths.append(motion_set_transport_path)
+    motion_candidate_set_transport_paths: list[Path] = []
+    for index, motion_candidate_set in enumerate(route_motion_candidate_sets, start=1):
+        motion_candidate_set_transport_path = (
+            output_dir / f"route-motion-candidate-set-r{index}.json"
+        )
+        motion_candidate_set_transport_path.write_text(
+            json.dumps(
+                motion_candidate_set, ensure_ascii=False, indent=2, sort_keys=True
+            ),
+            encoding="utf-8",
+        )
+        motion_candidate_set_transport_paths.append(motion_candidate_set_transport_path)
     preflight_path = output_dir / "replay-viewer-preflight.json"
     preflight_path.write_text(
         json.dumps(
@@ -2322,10 +2475,15 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         "route_candidates": len(route_candidates["candidates"]),
         "route_candidate_sets": len(route_candidate_sets),
         "route_motion_sets": len(route_motion_sets),
+        "runtime_route_candidate_sets": len(runtime_route_candidate_sets),
+        "route_motion_candidate_sets": len(route_motion_candidate_sets),
         "formal_motion_required": formal_motion_required,
         "transport_files": {
             "plan_set": plan_set_transport_path.name,
             "route_motion_sets": [path.name for path in motion_set_transport_paths],
+            "route_motion_candidate_sets": [
+                path.name for path in motion_candidate_set_transport_paths
+            ],
             "causal_replay_manifest": (
                 str(args.winter_replay_manifest)
                 if args.winter_replay_manifest is not None
@@ -2351,6 +2509,9 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         "winter-combined-viewer-manifest.json",
     ]
     checksum_names[2:2] = [path.name for path in motion_set_transport_paths]
+    checksum_names[2:2] = [
+        path.name for path in motion_candidate_set_transport_paths
+    ]
     checksums = {
         "schema_version": "presentation.winter-combined-checksums.v1",
         "files": {
@@ -2420,6 +2581,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--route-motion-candidate-set",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "formally bound cd.route-motion-candidate-set.v1 artifact; repeat once "
+            "for each revision with runnable full-voyage candidates"
+        ),
+    )
+    parser.add_argument(
         "--winter-replay-manifest",
         type=Path,
         default=None,
@@ -2462,6 +2633,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--winter-replay-manifest requires --winter-plan-set")
     if args.route_motion_set:
         parser.error("--route-motion-set currently requires --winter-plan-set binding")
+    if args.route_motion_candidate_set:
+        parser.error(
+            "--route-motion-candidate-set currently requires --winter-plan-set binding"
+        )
     if args.manifest is None:
         parser.error("manifest is required unless --winter-plan-set is supplied")
 

@@ -6,18 +6,21 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from arctic_route_planning.motion import build_route_motion_set
+from arctic_route_planning.motion import build_route_motion_candidate_set, build_route_motion_set
 from arctic_route_planning.publishing import (
     four_layer_route_plan_set_to_dict,
+    route_motion_candidate_set_to_dict,
     route_motion_set_to_dict,
 )
 
 from arctic_route_orchestrator.errors import OrchestrationError
 from arctic_route_orchestrator.output import publish_output_directory
 from arctic_route_orchestrator.route_motion import (
+    load_bound_route_motion_candidate_set,
     load_bound_route_motion_set,
     validate_route_motion_context,
 )
+from arctic_route_orchestrator.route_presentation import project_runtime_route_candidates
 
 _HELPER_PATH = Path(__file__).with_name("test_route_presentation.py")
 _SPEC = importlib.util.spec_from_file_location("route_presentation_test_helper", _HELPER_PATH)
@@ -70,6 +73,41 @@ def test_formal_motion_is_bound_to_four_recommended_routes_and_adoption(tmp_path
     assert loaded == document
     assert len(loaded["records"]) == 4
     assert loaded["records"][0]["plan_id"] == replay_route["route_id"]
+
+
+def test_candidate_motion_is_bound_to_all_full_voyage_objectives(tmp_path) -> None:
+    plan_set = _plan_set()
+    motion_set = build_route_motion_candidate_set(
+        plan_set,
+        risk_window_id="risk-window-fixture",
+        risk_window_digest="2" * 64,
+        vessel_profile_digest="3" * 64,
+        producer_digest="4" * 64,
+        generated_at=plan_set.generated_at,
+    )
+    document = route_motion_candidate_set_to_dict(motion_set)
+    path = tmp_path / "route-motion-candidate-set.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    runtime = project_runtime_route_candidates(plan_set)
+
+    loaded = load_bound_route_motion_candidate_set(
+        path,
+        plan_set_document=four_layer_route_plan_set_to_dict(plan_set),
+        runtime_candidates_document=runtime,
+    )
+
+    assert loaded == document
+    assert [item["objective_mode"] for item in loaded["records"]] == [
+        "fastest", "low_risk", "recommended"
+    ]
+    tampered = json.loads(json.dumps(runtime))
+    tampered["candidates"][0]["waypoints"][1]["longitude"] += 0.01
+    with pytest.raises(ValueError, match="geometry differs"):
+        load_bound_route_motion_candidate_set(
+            path,
+            plan_set_document=four_layer_route_plan_set_to_dict(plan_set),
+            runtime_candidates_document=tampered,
+        )
 
 
 def test_formal_motion_accepts_declared_uniform_deferred_adoption_offset(tmp_path) -> None:

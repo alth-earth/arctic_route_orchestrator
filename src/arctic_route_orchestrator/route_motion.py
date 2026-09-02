@@ -8,13 +8,18 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from arctic_route_planning.contracts import PlanLayer
 from arctic_route_planning.domain import ObjectiveMode
 from arctic_route_planning.publishing import (
     canonical_route_motion_sha256,
     four_layer_route_plan_set_from_dict,
+    route_motion_candidate_set_from_dict,
+    route_motion_candidate_set_to_dict,
     route_motion_set_from_dict,
     route_motion_set_to_dict,
 )
+
+from arctic_route_orchestrator.route_presentation import validate_runtime_route_candidates
 
 
 def load_bound_route_motion_set(
@@ -86,6 +91,80 @@ def validate_route_motion_context(
             raise ValueError(f"route motion set differs from publication context: {name}")
 
 
+def load_bound_route_motion_candidate_set(
+    path: str | Path,
+    *,
+    plan_set_document: Mapping[str, Any],
+    runtime_candidates_document: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Load the additive C motion artifact for the three full-voyage objectives.
+
+    The candidate motion set is deliberately bound to both the immutable C
+    plan set and the orchestrator's waypoint/ETA presentation projection.  A
+    D consumer therefore cannot silently pair a curve sample with a different
+    objective, revision, or timestamp.
+    """
+
+    location = Path(path)
+    try:
+        document = json.loads(location.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read route motion candidate set {location}: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ValueError("route motion candidate set must be a JSON object")
+    candidate_set = route_motion_candidate_set_from_dict(document)
+    plan_set = four_layer_route_plan_set_from_dict(plan_set_document)
+    validate_runtime_route_candidates(runtime_candidates_document)
+    if candidate_set.layer_set_id != plan_set.layer_set_id:
+        raise ValueError("route motion candidate set differs from plan layer_set_id")
+    if runtime_candidates_document.get("layer_set_id") != plan_set.layer_set_id:
+        raise ValueError("runtime route candidates differ from plan layer_set_id")
+    for name in (
+        "run_id", "scenario_id", "corridor_id", "generation_id", "input_revision",
+        "vessel_profile_id", "config_digest", "model_config_digest",
+        "planner_config_digest",
+    ):
+        if getattr(candidate_set, name) != getattr(plan_set, name):
+            raise ValueError(f"route motion candidate set differs from plan set: {name}")
+    candidates = {
+        item["objective"]: item
+        for item in runtime_candidates_document["candidates"]
+        if item["layer"] == "full_voyage"
+    }
+    full = plan_set.bundle_for(PlanLayer.FULL_VOYAGE)
+    for item in candidate_set.records:
+        objective = item.objective_mode.value
+        plan = full.plans[item.objective_mode]
+        candidate = candidates.get(objective)
+        if candidate is None or candidate["candidate_id"] != plan.plan_id:
+            raise ValueError("route motion candidate objective is not bound to C plan")
+        waypoint_payload = [
+            {
+                "longitude": waypoint.longitude,
+                "latitude": waypoint.latitude,
+                "eta": waypoint.eta.isoformat().replace("+00:00", "Z"),
+                "recommended_speed_mps": waypoint.recommended_speed_mps,
+            }
+            for waypoint in plan.waypoints
+        ]
+        candidate_payload = [
+            {
+                "longitude": waypoint["longitude"],
+                "latitude": waypoint["latitude"],
+                "eta": waypoint["eta"],
+                "recommended_speed_mps": waypoint["recommended_speed_mps"],
+            }
+            for waypoint in candidate["waypoints"]
+        ]
+        if candidate_payload != waypoint_payload:
+            raise ValueError("runtime candidate waypoints differ from C plan")
+        if item.record.plan_id != plan.plan_id or item.record.raw_route_digest != (
+            canonical_route_motion_sha256(waypoint_payload)
+        ):
+            raise ValueError("route motion candidate raw waypoint digest differs from C plan")
+    return route_motion_candidate_set_to_dict(candidate_set)
+
+
 def _validate_replay_adoption(
     motion_set: Mapping[str, Any],
     replay_routes: Sequence[Mapping[str, Any]],
@@ -138,4 +217,8 @@ def _shift_iso(value: object, offset_seconds: float) -> str | None:
     return (moment + timedelta(seconds=offset_seconds)).isoformat().replace("+00:00", "Z")
 
 
-__all__ = ["load_bound_route_motion_set", "validate_route_motion_context"]
+__all__ = [
+    "load_bound_route_motion_candidate_set",
+    "load_bound_route_motion_set",
+    "validate_route_motion_context",
+]

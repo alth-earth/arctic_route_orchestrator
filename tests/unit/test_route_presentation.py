@@ -23,8 +23,11 @@ from arctic_route_planning.service import ServicePlanningRequest
 
 from arctic_route_orchestrator.route_presentation import (
     load_route_candidates,
+    load_runtime_route_candidates,
     project_route_candidates,
+    project_runtime_route_candidates,
     validate_route_candidates,
+    validate_runtime_route_candidates,
 )
 
 CONFIG_ROOT = Path(arctic_route_planning.__file__).resolve().parents[2] / "configs"
@@ -154,3 +157,26 @@ def test_published_package_fails_closed_on_partial_candidate_set() -> None:
 
     with pytest.raises(ValueError, match="exactly 12"):
         validate_route_candidates(document)
+
+
+def test_runtime_projection_preserves_c_waypoints_and_all_objectives(tmp_path: Path) -> None:
+    plan_set = _plan_set()
+    document = project_runtime_route_candidates(plan_set)
+
+    assert document["schema_version"] == "presentation.runtime-route-candidates.v1"
+    assert len(document["candidates"]) == 12
+    assert document["selected_candidate_id"] == plan_set.recommended.plan_id
+    for candidate in document["candidates"]:
+        assert candidate["geometry"]["coordinates"] == [
+            [point["longitude"], point["latitude"]]
+            for point in candidate["waypoints"]
+        ]
+        assert candidate["arrival_eta"] == candidate["waypoints"][-1]["eta"]
+    path = tmp_path / "runtime-route-candidates.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    assert load_runtime_route_candidates(path) == document
+
+    tampered = json.loads(json.dumps(document))
+    tampered["candidates"][0]["waypoints"][1]["latitude"] += 0.01
+    with pytest.raises(ValueError, match="geometry differs"):
+        validate_runtime_route_candidates(tampered)
