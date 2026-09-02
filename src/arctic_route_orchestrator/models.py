@@ -32,6 +32,13 @@ _FIELDS = frozenset(
         "per_stage_timeout_seconds",
     }
 )
+_V2_FIELDS = frozenset(
+    {
+        *_FIELDS,
+        "planning_workers",
+        "parallel_pool_mode",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +55,11 @@ class ExecutionSpec:
     max_snap_km: float = 150.0
     replan_after_hours: int = 6
     per_stage_timeout_seconds: float = 900.0
+    # RC2 retained objective-level C parallelism.  v1 specs do not carry the
+    # execution profile explicitly, so they use this compatibility default;
+    # v2 specs persist the values and make the profile auditable.
+    planning_workers: int = 3
+    parallel_pool_mode: str = "persistent"
 
     def __post_init__(self) -> None:
         for name in ("schema_version", "run_id", "scenario_id", "planning_contract"):
@@ -55,7 +67,10 @@ class ExecutionSpec:
                 raise OrchestrationError(
                     "execution_spec_invalid", f"{name} must be a string"
                 )
-        if self.schema_version != "orchestrator.execution-spec.v1":
+        if self.schema_version not in {
+            "orchestrator.execution-spec.v1",
+            "orchestrator.execution-spec.v2",
+        }:
             raise OrchestrationError("execution_spec_invalid", "unsupported schema_version")
         if _RUN_ID.fullmatch(self.run_id) is None:
             raise OrchestrationError("execution_spec_invalid", "run_id must be run-UUID")
@@ -115,6 +130,31 @@ class ExecutionSpec:
             "per_stage_timeout_seconds",
             float(self.per_stage_timeout_seconds),
         )
+        if (
+            isinstance(self.planning_workers, bool)
+            or not isinstance(self.planning_workers, int)
+            or self.planning_workers <= 0
+        ):
+            raise OrchestrationError(
+                "execution_spec_invalid",
+                "planning_workers must be a positive integer",
+            )
+        if self.parallel_pool_mode not in {"persistent", "percall"}:
+            raise OrchestrationError(
+                "execution_spec_invalid",
+                "parallel_pool_mode must be persistent or percall",
+            )
+        # Keep the frozen v1 wire shape stable.  Its runtime compatibility
+        # profile is the RC2 three-worker persistent pool above; callers that
+        # need a different profile must opt into v2.
+        if self.schema_version == "orchestrator.execution-spec.v1" and (
+            self.planning_workers != 3 or self.parallel_pool_mode != "persistent"
+        ):
+            raise OrchestrationError(
+                "execution_spec_invalid",
+                "execution-spec.v1 uses the fixed RC2 three-worker profile; "
+                "use v2 for an explicit profile",
+            )
 
     @classmethod
     def from_path(cls, path: str | Path) -> ExecutionSpec:
@@ -131,11 +171,19 @@ class ExecutionSpec:
             ) from exc
         if not isinstance(value, dict):
             raise OrchestrationError("execution_spec_invalid", "document must be an object")
-        if set(value) != _FIELDS:
+        schema_version = value.get("schema_version")
+        expected_fields = (
+            _FIELDS
+            if schema_version == "orchestrator.execution-spec.v1"
+            else _V2_FIELDS
+            if schema_version == "orchestrator.execution-spec.v2"
+            else _FIELDS
+        )
+        if set(value) != expected_fields:
             raise OrchestrationError(
                 "execution_spec_invalid",
-                f"fields differ: missing={sorted(_FIELDS - set(value))}, "
-                f"extra={sorted(set(value) - _FIELDS)}",
+                f"fields differ: missing={sorted(expected_fields - set(value))}, "
+                f"extra={sorted(set(value) - expected_fields)}",
             )
         try:
             raw_generated_at = value["generated_at"]
@@ -155,6 +203,8 @@ class ExecutionSpec:
                 max_snap_km=value["max_snap_km"],
                 replan_after_hours=value["replan_after_hours"],
                 per_stage_timeout_seconds=value["per_stage_timeout_seconds"],
+                planning_workers=value.get("planning_workers", 3),
+                parallel_pool_mode=value.get("parallel_pool_mode", "persistent"),
             )
         except (TypeError, ValueError) as exc:
             raise OrchestrationError(
@@ -162,7 +212,7 @@ class ExecutionSpec:
             ) from exc
 
     def to_document(self) -> dict[str, Any]:
-        return {
+        document = {
             "schema_version": self.schema_version,
             "run_id": self.run_id,
             "scenario_id": self.scenario_id,
@@ -174,6 +224,14 @@ class ExecutionSpec:
             "replan_after_hours": self.replan_after_hours,
             "per_stage_timeout_seconds": self.per_stage_timeout_seconds,
         }
+        if self.schema_version == "orchestrator.execution-spec.v2":
+            document.update(
+                {
+                    "planning_workers": self.planning_workers,
+                    "parallel_pool_mode": self.parallel_pool_mode,
+                }
+            )
+        return document
 
 
 def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

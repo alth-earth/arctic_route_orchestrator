@@ -8,7 +8,7 @@ Applicability: CURRENT
 Scope: orchestrator package README
 Canonical For: orchestrator role and ownership
 Branch: research-validation-system
-Last Verified: 2026-09-01
+Last Verified: 2026-09-02
 Related Canonical Docs: ../arctic_route_governance/current/architecture/ARCTIC_ROUTE_SYSTEM.md
 ---
 
@@ -19,7 +19,40 @@ Related Canonical Docs: ../arctic_route_governance/current/architecture/ARCTIC_R
 
 # A-B-C-D Root Coordinator
 
+## Winter 动态重规划与 RC2 三核并行（2026-09-01 22:40 +08:00）
+
+默认 Winter Viewer 已恢复为 2026-08-31 使用的原始冻结身份，并消费同一身份的
+`retrospective_dynamic_replay` 制品，而不是误选后续 holdout 或人工补写事件：回放保留原始
+`issue_time`，明确标记为事后动态投影，不冒充当时可获得的 causal replay。C 正式
+`cd.four-layer-route-plan-set.v3` 在初始规划和重规划中均使用 RC2 的三 worker
+`ProcessPool`，只并行同一请求内的 fastest / low_risk / recommended 三个目标；tick、层级、
+B 构建和 adoption gate 仍严格串行。manifest/report 会记录请求 worker 数、最大同时并发、
+提交任务数和 worker PID provenance。
+
+Viewer 传输保留每个真实 revision 的不可变四层 plan-set 资源（每版 4 层、12 条路线）以及
+`REPLAN_DECIDED`、`REPLAN_ADOPTED`、`ROUTE_CHANGED` 事件，因此“待采用 / 已替代 / 当前路段”
+由 revision 状态和正式 `motion_samples` 驱动。B-spline 仍是 D 的受约束绘制层，不能改变
+waypoint、ETA、risk、adoption 或安全门禁。
+
+当前到达态回放为 `winter-original-frozen-dynamic-v1`：25 个 snapshot、9 个不可变
+revision、119 个真实事件，其中 `REPLAN_DECIDED/REPLAN_ADOPTED/ROUTE_CHANGED` 各 8 次；
+最终状态为 `ARRIVED`，无 pending revision。原始身份为
+`tromso_isfjorden_february_2026_research_v1`、DatasetBundle
+`a-bundle-a2146dd0adbaa7db77a6beb7`、RiskWindow
+`risk-window-sha256-b5bed6bb48893e32620710e8c765dc60ec37a2fc384f0c49014b92f0a1c056b2`。
+C 运行报告记录 `requested/effective/max=3/3/3`、36 次规划调用和 108 个目标任务。默认 D
+assembly 为 `winter-viewer-sha256-a375b431ed7c431487300988a7dc6c298cbecaf3a8e77ec4bc1371cf6be894e7`，
+共 8,641 个分钟采样，逐 revision 传输 9 个候选集合和 9 个正式 motion set；R1–R4 为
+`CURVE`，R5–R7 因 `integrated_risk_increased`、R8–R9 因几何条件诚实回退 raw。
+最终工作树已通过 Orchestrator `145 passed`，并重新执行 formal integration：
+`2 passed, 1 warning`、退出码 0、用时 1009.42 秒。告警仅为 xarray 探测不到可选
+ecCodes/cfgrib plugin。全仓 Ruff 仍被无关既有脚本格式问题阻挡，所改文件的定向 Ruff 已通过。
+
 ## Winter Combined Viewer 组装（2026-08-23 20:14 +08:00）
+
+> 历史基线；当前默认 Winter 路径已显式使用真实 `retrospective_dynamic_replay`。
+> 当前原始冻结身份没有可诚实附加的 B explanation sidecar；strict causal 与 explanation
+> 都必须使用独立、同身份的生产证据。
 
 `scripts/replay_viewer_export.py` 现在支持 Winter research assembly：它同时校验
 `DatasetBundle.v2`、`RunContext.v2`、committed `RiskWindow`、
@@ -45,6 +78,12 @@ schema、相对 artifact 路径、artifact SHA-256，以及 `risk_window_id`、r
 vessel identity；失败时不嵌入 sidecar。Orchestrator 不计算 contributor、不修补缺测，D
 继续可选消费并在缺失/错配时显示 `Explanation unavailable`。sidecar 的
 `demo_unvalidated` / `research_unvalidated` 标识保持不变。
+
+传输链本身已有其他 Winter 身份的工程验证，但当前原始冻结 RiskWindow 不附带 sidecar。
+其精确 A source record 已在 2026-08-26 detided-retirement 清理中物理退役，无法从最终
+RiskFrame 反推同次公式 component trace；因此默认 D 诚实显示 `Explanation unavailable`，
+不能把其他 holdout 的 sidecar 错配过来，也不能伪造 contributor。该缺失不改变 RiskFrame、
+路线或仿真。
 
 ## 研究曲线 sidecar 导出边界（历史兼容，2026-08-31）
 

@@ -121,7 +121,37 @@
           "minProperties": 1,
           "additionalProperties": {"type": "number", "minimum": 0}
         },
-        "process_peak_rss_bytes": {"type": "integer", "minimum": 0}
+        "process_peak_rss_bytes": {"type": "integer", "minimum": 0},
+        "c_objective_parallelism": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "parallel_active",
+            "requested_workers",
+            "effective_workers",
+            "pool_mode",
+            "planning_calls",
+            "tasks_submitted",
+            "max_parallel_tasks",
+            "worker_pids"
+          ],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "parallel_active": {"type": "boolean"},
+            "requested_workers": {"type": "integer", "minimum": 1},
+            "effective_workers": {"type": "integer", "minimum": 1},
+            "pool_mode": {"enum": ["persistent", "percall"]},
+            "planning_calls": {"type": "integer", "minimum": 0},
+            "tasks_submitted": {"type": "integer", "minimum": 0},
+            "max_parallel_tasks": {"type": "integer", "minimum": 1},
+            "worker_pids": {
+              "type": "array",
+              "items": {"type": "integer", "minimum": 1},
+              "uniqueItems": true
+            }
+          }
+        }
       }
     },
     "environment": {

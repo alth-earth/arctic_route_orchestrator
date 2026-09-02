@@ -43,6 +43,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replay-start", default="2026-08-15T10:00:00Z")
     parser.add_argument("--replay-end", default=None)
     parser.add_argument("--window-hours", type=int, default=12)
+    parser.add_argument(
+        "--replay-mode",
+        choices=("causal_replay", "retrospective_dynamic_replay"),
+        default="causal_replay",
+        help="causal issue-time replay or explicitly labelled post-hoc dynamic replay",
+    )
     parser.add_argument("--risk-forecast-end", default=None)
     parser.add_argument("--planning-horizon-hours", type=int, default=None)
     parser.add_argument("--v2-only", action="store_true")
@@ -52,7 +58,12 @@ def main(argv: list[str] | None = None) -> int:
         "--output-root",
         type=Path,
         default=(
-            _workspace_root() / "work_package_a" / "data" / "output" / "rc2-smoke" / "causal-replay-mvp"
+            _workspace_root()
+            / "work_package_a"
+            / "data"
+            / "output"
+            / "rc2-smoke"
+            / "causal-replay-mvp"
         ),
     )
     parser.add_argument(
@@ -91,15 +102,37 @@ def main(argv: list[str] | None = None) -> int:
             / "output-tromso-144h-r2" / "run-context.json"
         ),
     )
+    parser.add_argument(
+        "--frozen-dataset-bundle",
+        type=Path,
+        default=None,
+        help="exact immutable DatasetBundle.v2 to reuse with a frozen B window",
+    )
+    parser.add_argument(
+        "--frozen-risk-store-root",
+        type=Path,
+        default=None,
+        help="read-only source PersistentRiskStore containing the frozen commit",
+    )
+    parser.add_argument(
+        "--frozen-risk-commit-id",
+        default=None,
+        help="exact immutable RiskWindow commit to reuse without recomputing A/B",
+    )
     parser.add_argument("--max-snap-km", type=float, default=30.0)
     parser.add_argument("--cache-memory-mb", type=float, default=2048.0)
-    parser.add_argument("--planning-workers", type=int, default=1)
+    parser.add_argument(
+        "--planning-workers",
+        type=int,
+        default=3,
+        help="C objective-level workers (RC2 default: 3; ticks/layers remain serial)",
+    )
     parser.add_argument("--replan-min-interval-hours", type=float, default=None)
     parser.add_argument("--replan-waypoint-aligned-only", action="store_true")
     parser.add_argument(
         "--parallel-pool-mode",
         choices=("persistent", "percall"),
-        default="percall",
+        default="persistent",
     )
     args = parser.parse_args(argv)
 
@@ -123,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
         replay_end=replay_end,
         risk_forecast_end=risk_forecast_end,
         planning_horizon_hours=args.planning_horizon_hours,
+        replay_mode=args.replay_mode,
         v2_only=args.v2_only,
         tick_cadence_hours=args.tick_hours,
         a_data_root=args.a_data_root,
@@ -131,6 +165,9 @@ def main(argv: list[str] | None = None) -> int:
         c_config_root=args.c_config_root,
         contracts_config_root=args.contracts_config_root,
         frozen_run_context_path=args.frozen_run_context,
+        frozen_dataset_bundle_path=args.frozen_dataset_bundle,
+        frozen_risk_store_root=args.frozen_risk_store_root,
+        frozen_risk_commit_id=args.frozen_risk_commit_id,
         max_snap_km=args.max_snap_km,
         cache_memory_mb=args.cache_memory_mb,
         planning_workers=args.planning_workers,

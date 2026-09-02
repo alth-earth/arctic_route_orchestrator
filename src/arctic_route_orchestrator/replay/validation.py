@@ -21,10 +21,22 @@ def validate_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     visibility = snapshot["visibility"]
     risk = snapshot["risk"]
     planning = snapshot["planning"]
-    if knowledge_as_of != simulation_time:
-        violations.append("knowledge_as_of != simulation_time")
     max_issue = visibility.get("max_source_issue_time")
-    if max_issue and _parse_utc(max_issue) > knowledge_as_of:
+    mode = snapshot.get("scenario_mode")
+    if mode not in {"causal_replay", "retrospective_dynamic_replay"}:
+        violations.append("scenario_mode is unsupported")
+    elif mode == "causal_replay" and knowledge_as_of != simulation_time:
+        violations.append("causal knowledge_as_of != simulation_time")
+    elif (
+        mode == "retrospective_dynamic_replay"
+        and knowledge_as_of < simulation_time
+    ):
+        violations.append("retrospective knowledge_as_of < simulation_time")
+    if (
+        mode == "causal_replay"
+        and max_issue
+        and _parse_utc(max_issue) > knowledge_as_of
+    ):
         violations.append("max_source_issue_time > knowledge_as_of")
     prediction_as_of = risk.get("prediction_as_of")
     if prediction_as_of and _parse_utc(prediction_as_of) > knowledge_as_of:
@@ -32,8 +44,12 @@ def validate_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     planning_as_of = planning.get("planning_as_of")
     if planning_as_of and _parse_utc(planning_as_of) > knowledge_as_of:
         violations.append("planning_as_of > knowledge_as_of")
-    if snapshot["scenario_mode"] != "causal_replay":
-        violations.append("scenario_mode != causal_replay")
+    if (
+        mode == "retrospective_dynamic_replay"
+        and max_issue
+        and _parse_utc(max_issue) > knowledge_as_of
+    ):
+        violations.append("retrospective knowledge_as_of before complete source set")
     ship_status = snapshot["ship_state"].get("status")
     if ship_status not in (
         "DEFERRED",
@@ -70,6 +86,7 @@ def validate_replay(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
 
     violations: list[str] = []
     previous_time: datetime | None = None
+    previous_knowledge: datetime | None = None
     previous_index: int | None = None
     previous_revisions: dict[str, int] = {}
     previous_nav: dict[str, Any] | None = None
@@ -82,8 +99,11 @@ def validate_replay(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
             for item in result["violations"]
         )
         current_time = _parse_utc(snapshot["simulation_time"])
+        current_knowledge = _parse_utc(snapshot["knowledge_as_of"])
         if previous_time is not None and current_time <= previous_time:
             violations.append("simulation_time not strictly monotonic")
+        if previous_knowledge is not None and current_knowledge < previous_knowledge:
+            violations.append("knowledge_as_of moved backwards")
         if previous_index is not None and snapshot["snapshot_index"] != previous_index + 1:
             violations.append("snapshot_index not monotonic")
         revisions = {
@@ -147,9 +167,30 @@ def validate_replay(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
                     previous_position,
                     (position["longitude"], position["latitude"]),
                 )
-                if delta_km > 80.0:
+                elapsed_hours = (
+                    (current_time - previous_time).total_seconds() / 3_600.0
+                    if previous_time is not None
+                    else 0.0
+                )
+                motion_budget_km = _motion_budget_km(
+                    previous_nav,
+                    ship,
+                    elapsed_hours=elapsed_hours,
+                )
+                # A small relative/absolute allowance covers great-circle versus
+                # routed-distance interpolation and floating-point rounding. The
+                # budget still scales with cadence: a normal six-hour leg is not
+                # judged by the old fixed 80 km threshold.
+                teleport_limit_km = (
+                    motion_budget_km * 1.25 + 2.0
+                    if motion_budget_km is not None
+                    else 80.0
+                )
+                if delta_km > teleport_limit_km:
                     violations.append(
-                        f"navigation teleport candidate: {delta_km:.1f} km in one tick"
+                        "navigation teleport candidate: "
+                        f"{delta_km:.1f} km exceeds {teleport_limit_km:.1f} km "
+                        "motion budget"
                     )
         if ship.get("status") != "DEFERRED":
             previous_position = (
@@ -168,6 +209,7 @@ def validate_replay(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
             previous_position = None
             previous_cumulative = None
         previous_time = current_time
+        previous_knowledge = current_knowledge
         previous_index = snapshot["snapshot_index"]
     return {
         "snapshot_count": len(snapshots),
@@ -182,8 +224,11 @@ def validate_manifest(manifest: dict[str, Any], snapshots: list[dict[str, Any]])
     violations: list[str] = []
     if manifest.get("snapshot_count") != len(snapshots):
         violations.append("manifest snapshot_count mismatch")
-    if manifest.get("scenario_mode") != "causal_replay":
-        violations.append("manifest scenario_mode != causal_replay")
+    if manifest.get("scenario_mode") not in {
+        "causal_replay",
+        "retrospective_dynamic_replay",
+    }:
+        violations.append("manifest scenario_mode is unsupported")
     actual_indexes = [snapshot["snapshot_index"] for snapshot in snapshots]
     expected_indexes = list(range(len(snapshots)))
     if actual_indexes != expected_indexes:
@@ -213,3 +258,28 @@ def _haversine_km(start: tuple[float, float], end: tuple[float, float]) -> float
         + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2.0) ** 2
     )
     return 2.0 * 6_371.0088 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _motion_budget_km(
+    previous_ship: dict[str, Any],
+    current_ship: dict[str, Any],
+    *,
+    elapsed_hours: float,
+) -> float | None:
+    """Return the largest independently published physical travel budget."""
+
+    candidates: list[float] = []
+    expected = current_ship.get("expected_travel_km")
+    if expected is not None:
+        candidates.append(max(float(expected), 0.0))
+    if elapsed_hours > 0.0:
+        speeds = (
+            previous_ship.get("effective_speed_knots"),
+            current_ship.get("effective_speed_knots"),
+        )
+        candidates.extend(
+            max(float(speed), 0.0) * 1.852 * elapsed_hours
+            for speed in speeds
+            if speed is not None
+        )
+    return max(candidates) if candidates else None

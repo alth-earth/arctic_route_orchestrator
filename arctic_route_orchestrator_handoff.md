@@ -6,7 +6,7 @@ Content Status:
 Document Role: SUPPORTING
 Scope: orchestrator handoff
 Branch: research-validation-system
-Last Verified: 2026-08-23
+Last Verified: 2026-09-02 02:40 +08:00
 ---
 
 > **文档治理声明**
@@ -17,6 +17,24 @@ Last Verified: 2026-08-23
 > - 改造原因：同步挑战杯稳定演示、工程优先验收、双运行模式和项目负责人决策权。
 
 # A–B–C 编排器项目交接
+
+## 2026-09-01 动态回放与 C 并行交接增量
+
+默认 Winter 展示已恢复 2026-08-31 原始冻结身份，并由真实
+`retrospective_dynamic_replay` 资源驱动。最终到达态制品
+`winter-original-frozen-dynamic-v1` 含 25 snapshots、119 个事件和 9 个不可变 revision；
+每版均为 4×3=12 条候选，8 次 `REPLAN_DECIDED` 均有对应的
+`REPLAN_ADOPTED/ROUTE_CHANGED`，终态 `ARRIVED` 且无 pending。严格 causal replay 仍按
+issue-time fail closed；该回放不代表历史当时可得或导航资格。
+
+正式 C initial/replan 路径已恢复 RC2 三 worker objective-level `ProcessPool`，真实运行记录
+`effective_workers=3`、`max_parallel_tasks=3`、36 次 planning call、108 个 objective tasks；tick、layer、B 与 adoption gate
+继续串行。B-spline 仅是 D 绘制层，不能改变 C waypoint/ETA/risk/adoption。
+
+当前原始冻结 RiskWindow 没有可复现的 `risk-explanation.v1`：其精确 A source record 已在
+历史 detided-retirement 清理中退役，B 不能从最终 RiskFrame 反推同次 component trace。
+Orchestrator 因而不传入其他 holdout 的 sidecar，D 显示 `Explanation unavailable`；基础风险、
+路线与仿真不受影响。
 
 > Status: CURRENT — 2026-08-20。v3 四层 + 6h 重规划已跑通（r6/r7）；
 > 可中断 worker timeout 已实现并单测；worker 模式全链冒烟为 pre-demo 必做。

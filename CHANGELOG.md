@@ -6,12 +6,48 @@ Content Status:
 Document Role: SUPPORTING
 Scope: orchestrator change history
 Branch: research-validation-system
-Last Verified: 2026-09-01
+Last Verified: 2026-09-02
 ---
 
 # Changelog
 
-## Unreleased - identity-bound replay and risk explanation transport（2026-09-01）
+## Unreleased - arrival-complete replay and formal-motion binding（2026-09-02）
+
+- replay/export: restore the original frozen Winter identity and publish the complete 144-hour
+  retrospective run with 25 snapshots, 9 immutable plan revisions, 119 observed events and a
+  terminal `ARRIVED` state; all eight decided replans have adopted/route-changed evidence;
+- presentation: overlay exact event-time adoption state between sparse snapshots, keep completed
+  track append-only, clear the current segment only at arrival, and transport all eight revision
+  transitions plus all nine revision candidate/motion sets;
+- formal motion: preserve per-revision adoption offsets; D now tolerates only the sub-millisecond
+  precision necessarily lost by JavaScript `Date`, while still rejecting a 2 ms mismatch;
+- evidence: RC2 objective parallelism remained active (`3/3/3`, 36 planning calls, 108 tasks),
+  R1–R4 use qualified curves, R5–R7 fail closed on increased integrated risk, and R8–R9 fail
+  closed on geometric eligibility; the Viewer assembly has 8,641 minute samples.
+- explanation: do not attach the later holdout sidecar to the restored identity; its exact A source
+  trace was retired, so the optional consumer remains honestly unavailable without affecting risk,
+  routing, or replay.
+
+## Unreleased - Winter dynamic replay and RC2 objective parallelism（2026-09-01 22:40 +08:00）
+
+- replay: publish real Winter `retrospective_dynamic_replay` resources with revision-level
+  immutable 4-layer/12-route plan sets and observed `REPLAN_DECIDED` / `REPLAN_ADOPTED` events;
+  the temporal claim remains explicitly post-hoc, not causal;
+- perf: restore RC2 three-worker `ProcessPool` objective parallelism in formal C initial and
+  replanning calls, with fail-closed worker/pool validation and run-report telemetry;
+- safety: keep ticks, layers, B, switch/adoption gates, route metrics, ETA and hard constraints
+  serial/authoritative; B-spline remains presentation-only and cannot alter route semantics;
+- test: add parallel install/profile regression coverage and preserve B's expected
+  `allowed_region_has_no_grid_node` fail-closed endpoint test.
+- integration: bind B's real same-call `risk-explanation.v1` artifact/manifest to the Winter
+  RiskWindow with deterministic `generated_at`; D receives the content-addressed sidecar and
+  preserves producer `COMPLETE/PARTIAL/UNAVAILABLE` semantics.
+
+## Unreleased - identity-bound replay and risk explanation transport（历史基线，2026-09-01）
+
+> 后续当前状态：默认 Winter 路径已显式采用真实 `retrospective_dynamic_replay`；strict
+> `causal_replay` 仍按 issue-time 门禁失败关闭。本节 sidecar PASS 属于中间 holdout 身份；
+> 当前恢复的原始冻结身份没有可重建 trace，详见顶部增量与治理运行报告。
 
 - Winter export accepts only a strict `causal_replay` manifest with matching
   DatasetBundle/RunContext/RiskWindow/layer identity; real observed

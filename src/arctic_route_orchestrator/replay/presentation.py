@@ -243,6 +243,7 @@ class PresentationAdapter:
         self._events = self._collect_events()
         self._route_changes = self._build_route_changes()
         self._routes_by_revision = self._build_route_index()
+        self._pending_routes_by_revision = self._build_pending_route_index()
 
     def _collect_events(self) -> list[dict[str, Any]]:
         seen: set[tuple[str, str, str | None]] = set()
@@ -281,6 +282,21 @@ class PresentationAdapter:
             revision = int(revision)
             if revision not in index:
                 index[revision] = {"snapshot": snapshot, "route": payload}
+        return index
+
+    def _build_pending_route_index(self) -> dict[int, dict[str, Any]]:
+        index: dict[int, dict[str, Any]] = {}
+        for snapshot in self.snapshots:
+            ship = snapshot.get("ship_state") or {}
+            revision = ship.get("candidate_plan_revision")
+            payload = ship.get("pending_route")
+            if revision is None or not payload:
+                continue
+            revision = int(revision)
+            index.setdefault(
+                revision,
+                {"snapshot": snapshot, "route": payload},
+            )
         return index
 
     @property
@@ -329,6 +345,78 @@ class PresentationAdapter:
     def _route_for_revision(self, revision: int) -> dict[str, Any] | None:
         entry = self._routes_by_revision.get(int(revision))
         return entry["route"] if entry else None
+
+    def _pending_revision_at(self, tick: datetime) -> int | None:
+        pending: int | None = None
+        for event in self._events:
+            if _parse_utc(event["simulation_time"]) > tick:
+                break
+            revision = event.get("revision")
+            if revision in (None, ""):
+                continue
+            if event["type"] == "REPLAN_DECIDED":
+                pending = int(revision)
+            elif (
+                event["type"] in {"REPLAN_ADOPTED", "ROUTE_CHANGED"}
+                and pending == int(revision)
+            ):
+                pending = None
+        return pending
+
+    def _ship_for_moment(
+        self,
+        snapshot_ship: dict[str, Any],
+        moment: datetime,
+    ) -> dict[str, Any]:
+        """Overlay event-time route lifecycle on snapshot execution history."""
+
+        ship = dict(snapshot_ship)
+        active_revision = self._active_revision_at(moment)
+        active_entry = self._routes_by_revision.get(active_revision)
+        if active_entry is not None:
+            active_ship = (active_entry.get("snapshot") or {}).get("ship_state") or {}
+            ship["accepted_plan_revision"] = active_revision
+            ship["accepted_plan_digest"] = active_ship.get("accepted_plan_digest")
+            ship["accepted_route"] = active_entry["route"]
+            ship["superseded_route"] = active_ship.get("superseded_route")
+
+        pending_revision = self._pending_revision_at(moment)
+        pending_entry = (
+            self._pending_routes_by_revision.get(pending_revision)
+            if pending_revision is not None
+            else None
+        )
+        if pending_entry is None:
+            for field in (
+                "pending_route",
+                "candidate_plan_revision",
+                "replan_decision_time",
+                "effective_adoption_time",
+            ):
+                ship[field] = None
+            ship["adoption_status"] = "NONE"
+        else:
+            pending_ship = (pending_entry.get("snapshot") or {}).get("ship_state") or {}
+            decision_event = next(
+                (
+                    event
+                    for event in reversed(self._events)
+                    if event.get("type") == "REPLAN_DECIDED"
+                    and str(event.get("revision")) == str(pending_revision)
+                    and _parse_utc(event["simulation_time"]) <= moment
+                ),
+                None,
+            )
+            ship["pending_route"] = pending_entry["route"]
+            ship["candidate_plan_revision"] = pending_revision
+            ship["replan_decision_time"] = (
+                decision_event.get("simulation_time") if decision_event else None
+            )
+            ship["effective_adoption_time"] = pending_ship.get(
+                "effective_adoption_time"
+            )
+            ship["adoption_status"] = "PENDING"
+        return ship
 
     def vessel_at(self, tick: datetime | str) -> dict[str, Any]:
         """Physical vessel state at any simulation time (route-ETA driven)."""
@@ -380,7 +468,8 @@ class PresentationAdapter:
         snapshot = self._snapshot_at(moment)
         snapshot_index = int(snapshot["snapshot_index"])
         simulation_time = snapshot["simulation_time"]
-        ship = snapshot.get("ship_state") or {}
+        snapshot_ship = snapshot.get("ship_state") or {}
+        ship = self._ship_for_moment(snapshot_ship, moment)
         risk = snapshot.get("risk") or {}
 
         live_vessel: dict[str, Any] | None = None
@@ -397,10 +486,12 @@ class PresentationAdapter:
 
         if live_vessel is not None:
             snapshot_vessel = self.vessel_at(_parse_utc(simulation_time))
-            cumulative = ship.get("cumulative_travelled_km")
+            cumulative = snapshot_ship.get("cumulative_travelled_km")
             if (
                 cumulative is not None
                 and snapshot_vessel.get("executed_distance_km") is not None
+                and self._active_revision_at(_parse_utc(simulation_time))
+                == self._active_revision_at(moment)
             ):
                 cumulative_live = float(cumulative) + max(
                     0.0,
@@ -443,7 +534,12 @@ class PresentationAdapter:
                 ),
             )
 
-        plan = self._presentation_plan(snapshot, ship, moment)
+        plan = self._presentation_plan(
+            snapshot,
+            ship,
+            moment,
+            live_vessel=live_vessel,
+        )
         risk_view = PresentationRisk(
             risk_content_revision=int(risk.get("risk_content_revision", 0)),
             risk_window_revision=int(risk.get("risk_window_revision", 0)),
@@ -474,19 +570,32 @@ class PresentationAdapter:
         snapshot: dict[str, Any],
         ship: dict[str, Any],
         moment: datetime,
+        *,
+        live_vessel: dict[str, Any] | None = None,
     ) -> PresentationPlan:
         accepted_revision = int(ship.get("accepted_plan_revision", 0))
         route = ship.get("accepted_route") or {}
         waypoints = route.get("waypoints", ())
-        vessel_index = ship.get("current_edge_index")
+        vessel_index = (
+            live_vessel.get("current_edge_index")
+            if live_vessel is not None
+            else ship.get("current_edge_index")
+        )
+        vessel_status = (
+            live_vessel.get("status")
+            if live_vessel is not None
+            else ship.get("status")
+        )
         has_segment = (
+            vessel_status != "ARRIVED"
+            and
             vessel_index is not None
             and 0 <= int(vessel_index) < len(waypoints) - 1
         )
         segment = PresentationSegment(
             index=(
                 int(vessel_index)
-                if vessel_index is not None
+                if has_segment
                 else None
             ),
             start=(
@@ -505,8 +614,16 @@ class PresentationAdapter:
                 if has_segment
                 else None
             ),
-            start_eta=ship.get("current_segment_start_eta"),
-            end_eta=ship.get("current_segment_end_eta"),
+            start_eta=(
+                live_vessel.get("segment_start_eta")
+                if has_segment and live_vessel is not None
+                else ship.get("current_segment_start_eta") if has_segment else None
+            ),
+            end_eta=(
+                live_vessel.get("segment_end_eta")
+                if has_segment and live_vessel is not None
+                else ship.get("current_segment_end_eta") if has_segment else None
+            ),
         )
         future = [
             {
@@ -517,9 +634,7 @@ class PresentationAdapter:
             for item in waypoints
             if item.get("eta") and _parse_utc(item["eta"]) >= moment
         ]
-        completed_track = [
-            dict(item) for item in ship.get("completed_track", ())
-        ]
+        completed_track = self._completed_track_at(ship, waypoints, moment)
         pending_route = ship.get("pending_route")
         pending_candidate = None
         if pending_route:
@@ -570,6 +685,48 @@ class PresentationAdapter:
             pending_adoption=pending_adoption,
             superseded_future_route=superseded_future,
         )
+
+    @staticmethod
+    def _completed_track_at(
+        ship: dict[str, Any],
+        waypoints: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        moment: datetime,
+    ) -> list[dict[str, Any]]:
+        """Extend snapshot history with actually completed live-route anchors.
+
+        Snapshot history remains authoritative across plan adoption.  Between
+        snapshots, only accepted-route waypoints whose ETA has elapsed are
+        appended.  This keeps the track append-only without publishing a full
+        growing array for every render-cadence sample.
+        """
+
+        completed = [dict(item) for item in ship.get("completed_track", ())]
+        last_eta = (
+            _parse_utc(completed[-1]["eta"])
+            if completed and completed[-1].get("eta")
+            else None
+        )
+        for waypoint in waypoints:
+            eta_value = waypoint.get("eta")
+            if not eta_value:
+                continue
+            eta = _parse_utc(eta_value)
+            if eta > moment or (last_eta is not None and eta <= last_eta):
+                continue
+            point = {
+                "longitude": waypoint.get("longitude"),
+                "latitude": waypoint.get("latitude"),
+                "eta": eta_value,
+            }
+            if completed and all(
+                completed[-1].get(name) == point[name]
+                for name in ("longitude", "latitude")
+            ):
+                last_eta = eta
+                continue
+            completed.append(point)
+            last_eta = eta
+        return completed
 
     @staticmethod
     def _hard_reason_resource(snapshot: dict[str, Any]) -> str | None:

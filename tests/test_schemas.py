@@ -15,6 +15,7 @@ def _schema(name: str) -> dict[str, object]:
 def test_schemas_are_valid_draft_2020_12() -> None:
     for name in (
         "execution-spec-v1.schema.json",
+        "execution-spec-v2.schema.json",
         "presentation-route-candidates-v1.schema.json",
         "run-report-v1.schema.json",
     ):
@@ -30,6 +31,28 @@ def test_example_execution_spec_matches_schema() -> None:
 
     Draft202012Validator(
         _schema("execution-spec-v1.schema.json"),
+        format_checker=FormatChecker(),
+    ).validate(document)
+
+
+def test_v2_execution_spec_matches_schema() -> None:
+    document = {
+        "schema_version": "orchestrator.execution-spec.v2",
+        "run_id": "run-00000000-0000-4000-8000-000000000002",
+        "scenario_id": "murmansk_dikson_july_2026_retrospective_v1",
+        "generation_id": 0,
+        "input_revision": 0,
+        "generated_at": "2026-08-13T00:00:00Z",
+        "planning_contract": "cd.four-layer-route-plan-set.v3",
+        "max_snap_km": 150.0,
+        "replan_after_hours": 6,
+        "per_stage_timeout_seconds": 900.0,
+        "planning_workers": 3,
+        "parallel_pool_mode": "persistent",
+    }
+
+    Draft202012Validator(
+        _schema("execution-spec-v2.schema.json"),
         format_checker=FormatChecker(),
     ).validate(document)
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,26 @@ def test_formal_motion_is_bound_to_four_recommended_routes_and_adoption(tmp_path
     assert loaded == document
     assert len(loaded["records"]) == 4
     assert loaded["records"][0]["plan_id"] == replay_route["route_id"]
+
+
+def test_formal_motion_accepts_declared_uniform_deferred_adoption_offset(tmp_path) -> None:
+    path, plan_set, document, replay_route = _artifact(tmp_path)
+    offset = timedelta(minutes=17, seconds=5)
+    replay_route["motion_time_offset_seconds"] = offset.total_seconds()
+    for waypoint in replay_route["waypoints"]:
+        moment = datetime.fromisoformat(waypoint["eta"].replace("Z", "+00:00"))
+        waypoint["eta"] = (moment + offset).astimezone(UTC).isoformat().replace(
+            "+00:00", "Z"
+        )
+    replay_route["effective_adoption_time"] = replay_route["waypoints"][0]["eta"]
+
+    loaded = load_bound_route_motion_set(
+        path,
+        plan_set_document=four_layer_route_plan_set_to_dict(plan_set),
+        replay_routes=[replay_route],
+    )
+
+    assert loaded == document
 
 
 def test_formal_motion_rejects_stale_plan_and_adoption_teleport(tmp_path) -> None:

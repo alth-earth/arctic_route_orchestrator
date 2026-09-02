@@ -37,8 +37,10 @@ from arctic_route_contracts import (
     canonical_sha256,
     configuration_digest,
     load_run_context,
+    run_context_to_dict,
 )
 from arctic_route_data import (
+    DatasetBundle,
     PartitionedABCache,
     SimulationClock,
     WorkPackageA,
@@ -101,6 +103,7 @@ class ReplayPaths:
     output_root: Path
     risk_store_root: Path
     snapshots_dir: Path
+    planning_revisions_dir: Path
     logs_dir: Path
     heartbeat_path: Path
     checkpoint_path: Path
@@ -114,6 +117,7 @@ class ReplayPaths:
             output_root=root,
             risk_store_root=root / "risk-store",
             snapshots_dir=root / "snapshots",
+            planning_revisions_dir=root / "planning-revisions",
             logs_dir=root / "logs",
             heartbeat_path=root / "heartbeat.json",
             checkpoint_path=root / "checkpoint.json",
@@ -124,6 +128,7 @@ class ReplayPaths:
             root,
             paths.risk_store_root,
             paths.snapshots_dir,
+            paths.planning_revisions_dir,
             paths.logs_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -174,7 +179,14 @@ def _rss_mb() -> float:
 
 @dataclass(slots=True)
 class ReplayRunner:
-    """One Scenario B causal replay execution."""
+    """One replay execution.
+
+    ``causal_replay`` enforces issue-time visibility.  The explicit
+    ``retrospective_dynamic_replay`` mode is a post-hoc projection over the
+    same real records: all records are visible at the start, the original
+    issue times remain in the manifest, and the output is never presented as
+    historically available information.
+    """
 
     replay_id: str
     scenario_id: str
@@ -188,16 +200,21 @@ class ReplayRunner:
     c_config_root: Path
     contracts_config_root: Path
     frozen_run_context_path: Path
+    frozen_dataset_bundle_path: Path | None = None
+    frozen_risk_store_root: Path | None = None
+    frozen_risk_commit_id: str | None = None
     risk_forecast_end: datetime | None = None
     planning_horizon_hours: int | None = None
+    replay_mode: str = "causal_replay"
     v2_only: bool = False
     max_snap_km: float = 30.0
     cache_memory_mb: float = 2048.0
     c_attempt_timeout_seconds: int = 900
-    planning_workers: int = 1
+    # RC2 objective-level ProcessPool profile.  Tick/layer/B remain serial.
+    planning_workers: int = 3
     replan_min_interval_hours: float | None = None
     replan_waypoint_aligned_only: bool = False
-    parallel_pool_mode: str = "percall"
+    parallel_pool_mode: str = "persistent"
     pending_plan: Any = None
     pending_plan_set: Any = None
     pending_plan_kind: str = ""
@@ -212,6 +229,7 @@ class ReplayRunner:
 
     records: tuple[SourceRecord, ...] = ()
     run_context: RunContext | None = None
+    dataset_bundle: Any = None
     paths: ReplayPaths | None = None
     risk_store: Any = None
     ingress: Any = None
@@ -268,6 +286,12 @@ class ReplayRunner:
     nav_state: NavigationExecutionState | None = None
     _grid: Any = None
     _hard_mask: Any = None
+    _knowledge_as_of: datetime | None = None
+    plan_revision_resources: list[dict[str, Any]] = field(default_factory=list)
+    _current_plan_set_resource: dict[str, Any] | None = None
+    _pending_plan_set_resource: dict[str, Any] | None = None
+    _superseded_plan_set_resource: dict[str, Any] | None = None
+    planning_parallelism: dict[str, Any] = field(default_factory=dict)
 
     def run(
         self,
@@ -281,16 +305,47 @@ class ReplayRunner:
             output_root or _default_output_root(self.replay_id),
             self.replay_id,
         )
+        if self.replay_mode not in {
+            "causal_replay",
+            "retrospective_dynamic_replay",
+        }:
+            raise ValueError(
+                "replay_mode must be causal_replay or retrospective_dynamic_replay"
+            )
+        frozen_inputs = (
+            self.frozen_dataset_bundle_path,
+            self.frozen_risk_store_root,
+            self.frozen_risk_commit_id,
+        )
+        if any(item is not None for item in frozen_inputs) and not all(
+            item is not None for item in frozen_inputs
+        ):
+            raise ValueError(
+                "frozen DatasetBundle, risk store root, and risk commit id "
+                "must be supplied together"
+            )
         self.records = load_manifest_records(str(self.manifest_path), self.corridor_id)
         self.configuration = load_configuration(
             self.c_config_root,
             self.scenario_id,
             shared_config_root=self.contracts_config_root,
         )
-        self.risk_forecast_end = self.risk_forecast_end or _common_causal_valid_end(
-            self.records,
-            self.replay_start,
-        )
+        if self.replay_mode == "retrospective_dynamic_replay":
+            self._knowledge_as_of = max(
+                (record.issue_time for record in self.records),
+                default=self.replay_start,
+            )
+            retrospective_end = _common_retrospective_valid_end(self.records)
+            self.risk_forecast_end = self.risk_forecast_end or min(
+                self.replay_end,
+                retrospective_end,
+            )
+        else:
+            self._knowledge_as_of = self.replay_start
+            self.risk_forecast_end = self.risk_forecast_end or _common_causal_valid_end(
+                self.records,
+                self.replay_start,
+            )
         forecast_hours = int(
             (self.risk_forecast_end - self.replay_start).total_seconds() // 3600
         )
@@ -316,8 +371,10 @@ class ReplayRunner:
         previous_visible: tuple[SourceRecord, ...] = ()
         while tick <= self.replay_end:
             tick_started = time.perf_counter()
-            visible = tuple(
-                record for record in self.records if record.issue_time <= tick
+            visible = (
+                self.records
+                if self.replay_mode == "retrospective_dynamic_replay"
+                else tuple(record for record in self.records if record.issue_time <= tick)
             )
             newly_visible = tuple(
                 record
@@ -366,9 +423,18 @@ class ReplayRunner:
                 self._build_risk_window(tick, progress=progress)
                 events.append(
                     ReplayEvent(
-                        type="B_UPDATED",
+                        type=(
+                            "B_REUSED"
+                            if self.frozen_risk_commit_id is not None
+                            else "B_UPDATED"
+                        ),
                         simulation_time=_iso(tick),
                         revision=self.risk_commit.commit_id,
+                        description=(
+                            "exact frozen formal RiskWindow rebound read-only"
+                            if self.frozen_risk_commit_id is not None
+                            else ""
+                        ),
                         observed=True,
                     )
                 )
@@ -513,11 +579,12 @@ class ReplayRunner:
             index += 1
             tick += timedelta(hours=self.tick_cadence_hours)
 
+        transport_resources = self._write_transport_artifacts()
         manifest = ReplayManifest(
             schema_version="orchestrator.replay-manifest.v1",
             replay_id=self.replay_id,
             scenario_id=self.scenario_id,
-            scenario_mode="causal_replay",
+            scenario_mode=self.replay_mode,
             replay_start=_iso(self.replay_start),
             replay_end=_iso(self.replay_end),
             tick_cadence_hours=self.tick_cadence_hours,
@@ -527,13 +594,14 @@ class ReplayRunner:
             resources={
                 "risk_store": "risk-store",
                 "snapshots": "snapshots",
+                **transport_resources,
             },
             provenance={
                 "runner": "arctic_route_orchestrator.replay.runner",
                 "replay_start": _iso(self.replay_start),
                 "replay_end": _iso(self.replay_end),
                 "tick_cadence_hours": self.tick_cadence_hours,
-                "scenario_mode": "causal_replay",
+                "scenario_mode": self.replay_mode,
                 # A replay can be transported into a combined Viewer only
                 # when this exact source identity is carried with it.  Older
                 # manifests without this block remain valid replay artifacts
@@ -554,19 +622,36 @@ class ReplayRunner:
                         self.risk_commit.content_digest if self.risk_commit else None
                     ),
                     "layer_set_id": (
-                        self.current_plan_set.layer_set_id
-                        if self.current_plan_set is not None
-                        else None
+                        self.plan_revision_resources[0]["layer_set_id"]
+                        if self.plan_revision_resources
+                        else (
+                            self.current_plan_set.layer_set_id
+                            if self.current_plan_set is not None
+                            else None
+                        )
                     ),
                     "candidate_set_id": None,
                 },
+                "planning_workers": self.planning_workers,
+                "parallel_pool_mode": self.parallel_pool_mode,
+                "plan_revision_index": (
+                    self._plan_revision_index_relative_path()
+                    if self.plan_revision_resources
+                    else None
+                ),
+                "knowledge_as_of": (
+                    _iso(self._knowledge_as_of)
+                    if self._knowledge_as_of is not None
+                    else None
+                ),
+                "c_objective_parallelism": self.planning_parallelism,
             },
         )
         _write_json(self.paths.manifest_path, manifest.to_dict())
         summary = {
             "replay_id": self.replay_id,
             "scenario_id": self.scenario_id,
-            "scenario_mode": "causal_replay",
+            "scenario_mode": self.replay_mode,
             "snapshot_count": len(self.snapshots),
             "data_revision": self.data_revision,
             "b_input_revision": self.b_input_revision,
@@ -593,6 +678,18 @@ class ReplayRunner:
             "v2_probe_eta_hours": self.v2_probe_eta_hours,
             "planning_workers": self.planning_workers,
             "parallel_pool_mode": self.parallel_pool_mode,
+            "plan_revision_resources": list(self.plan_revision_resources),
+            "plan_revision_index": (
+                self._plan_revision_index_relative_path()
+                if self.plan_revision_resources
+                else None
+            ),
+            "knowledge_as_of": (
+                _iso(self._knowledge_as_of)
+                if self._knowledge_as_of is not None
+                else None
+            ),
+            "c_objective_parallelism": self.planning_parallelism,
             "route_semantic_digests": self.route_semantic_digests,
             "events": [event.to_dict() for event in self.events],
             "total_elapsed_seconds": round(time.perf_counter() - started, 1),
@@ -602,6 +699,10 @@ class ReplayRunner:
         return summary
 
     def _build_risk_window(self, tick: datetime, *, progress: Callable | None = None) -> None:
+        if self.frozen_risk_commit_id is not None:
+            self._bind_frozen_risk_window(tick, progress=progress)
+            return
+
         from arctic_route_data.sources import LocalArchiveSource
         from arctic_route_risk.config import load_risk_build_configuration
         from arctic_route_risk.context import BInputEnvelope
@@ -609,7 +710,16 @@ class ReplayRunner:
         from arctic_route_risk.service import RiskBuildRequest, RiskBuildService
 
         if progress is not None:
-            progress({"stage": "A causal resolution", "tick": _iso(tick)})
+            progress(
+                {
+                    "stage": (
+                        "A retrospective resolution"
+                        if self.replay_mode == "retrospective_dynamic_replay"
+                        else "A causal resolution"
+                    ),
+                    "tick": _iso(tick),
+                }
+            )
         source = LocalArchiveSource(self.a_data_root)
         clock = SimulationClock(tick)
         cache = PartitionedABCache(max_memory_mb=self.cache_memory_mb)
@@ -623,8 +733,14 @@ class ReplayRunner:
             target_horizon_hours=horizon_hours,
             minimum_complete_horizon_hours=horizon_hours,
             expected_interval_hours=EXPECTED_INTERVAL_HOURS,
-            knowledge_as_of=tick,
+            knowledge_as_of=(
+                self._knowledge_as_of
+                if self.replay_mode == "retrospective_dynamic_replay"
+                and self._knowledge_as_of is not None
+                else tick
+            ),
         )
+        self.dataset_bundle = prepared.dataset_bundle
         if progress is not None:
             progress({"stage": "B build", "tick": _iso(tick)})
         base_context = self._replay_run_context(prepared.dataset_bundle)
@@ -632,7 +748,12 @@ class ReplayRunner:
             run_context=base_context,
             prepared_window=prepared,
             generation_id=0,
-            knowledge_as_of=tick,
+            knowledge_as_of=(
+                self._knowledge_as_of
+                if self.replay_mode == "retrospective_dynamic_replay"
+                and self._knowledge_as_of is not None
+                else tick
+            ),
             requested_start=tick,
             requested_end=forecast_end,
         )
@@ -652,7 +773,12 @@ class ReplayRunner:
         self.risk_store = store
         self.risk_valid_start = frames[0].valid_time
         self.risk_valid_end = frames[-1].valid_time
-        self.prediction_as_of = tick
+        self.prediction_as_of = (
+            self._knowledge_as_of
+            if self.replay_mode == "retrospective_dynamic_replay"
+            and self._knowledge_as_of is not None
+            else tick
+        )
         self.risk_revision += 1
         self.risk_window_revision += 1
         self.risk_semantic_digest = risk_semantic_digest(frames)
@@ -665,6 +791,100 @@ class ReplayRunner:
         self.endpoint_mapping = map_corridor_endpoints(
             self.configuration,
             frames[0],
+            max_adjustment_km=self.max_snap_km,
+        )
+
+    def _bind_frozen_risk_window(
+        self,
+        tick: datetime,
+        *,
+        progress: Callable | None = None,
+    ) -> None:
+        """Bind an exact immutable A/B identity without recomputing A or B.
+
+        The source risk store is read only.  Canonical frames are republished
+        into the replay-local store, so suffix commits and restart state never
+        mutate the frozen producer evidence.
+        """
+
+        from arctic_route_risk.publishing.store import PersistentRiskStore
+
+        if progress is not None:
+            progress({"stage": "A/B frozen identity validation", "tick": _iso(tick)})
+        bundle_path = Path(self.frozen_dataset_bundle_path)
+        source_store_root = Path(self.frozen_risk_store_root)
+        commit_id = str(self.frozen_risk_commit_id)
+        bundle_document = json.loads(bundle_path.read_text(encoding="utf-8"))
+        bundle = DatasetBundle.from_dict(bundle_document)
+        source_context = load_run_context(self.frozen_run_context_path)
+        commit_path = source_store_root / "commits" / f"{commit_id}.json"
+        commit_document = json.loads(commit_path.read_text(encoding="utf-8"))
+        query = _query_from_commit_document(commit_document)
+        source_window = PersistentRiskStore(source_store_root).get_committed_window(query)
+
+        mismatches: list[str] = []
+        if source_window.commit_id != commit_id:
+            mismatches.append("risk_commit_id")
+        if bundle.bundle_id != source_context.dataset_bundle_id:
+            mismatches.append("dataset_bundle_id")
+        if bundle.bundle_digest != source_context.dataset_bundle_digest:
+            mismatches.append("dataset_bundle_digest")
+        if bundle.corridor_id != self.corridor_id:
+            mismatches.append("corridor_id")
+        if source_window.scenario_id != self.scenario_id:
+            mismatches.append("scenario_id")
+        if source_window.corridor_id != self.corridor_id:
+            mismatches.append("risk_corridor_id")
+        if source_window.run_id != source_context.run_id:
+            mismatches.append("run_id")
+        if source_window.frames[0].config_digest != source_context.config_digest:
+            mismatches.append("config_digest")
+        if source_window.start != self.replay_start:
+            mismatches.append("risk_window_start")
+        required_end = self.risk_forecast_end or self.replay_end
+        if source_window.end < required_end:
+            mismatches.append("risk_window_end")
+        if not (
+            bundle.requested_start <= self.replay_start
+            and bundle.minimum_required_end >= required_end
+        ):
+            mismatches.append("dataset_coverage")
+        if mismatches:
+            raise ValueError(
+                "frozen A/B identity mismatch: " + ", ".join(sorted(mismatches))
+            )
+
+        if progress is not None:
+            progress({"stage": "B frozen window replay-local publication", "tick": _iso(tick)})
+        store = PersistentRiskStore(self.paths.risk_store_root)
+        store.bind_generation_authority(
+            source_window.run_id,
+            SimulationClock(tick),
+        )
+        copied_window = store.publish_window(source_window.frames)
+        if copied_window.commit_id != source_window.commit_id:
+            raise ValueError("replay-local RiskWindow copy changed canonical identity")
+
+        self.dataset_bundle = bundle
+        self.risk_commit = copied_window
+        self.window_commit = copied_window
+        self.risk_store = store
+        self.risk_valid_start = copied_window.start
+        self.risk_valid_end = copied_window.end
+        self.prediction_as_of = copied_window.as_of
+        self.risk_revision += 1
+        self.risk_window_revision += 1
+        self.risk_semantic_digest = risk_semantic_digest(copied_window.frames)
+        self._last_window_identity = copied_window.commit_id
+        self._model_config_digest = copied_window.model_config_digest
+        self.run_context = self._c_run_context(source_context)
+        self.ingress = RiskSourcePlanningIngress(
+            source=store,
+            configuration=self.configuration,
+        )
+        self.endpoint_mapping = map_corridor_endpoints(
+            self.configuration,
+            copied_window.frames[0],
             max_adjustment_km=self.max_snap_km,
         )
 
@@ -773,11 +993,7 @@ class ReplayRunner:
                     supported_layers=self.supported_layers,
                     unsupported_layers=self.unsupported_layers,
                     blockers=self.planning_blockers,
-                    resources=(
-                        {"route_integrity": self._route_integrity}
-                        if self._route_integrity is not None
-                        else {}
-                    ),
+                    resources=self._planning_resources(),
                     observation_sequence=self.observation_sequence,
                     replan_reasons=self.last_replan_reasons,
                     route_semantic_digests=dict(self.route_semantic_digests),
@@ -796,11 +1012,7 @@ class ReplayRunner:
             supported_layers=self.supported_layers,
             unsupported_layers=self.unsupported_layers,
             blockers=self.planning_blockers,
-            resources=(
-                {"route_integrity": self._route_integrity}
-                if self._route_integrity is not None
-                else {}
-            ),
+            resources=self._planning_resources(),
             observation_sequence=self.observation_sequence,
             replan_reasons=self.last_replan_reasons,
             route_semantic_digests=dict(self.route_semantic_digests),
@@ -897,6 +1109,51 @@ class ReplayRunner:
             pool_mode=self.parallel_pool_mode,
         ):
             operation(tick, events)
+            # ``install`` restores the parent's global state on exit.  Capture
+            # the completed call while the install is still active, otherwise
+            # a top-level replay would lose the worker evidence entirely.
+            telemetry = replay_parallel.snapshot_telemetry()
+        self._record_parallel_telemetry(telemetry)
+
+    def _record_parallel_telemetry(self, telemetry: dict[str, Any]) -> None:
+        """Merge one formal C planning call into replay evidence."""
+
+        previous = self.planning_parallelism
+        pids = sorted(
+            set(previous.get("worker_pids", ()))
+            | set(telemetry.get("worker_pids", ()))
+        )
+        self.planning_parallelism = {
+            "enabled": bool(previous.get("enabled") or telemetry.get("enabled")),
+            "parallel_active": bool(
+                previous.get("parallel_active")
+                or telemetry.get("parallel_active")
+            ),
+            "requested_workers": max(
+                int(previous.get("requested_workers", 1)),
+                int(telemetry.get("requested_workers", self.planning_workers)),
+            ),
+            # ``worker_pids`` is a cumulative provenance list across planning
+            # calls; it must not be mistaken for simultaneous capacity.  The
+            # effective worker count is the largest pool observed in any one
+            # call (RC2 target: three objective workers).
+            "effective_workers": max(
+                int(previous.get("effective_workers", 1)),
+                int(telemetry.get("effective_workers", 1)),
+            ),
+            "pool_mode": telemetry.get(
+                "pool_mode", previous.get("pool_mode", self.parallel_pool_mode)
+            ),
+            "planning_calls": int(previous.get("planning_calls", 0))
+            + int(telemetry.get("planning_calls", 0)),
+            "tasks_submitted": int(previous.get("tasks_submitted", 0))
+            + int(telemetry.get("tasks_submitted", 0)),
+            "max_parallel_tasks": max(
+                int(previous.get("max_parallel_tasks", 1)),
+                int(telemetry.get("max_parallel_tasks", 1)),
+            ),
+            "worker_pids": pids,
+        }
 
     def _attempt_initial_plan(self, tick: datetime, events: list[ReplayEvent]) -> None:
         if self.v2_only:
@@ -911,6 +1168,12 @@ class ReplayRunner:
             self._audit_and_attach_route()
             self._attach_route_digests()
             self.plan_revision = 1
+            self._current_plan_set_resource = self._publish_plan_set_resource(
+                self.current_plan_set,
+                tick=tick,
+                plan_revision=self.plan_revision,
+                state="current",
+            )
             self.supported_layers = (
                 "executable_0_6h",
                 "rolling_0_24h",
@@ -954,6 +1217,8 @@ class ReplayRunner:
             self.current_plan_set = None
             self.plan_revision = 1
             self.plan_kind = "v2_complete_route_fallback"
+            self._current_plan_set_resource = None
+            self._pending_plan_set_resource = None
             self._audit_and_attach_route()
             self._attach_route_digests()
             self.supported_layers = ("full_voyage_complete_route",)
@@ -1145,14 +1410,26 @@ class ReplayRunner:
 
         if adoption_spec["mode"] == "IMMEDIATE":
             self.superseded_route_payload = self._capture_superseded(tick)
+            self._set_plan_resource_state(
+                self._current_plan_set_resource,
+                state="superseded",
+            )
+            self._superseded_plan_set_resource = self._current_plan_set_resource
             self.current_plan = plan
             self.current_plan_set = plan_set
             self.plan_kind = plan_kind
             self.plan_revision += 1
+            self._current_plan_set_resource = self._publish_plan_set_resource(
+                plan_set,
+                tick=tick,
+                plan_revision=self.plan_revision,
+                state="current",
+            )
             self.active_plan_time_offset = timedelta()
             self.pending_plan = None
             self.pending_plan_set = None
             self.pending_plan_kind = ""
+            self._pending_plan_set_resource = None
             self.pending_decision_time = None
             self.pending_adoption_time = None
             self.pending_revision = 0
@@ -1165,6 +1442,12 @@ class ReplayRunner:
         self.pending_plan = plan
         self.pending_plan_set = plan_set
         self.pending_plan_kind = plan_kind
+        self._pending_plan_set_resource = self._publish_plan_set_resource(
+            plan_set,
+            tick=tick,
+            plan_revision=self.plan_revision + 1,
+            state="pending",
+        )
         self.pending_decision_time = tick
         self.pending_adoption_time = adoption_spec["adoption_time"]
         self.pending_revision = self.plan_revision + 1
@@ -1175,6 +1458,27 @@ class ReplayRunner:
         self.pending_decision_position = self._physical_state_at(
             tick, self.current_plan
         ).position
+
+    def _set_plan_resource_state(
+        self,
+        resource: dict[str, Any] | None,
+        *,
+        state: str,
+    ) -> None:
+        """Update the index entry for a published revision's lifecycle state."""
+
+        if resource is None:
+            return
+        digest = resource.get("digest")
+        revision = resource.get("plan_revision")
+        for entry in self.plan_revision_resources:
+            if (
+                entry.get("digest") == digest
+                and entry.get("plan_revision") == revision
+            ):
+                entry["state"] = state
+                resource["state"] = state
+                return
 
     def _adopt_pending_if_due(
         self,
@@ -1189,11 +1493,23 @@ class ReplayRunner:
             or tick < self.pending_adoption_time
         ):
             return
-        self.superseded_route_payload = self._capture_superseded(tick)
+        adoption_time = self.pending_adoption_time
+        self.superseded_route_payload = self._capture_superseded(adoption_time)
+        self._set_plan_resource_state(
+            self._current_plan_set_resource,
+            state="superseded",
+        )
+        self._set_plan_resource_state(
+            self._pending_plan_set_resource,
+            state="current",
+        )
+        self._superseded_plan_set_resource = self._current_plan_set_resource
         self.current_plan = self.pending_plan
         self.current_plan_set = self.pending_plan_set
         self.plan_kind = self.pending_plan_kind
         self.plan_revision = self.pending_revision
+        self._current_plan_set_resource = self._pending_plan_set_resource
+        self._pending_plan_set_resource = None
         self.active_plan_time_offset = (
             self.pending_adoption_time - self.pending_decision_time
             if self.pending_decision_time is not None
@@ -1204,7 +1520,7 @@ class ReplayRunner:
         events.append(
             ReplayEvent(
                 type="REPLAN_ADOPTED",
-                simulation_time=_iso(tick),
+                simulation_time=_iso(adoption_time),
                 revision=str(self.plan_revision),
                 description="deferred plan adopted at execution node",
                 observed=True,
@@ -1213,7 +1529,7 @@ class ReplayRunner:
         events.append(
             ReplayEvent(
                 type="ROUTE_CHANGED",
-                simulation_time=_iso(tick),
+                simulation_time=_iso(adoption_time),
                 revision=str(self.plan_revision),
                 description="deferred adoption",
                 observed=True,
@@ -1373,6 +1689,153 @@ class ReplayRunner:
                 flush=True,
             )
             return f"v2 probe: {type(exc).__name__}: {exc}"
+
+    def _publish_plan_set_resource(
+        self,
+        plan_set: Any,
+        *,
+        tick: datetime,
+        plan_revision: int,
+        state: str,
+    ) -> dict[str, Any] | None:
+        """Persist one immutable C 4x3 set for replay/D consumption."""
+
+        if plan_set is None:
+            return None
+        from arctic_route_planning.publishing import four_layer_route_plan_set_to_dict
+
+        document = four_layer_route_plan_set_to_dict(plan_set)
+        layer_count = len(document.get("layers", ()))
+        route_count = sum(
+            len(layer.get("plans", {}))
+            for layer in document.get("layers", ())
+            if isinstance(layer, dict)
+        )
+        if layer_count != 4 or route_count != 12:
+            raise ValueError(
+                f"replay plan-set resource must contain 4 layers × 3 objectives; "
+                f"got {layer_count} × {route_count}"
+            )
+        digest = canonical_sha256(document)
+        relative = f"planning-revisions/plan-set-{digest}.json"
+        path = self.paths.output_root / relative
+        if not path.is_file():
+            _write_json(path, document)
+        entry = {
+            "resource": relative,
+            "digest": digest,
+            "layer_set_id": plan_set.layer_set_id,
+            "plan_revision": int(plan_revision),
+            "simulation_time": _iso(tick),
+            "input_revision": int(plan_set.input_revision),
+            "state": state,
+            "layer_count": layer_count,
+            "route_count": route_count,
+        }
+        if not any(
+            item.get("digest") == digest
+            and item.get("plan_revision") == int(plan_revision)
+            for item in self.plan_revision_resources
+        ):
+            self.plan_revision_resources.append(entry)
+        return entry
+
+    def _planning_resources(self) -> dict[str, dict[str, Any]]:
+        resources: dict[str, dict[str, Any]] = {}
+        if self._route_integrity is not None:
+            resources["route_integrity"] = self._route_integrity
+        if self._current_plan_set_resource is not None:
+            resources["route_plan_set"] = self._current_plan_set_resource
+        if self._pending_plan_set_resource is not None:
+            resources["pending_route_plan_set"] = self._pending_plan_set_resource
+        if self._superseded_plan_set_resource is not None:
+            resources["superseded_route_plan_set"] = self._superseded_plan_set_resource
+        if self.planning_parallelism:
+            resources["c_objective_parallelism"] = self.planning_parallelism
+        return resources
+
+    def _plan_revision_index_payload(self) -> dict[str, Any]:
+        """Return the deterministic index for immutable C plan-set resources."""
+
+        return {
+            "schema_version": "orchestrator.plan-revision-index.v1",
+            "replay_id": self.replay_id,
+            "scenario_id": self.scenario_id,
+            "scenario_mode": self.replay_mode,
+            "layer_count": 4,
+            "routes_per_layer": 3,
+            "route_count": 12,
+            "entries": list(self.plan_revision_resources),
+        }
+
+    def _plan_revision_index_relative_path(self) -> str:
+        payload = self._plan_revision_index_payload()
+        digest = canonical_sha256(payload)
+        return f"planning-revisions/index-{digest}.json"
+
+    def _write_plan_revision_index(self) -> str:
+        """Write the content-addressed revision index once and return its path."""
+
+        relative = self._plan_revision_index_relative_path()
+        path = self.paths.output_root / relative
+        if not path.is_file():
+            payload = self._plan_revision_index_payload()
+            _write_json(
+                path,
+                {
+                    **payload,
+                    "content_digest": canonical_sha256(payload),
+                },
+            )
+        return relative
+
+    def _write_transport_artifacts(self) -> dict[str, str]:
+        """Persist the exact A/B/C handoff files consumed by the Viewer."""
+
+        resources: dict[str, str] = {}
+        if self.dataset_bundle is not None:
+            dataset_path = self.paths.output_root / "dataset-bundle.json"
+            if not dataset_path.is_file():
+                _write_json(dataset_path, self.dataset_bundle.to_dict())
+            resources["dataset_bundle"] = "dataset-bundle.json"
+        if self.run_context is not None:
+            context_path = self.paths.output_root / "run-context.json"
+            if not context_path.is_file():
+                _write_json(context_path, run_context_to_dict(self.run_context))
+            resources["run_context"] = "run-context.json"
+        if self.risk_commit is not None:
+            commit_relative = (
+                f"risk-store/commits/{self.risk_commit.commit_id}.json"
+            )
+            resources["risk_window_commit"] = commit_relative
+            frame_index = {
+                "artifact_kind": "orchestrator-replay-risk-frame-index",
+                "status": "FORMAL_VALIDATED",
+                "commit_id": self.risk_commit.commit_id,
+                "content_digest": self.risk_commit.content_digest,
+                "dataset_bundle_id": (
+                    self.dataset_bundle.bundle_id if self.dataset_bundle else None
+                ),
+                "dataset_bundle_digest": (
+                    self.dataset_bundle.bundle_digest if self.dataset_bundle else None
+                ),
+                "frame_ids": [
+                    item.risk_id for item in self.risk_commit.frames
+                ],
+                "frame_schema": "bc.risk-frame.v2",
+                "grid_profile": "formal_replay",
+                "model_config_digest": self.risk_commit.model_config_digest,
+                "risk_store": "risk-store",
+                "run_id": self.risk_commit.run_id,
+                "scenario_id": self.risk_commit.scenario_id,
+            }
+            frame_index_path = self.paths.output_root / "frame-index.json"
+            if not frame_index_path.is_file():
+                _write_json(frame_index_path, frame_index)
+            resources["risk_frame_index"] = "frame-index.json"
+        if self.plan_revision_resources:
+            resources["planning_revision_index"] = self._write_plan_revision_index()
+        return resources
 
     def _audit_and_attach_route(self) -> None:
         from arctic_route_orchestrator.replay.route_integrity import audit_route
@@ -1602,6 +2065,7 @@ class ReplayRunner:
         completed_track = merge_completed_track(
             previous_track,
             waypoints[:completed_count],
+            eta_offset=self.active_plan_time_offset,
         )
         position = state.position
         remaining = state.remaining_distance_km
@@ -1639,7 +2103,9 @@ class ReplayRunner:
         arrived = state.status == "ARRIVED"
         status = state.status
         executed_until = (
-            _iso(waypoints[-1].eta) if arrived else _iso(tick)
+            _iso(waypoints[-1].eta + self.active_plan_time_offset)
+            if arrived
+            else _iso(tick)
         )
         adoption_spec = self._plan_adoption_spec(tick, plan)
         planner_origin_node = (
@@ -1900,10 +2366,15 @@ class ReplayRunner:
             schema_version="orchestrator.replay-snapshot.v1",
             replay_id=self.replay_id,
             scenario_id=self.scenario_id,
-            scenario_mode="causal_replay",
+            scenario_mode=self.replay_mode,
             snapshot_index=index,
             simulation_time=_iso(tick),
-            knowledge_as_of=_iso(tick),
+            knowledge_as_of=(
+                _iso(self._knowledge_as_of)
+                if self.replay_mode == "retrospective_dynamic_replay"
+                and self._knowledge_as_of is not None
+                else _iso(tick)
+            ),
             visibility=visibility,
             risk=risk,
             planning=planning,
@@ -1946,6 +2417,11 @@ class ReplayRunner:
                     self.active_plan_time_offset.total_seconds()
                 ),
                 "superseded_route_payload": self.superseded_route_payload,
+                "plan_revision_resources": self.plan_revision_resources,
+                "current_plan_set_resource": self._current_plan_set_resource,
+                "pending_plan_set_resource": self._pending_plan_set_resource,
+                "superseded_plan_set_resource": self._superseded_plan_set_resource,
+                "c_objective_parallelism": self.planning_parallelism,
             },
         )
 
@@ -1992,6 +2468,29 @@ class ReplayRunner:
         superseded = checkpoint.get("superseded_route_payload")
         self.superseded_route_payload = (
             dict(superseded) if superseded is not None else None
+        )
+        self.plan_revision_resources = [
+            dict(item)
+            for item in checkpoint.get("plan_revision_resources", ())
+            if isinstance(item, dict)
+        ]
+        current_resource = checkpoint.get("current_plan_set_resource")
+        pending_resource = checkpoint.get("pending_plan_set_resource")
+        superseded_resource = checkpoint.get("superseded_plan_set_resource")
+        self._current_plan_set_resource = (
+            dict(current_resource) if isinstance(current_resource, dict) else None
+        )
+        self._pending_plan_set_resource = (
+            dict(pending_resource) if isinstance(pending_resource, dict) else None
+        )
+        self._superseded_plan_set_resource = (
+            dict(superseded_resource)
+            if isinstance(superseded_resource, dict)
+            else None
+        )
+        parallelism = checkpoint.get("c_objective_parallelism")
+        self.planning_parallelism = (
+            dict(parallelism) if isinstance(parallelism, dict) else {}
         )
         self.pending_plan = None
         self.pending_plan_set = None
@@ -2096,6 +2595,8 @@ def _honest_replan_reasons(
 def merge_completed_track(
     previous: tuple[dict[str, Any], ...],
     waypoints: tuple[Any, ...],
+    *,
+    eta_offset: timedelta = timedelta(0),
 ) -> tuple[dict[str, Any], ...]:
     """Append-only executed-history merge across plan adoptions."""
 
@@ -2105,10 +2606,11 @@ def merge_completed_track(
     }
     merged = list(previous)
     for waypoint in waypoints:
+        executed_eta = _iso(waypoint.eta + eta_offset)
         key = (
             waypoint.longitude,
             waypoint.latitude,
-            _iso(waypoint.eta),
+            executed_eta,
         )
         if key in existing_keys:
             continue
@@ -2117,7 +2619,7 @@ def merge_completed_track(
             {
                 "longitude": waypoint.longitude,
                 "latitude": waypoint.latitude,
-                "eta": _iso(waypoint.eta),
+                "eta": executed_eta,
             }
         )
     return tuple(merged)
@@ -2172,6 +2674,24 @@ def _common_causal_valid_end(
         if valid_times:
             ends.append(max(valid_times))
     return min(ends) if ends else knowledge_as_of
+
+
+def _common_retrospective_valid_end(records: tuple[SourceRecord, ...]) -> datetime:
+    """Return the common dynamic valid end without applying issue-time gates."""
+
+    dynamic_types = REQUIRED_FORMAL_DATA_TYPES - STATIC_TYPES
+    ends: list[datetime] = []
+    for data_type in sorted(dynamic_types):
+        valid_times = [
+            record.valid_time
+            for record in records
+            if record.data_type == data_type
+        ]
+        if valid_times:
+            ends.append(max(valid_times))
+    if not ends:
+        raise ValueError("retrospective replay has no dynamic valid-time coverage")
+    return min(ends)
 
 
 def _aligned_planning_hours(forecast_hours: int) -> int:

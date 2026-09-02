@@ -24,6 +24,7 @@ from statistics import fmean
 from typing import Any
 
 import numpy as np
+from arctic_route_planning.publishing import four_layer_route_plan_set_from_dict
 
 from arctic_route_orchestrator.replay.digests import replay_semantic_digest
 from arctic_route_orchestrator.replay.geospatial import (
@@ -42,7 +43,10 @@ from arctic_route_orchestrator.route_motion import (
     load_bound_route_motion_set,
     validate_route_motion_context,
 )
-from arctic_route_orchestrator.route_presentation import load_route_candidates
+from arctic_route_orchestrator.route_presentation import (
+    load_route_candidates,
+    project_route_candidates,
+)
 
 SEA_RGB = (46, 102, 150)
 LAND_RGB = (108, 132, 98)
@@ -190,20 +194,32 @@ def _route_meta(
     revision: int,
     *,
     route_id_override: str | None = None,
+    plan_override: dict[str, Any] | None = None,
+    motion_time_offset_seconds: float = 0.0,
 ) -> dict:
     entry = adapter._routes_by_revision[revision]
     route = entry["route"]
     snapshot_ship = (entry.get("snapshot") or {}).get("ship_state") or {}
-    route_id = entry.get("route_id") or route.get("route_id") or route.get("plan_id")
+    route_id = (
+        entry.get("route_id")
+        or route.get("route_id")
+        or route.get("plan_id")
+        or (plan_override or {}).get("plan_id")
+        or route_id_override
+    )
     waypoints = []
-    for item in route["waypoints"]:
+    plan_waypoints = (plan_override or {}).get("waypoints", ())
+    for index, item in enumerate(route["waypoints"]):
         waypoint = {
             "lon": item["longitude"],
             "lat": item["latitude"],
             "eta": item["eta"],
         }
-        if item.get("recommended_speed_mps") is not None:
-            waypoint["recommended_speed_mps"] = item["recommended_speed_mps"]
+        recommended_speed = item.get("recommended_speed_mps")
+        if recommended_speed is None and index < len(plan_waypoints):
+            recommended_speed = plan_waypoints[index].get("recommended_speed_mps")
+        if recommended_speed is not None:
+            waypoint["recommended_speed_mps"] = recommended_speed
         waypoints.append(waypoint)
     decision_time = None
     adopt_time = None
@@ -216,37 +232,61 @@ def _route_meta(
             elif event["type"] == "REPLAN_TRIGGERED":
                 decision_time = event["simulation_time"]
                 mode = "IMMEDIATE"
-            elif event["type"] == "ROUTE_CHANGED":
+            elif event["type"] in {"REPLAN_ADOPTED", "ROUTE_CHANGED"}:
                 adopt_time = event["simulation_time"]
     if revision == 1:
         adopt_time = adapter.replay_start.isoformat().replace("+00:00", "Z")
     return {
         "revision": revision,
-        "route_id": route_id or route_id_override,
+        "route_id": route_id,
         "plan_digest": snapshot_ship.get("accepted_plan_digest"),
         "layer": "full_voyage",
         "objective": "recommended",
         "decision_time": decision_time,
         "effective_adoption_time": adopt_time,
         "adoption_mode": mode,
-        "distance_km": route.get("distance_km"),
+        "motion_time_offset_seconds": motion_time_offset_seconds,
+        "distance_km": (
+            (plan_override or {}).get("metrics", {}).get("distance_km")
+            if plan_override is not None
+            else route.get("distance_km")
+        ),
         "arrival_eta": waypoints[-1]["eta"] if waypoints else None,
         "metrics": {
-            "distance_km": route.get("distance_km"),
-            "average_risk": route.get("average_risk", route.get("avg_risk")),
-            "maximum_risk": route.get("maximum_risk", route.get("max_risk")),
+            "distance_km": (
+                (plan_override or {}).get("metrics", {}).get("distance_km")
+                if plan_override is not None
+                else route.get("distance_km")
+            ),
+            "average_risk": (
+                (plan_override or {}).get("metrics", {}).get("avg_risk")
+                if plan_override is not None
+                else route.get("average_risk", route.get("avg_risk"))
+            ),
+            "maximum_risk": (
+                (plan_override or {}).get("metrics", {}).get("max_risk")
+                if plan_override is not None
+                else route.get("maximum_risk", route.get("max_risk"))
+            ),
         },
         "waypoints": waypoints,
     }
 
 
-def _timeline(adapter: PresentationAdapter, cadence_seconds: int) -> list[dict]:
+def _timeline(
+    adapter: PresentationAdapter,
+    cadence_seconds: int,
+    *,
+    end_time: datetime | None = None,
+) -> list[dict]:
     results: list[dict] = []
     previous_track_key: tuple | None = None
     previous_pending_key: tuple | None = None
     previous_superseded_key: tuple | None = None
     moment = adapter.replay_start
-    while moment <= adapter.replay_end:
+    final_time = end_time or adapter.replay_end
+    _require(final_time >= moment, "timeline end must not precede replay start")
+    while moment <= final_time:
         state = adapter.state_at(moment)
         plan = state.plan
         vessel = state.vessel
@@ -283,12 +323,13 @@ def _timeline(adapter: PresentationAdapter, cadence_seconds: int) -> list[dict]:
             else None,
             "eat": None,
             "ctl": len(track),
-            "seg": {
+        }
+        if segment["index"] is not None:
+            entry["seg"] = {
                 "index": segment["index"],
                 "start_eta": segment["start_eta"],
                 "end_eta": segment["end_eta"],
-            },
-        }
+            }
         if plan_dict["pending_adoption"]:
             pending_revision = plan_dict["pending_plan_revision"]
             effective_event = next(
@@ -354,7 +395,12 @@ def _timeline(adapter: PresentationAdapter, cadence_seconds: int) -> list[dict]:
             )
             previous_superseded_key = superseded_key
         results.append(entry)
-        moment += timedelta(seconds=cadence_seconds)
+        next_moment = moment + timedelta(seconds=cadence_seconds)
+        if next_moment > final_time:
+            next_moment = final_time
+        if next_moment == moment:
+            break
+        moment = next_moment
     return results
 
 
@@ -581,9 +627,25 @@ def _presentation_risk(
         latitudes = coordinates.get("latitude")
         longitudes = coordinates.get("longitude")
         hard_reasons = variables.get("hard_reason")
+        hard_mask = variables.get("hard_mask")
         risk_levels = variables.get("risk_level")
         risk_scores = variables.get("risk_score")
         confidences = variables.get("confidence")
+        _require(
+            isinstance(hard_mask, list),
+            f"risk frame {path} is missing hard_mask",
+        )
+        if hard_reasons is None:
+            # bc.risk-frame.v2 intentionally keeps the per-cell reason in
+            # producer-side attributes in some formal builds.  Preserve the
+            # exact hard-mask cells for D, but never invent a physical cause.
+            hard_reasons = [
+                [
+                    "HARD_MASK_REASON_UNAVAILABLE" if bool(value) else "NONE"
+                    for value in row
+                ]
+                for row in hard_mask
+            ]
         if not all(
             isinstance(value, list)
             for value in (
@@ -599,7 +661,13 @@ def _presentation_risk(
         if any(
             len(matrix) != len(latitudes)
             or any(len(row) != len(longitudes) for row in matrix)
-            for matrix in (hard_reasons, risk_levels, risk_scores, confidences)
+            for matrix in (
+                hard_reasons,
+                hard_mask,
+                risk_levels,
+                risk_scores,
+                confidences,
+            )
         ):
             raise ValueError(f"risk frame {path} spatial arrays have mismatched shapes")
         flattened = {
@@ -607,6 +675,7 @@ def _presentation_risk(
             "risk_levels": [level for row in risk_levels for level in row],
             "risk_scores": [score for row in risk_scores for score in row],
             "confidences": [confidence for row in confidences for confidence in row],
+            "hard_mask": [value for row in hard_mask for value in row],
         }
         frame = {
             "valid_time": valid_time,
@@ -617,6 +686,11 @@ def _presentation_risk(
             "corridor_id": document.get("corridor_id"),
             "vessel_profile_id": document.get("vessel_profile_id"),
             "risk_window_id": document.get("risk_window_id"),
+            "hard_reason_source": (
+                "payload.hard_reason"
+                if variables.get("hard_reason") is not None
+                else "producer_hard_mask_only_reason_unavailable"
+            ),
             "coordinates": {"latitude": latitudes, "longitude": longitudes},
             **flattened,
         }
@@ -1002,14 +1076,25 @@ def _load_causal_replay_source(
     snapshots_dir: Path | None,
     expected_identity: dict[str, Any],
     expected_route: dict[str, Any],
+    allow_retrospective: bool = False,
 ) -> tuple[PresentationAdapter, dict[str, Any], Path]:
-    """Load only a real, identity-bound causal replay for Winter assembly."""
+    """Load a real, identity-bound replay for Winter assembly.
+
+    ``causal_replay`` keeps issue-time visibility.  The explicitly opt-in
+    ``retrospective_dynamic_replay`` mode consumes the same producer events
+    after the fact and is labelled as such; it is never treated as historical
+    information available at the simulation clock.
+    """
 
     manifest = _read_json_object(manifest_path, label="causal replay manifest")
+    scenario_mode = manifest.get("scenario_mode")
+    allowed_modes = {"causal_replay"}
+    if allow_retrospective:
+        allowed_modes.add("retrospective_dynamic_replay")
     _require(
         manifest.get("schema_version") == "orchestrator.replay-manifest.v1"
-        and manifest.get("scenario_mode") == "causal_replay",
-        "Winter source replay is not an orchestrator causal replay",
+        and scenario_mode in allowed_modes,
+        "Winter source replay is not an allowed orchestrator replay",
     )
     snapshots_root = snapshots_dir or manifest_path.parent / "snapshots"
     entries = manifest.get("snapshots")
@@ -1077,7 +1162,8 @@ def _load_causal_replay_source(
     _require(
         manifest.get("scenario_id") == expected_identity.get("scenario_id")
         and replay_start == expected_start
-        and expected_start <= replay_end <= expected_end,
+        and expected_start <= replay_end
+        and (allow_retrospective or replay_end <= expected_end),
         "causal replay time or scenario identity differs from Winter route",
     )
     events = manifest.get("events") or []
@@ -1086,11 +1172,13 @@ def _load_causal_replay_source(
         if isinstance(event, dict) and event.get("observed") is True
     ]
     types = [event.get("type") for event in observed_events]
-    _require("REPLAN_DECIDED" in types and "REPLAN_ADOPTED" in types,
-             "causal replay does not contain an observed replan decision/adoption")
+    _require(
+        "REPLAN_DECIDED" in types and "REPLAN_ADOPTED" in types,
+        "replay does not contain an observed replan decision/adoption",
+    )
     adapter = PresentationAdapter(manifest, snapshots)
     revisions = sorted(adapter._routes_by_revision)
-    _require(len(revisions) > 1, "causal replay has only one route revision")
+    _require(len(revisions) > 1, "replay has only one route revision")
     initial = _route_meta(adapter, revisions[0])
     _require(
         (
@@ -1105,14 +1193,120 @@ def _load_causal_replay_source(
         ),
         "causal replay initial route differs from Winter authoritative route",
     )
-    return adapter, {
+    source = {
         "manifest_path": str(manifest_path),
         "manifest_sha256": _sha256_file(manifest_path),
         "replay_id": manifest.get("replay_id"),
+        "scenario_mode": scenario_mode,
+        "temporal_claim": (
+            "historically_available_causal"
+            if scenario_mode == "causal_replay"
+            else "retrospective_post_hoc_dynamic_projection"
+        ),
         "semantic_digest": manifest.get("semantic_digest"),
         "revision_count": len(revisions),
         "event_types": sorted(set(types)),
-    }, manifest_path
+    }
+    revision_index = _load_plan_revision_index(manifest_path, manifest)
+    if revision_index is not None:
+        source.update(revision_index)
+    elif scenario_mode == "retrospective_dynamic_replay":
+        raise ValueError(
+            "retrospective dynamic replay has no immutable plan revision index"
+        )
+    provenance = manifest.get("provenance") or {}
+    source["knowledge_as_of"] = provenance.get("knowledge_as_of")
+    return adapter, source, manifest_path
+
+
+def _load_plan_revision_index(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate the content-addressed C plan-set revision transport."""
+
+    resources = manifest.get("resources") or {}
+    relative_value = resources.get("planning_revision_index")
+    if not isinstance(relative_value, str):
+        return None
+    relative = Path(relative_value)
+    _require(not relative.is_absolute(), "plan revision index path must be relative")
+    root = manifest_path.parent.resolve()
+    index_path = (root / relative).resolve()
+    try:
+        index_path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("plan revision index escapes replay directory") from exc
+    _require(index_path.is_file(), "plan revision index is missing")
+    index = _read_json_object(index_path, label="plan revision index")
+    _require(
+        index.get("schema_version") == "orchestrator.plan-revision-index.v1",
+        "plan revision index schema is unsupported",
+    )
+    declared = index.get("content_digest")
+    payload = {key: value for key, value in index.items() if key != "content_digest"}
+    _require(
+        isinstance(declared, str) and declared == _canonical_sha256(payload),
+        "plan revision index digest mismatch",
+    )
+    _require(
+        index.get("replay_id") == manifest.get("replay_id")
+        and index.get("scenario_id") == manifest.get("scenario_id")
+        and index.get("layer_count") == 4
+        and index.get("routes_per_layer") == 3
+        and index.get("route_count") == 12,
+        "plan revision index identity or cardinality is invalid",
+    )
+    entries = index.get("entries")
+    _require(isinstance(entries, list) and entries, "plan revision index entries are missing")
+    validated: list[dict[str, Any]] = []
+    documents: dict[int, dict[str, Any]] = {}
+    for entry in entries:
+        _require(isinstance(entry, dict), "plan revision index entry is invalid")
+        resource = entry.get("resource")
+        _require(isinstance(resource, str), "plan revision resource path is invalid")
+        resource_path = Path(resource)
+        _require(
+            not resource_path.is_absolute(),
+            "plan revision resource path must be relative",
+        )
+        plan_path = (root / resource_path).resolve()
+        try:
+            plan_path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("plan revision resource escapes replay directory") from exc
+        _require(plan_path.is_file(), "plan revision resource is missing")
+        plan_set = _read_json_object(plan_path, label="plan revision resource")
+        _require(
+            plan_set.get("schema_version") == "cd.four-layer-route-plan-set.v3",
+            "plan revision resource is not a C v3 plan set",
+        )
+        _require(
+            entry.get("digest") == _canonical_sha256(plan_set)
+            and entry.get("layer_set_id") == plan_set.get("layer_set_id")
+            and entry.get("layer_count") == 4
+            and entry.get("route_count") == 12,
+            "plan revision resource identity or cardinality is invalid",
+        )
+        revision = entry.get("plan_revision")
+        _require(
+            isinstance(revision, int) and revision > 0 and revision not in documents,
+            "plan revision resource revision is invalid or duplicated",
+        )
+        validated.append(dict(entry))
+        documents[revision] = plan_set
+    return {
+        "plan_revision_index": {
+            "resource": relative_value,
+            "content_digest": declared,
+            "entry_count": len(validated),
+        },
+        "plan_revision_resources": validated,
+        # Export assembly consumes these already-validated immutable documents
+        # to restore route IDs and per-revision candidate/motion bindings.  The
+        # private key is removed before source metadata enters the Viewer.
+        "_plan_sets_by_revision": documents,
+    }
 
 
 def _canonical_sha256(value: object) -> str:
@@ -1148,6 +1342,71 @@ def _winter_recommended_plan(plan_set: dict[str, Any]) -> dict[str, Any]:
     recommended = plans.get("recommended")
     _require(isinstance(recommended, dict), "Winter C recommended plan is missing")
     return recommended
+
+
+def _bind_replay_revision_plan(
+    adapter: PresentationAdapter,
+    revision: int,
+    plan_set: dict[str, Any],
+) -> tuple[dict[str, Any], float]:
+    """Bind one replay revision to its immutable C recommended plan."""
+
+    plan = _winter_recommended_plan(plan_set)
+    replay_route = adapter._routes_by_revision[revision]["route"]
+    replay_points = [
+        (point.get("longitude"), point.get("latitude"))
+        for point in replay_route.get("waypoints", ())
+    ]
+    plan_points = [
+        (point.get("longitude"), point.get("latitude"))
+        for point in plan.get("waypoints", ())
+    ]
+    _require(
+        replay_points == plan_points,
+        f"replay revision {revision} geometry differs from its C plan resource",
+    )
+    replay_waypoints = replay_route.get("waypoints", ())
+    plan_waypoints = plan.get("waypoints", ())
+    offsets = [
+        (_parse_utc(replay_point["eta"]) - _parse_utc(plan_point["eta"])).total_seconds()
+        for replay_point, plan_point in zip(
+            replay_waypoints,
+            plan_waypoints,
+            strict=True,
+        )
+    ]
+    _require(
+        offsets and max(offsets) - min(offsets) <= 1e-6,
+        f"replay revision {revision} does not use one uniform execution-time offset",
+    )
+    _require(
+        isinstance(plan.get("plan_id"), str),
+        f"replay revision {revision} C plan ID is missing",
+    )
+    return plan, offsets[0]
+
+
+def _revision_candidate_sets(
+    plan_sets_by_revision: dict[int, dict[str, Any]],
+    revision_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    states = {
+        int(entry["plan_revision"]): entry.get("state")
+        for entry in revision_entries
+    }
+    result = []
+    for revision in sorted(plan_sets_by_revision):
+        package = project_route_candidates(
+            four_layer_route_plan_set_from_dict(plan_sets_by_revision[revision])
+        )
+        result.append(
+            {
+                "revision": revision,
+                "state": states.get(revision),
+                "route_candidates": package,
+            }
+        )
+    return result
 
 
 def _validate_winter_identity(
@@ -1403,12 +1662,13 @@ def _winter_vessel_timeline(
             "dt": None,
             "eat": None,
             "ctl": completed_count,
-            "seg": {
+        }
+        if not arrived:
+            entry["seg"] = {
                 "index": edge_index,
                 "start_eta": start["eta"],
                 "end_eta": end["eta"],
-            },
-        }
+            }
         if completed_count != previous_track_count:
             entry["track"] = [
                 {
@@ -1454,11 +1714,13 @@ def _winter_combined_identity(
     timeline_source: str = "cd.route-plan.v3.waypoints.eta",
     source_replay_digest: str | None = None,
     risk_explanation_digest: str | None = None,
+    simulation_start: str | None = None,
+    simulation_end: str | None = None,
 ) -> tuple[str, str]:
     semantic_identity = {
         **identity,
-        "simulation_start": route["waypoints"][0]["eta"],
-        "simulation_end": route["waypoints"][-1]["eta"],
+        "simulation_start": simulation_start or route["waypoints"][0]["eta"],
+        "simulation_end": simulation_end or route["waypoints"][-1]["eta"],
         "timeline_source": timeline_source,
         "timeline_cadence_seconds": cadence_seconds,
     }
@@ -1480,7 +1742,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         getattr(args, "require_route_motion", False)
         or args.output_dir.resolve() == default_viewer_dir
     )
-    if formal_motion_required and args.route_motion_set is None:
+    if formal_motion_required and not args.route_motion_set:
         raise ValueError(
             "production Winter export requires --route-motion-set; "
             "use a separately generated formal cd.route-motion-set.v1 artifact"
@@ -1519,21 +1781,22 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
     )
     recommended = _winter_recommended_plan(plan_set)
     route = _winter_route_meta(recommended)
-    route_motion_set = None
-    if args.route_motion_set is not None:
-        route_motion_set = load_bound_route_motion_set(
-            args.route_motion_set,
-            plan_set_document=plan_set,
-            replay_routes=[route],
-        )
-        validate_route_motion_context(
-            route_motion_set,
-            risk_window_id=identity["risk_window_id"],
-            risk_window_digest=identity["risk_window_digest"],
-            vessel_profile_id=run_context["vessel_profile_id"],
-            vessel_profile_version=run_context["vessel_profile_version"],
-            vessel_profile_digest=run_context["vessel_profile_digest"],
-        )
+    authoritative_route = dict(route)
+    route_motion_sets: list[dict[str, Any]] = []
+    motion_context_by_layer_set = {
+        identity["layer_set_id"]: {
+            "risk_window_id": identity["risk_window_id"],
+            "risk_window_digest": identity["risk_window_digest"],
+        }
+    }
+    route_candidate_sets = [
+        {
+            "revision": 1,
+            "state": "current",
+            "route_candidates": route_candidates,
+        }
+    ]
+    plan_sets_by_revision: dict[int, dict[str, Any]] = {1: plan_set}
     route_smoothing_sidecar = None
     if args.route_smoothing_sidecar is not None:
         route_smoothing_sidecar = _load_route_smoothing_sidecar(
@@ -1556,24 +1819,67 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
                 "layer_set_id": identity["layer_set_id"],
             },
             expected_route=route,
+            allow_retrospective=True,
+        )
+        final_state = replay_adapter.state_at(replay_adapter.replay_end)
+        _require(
+            final_state.vessel.status == "ARRIVED"
+            and final_state.plan.pending_candidate is None,
+            "published dynamic replay must run through ARRIVED with no pending "
+            "adoption; ETA-only timeline extension is prohibited",
         )
         timeline = _timeline(replay_adapter, args.cadence_seconds)
+        plan_sets_by_revision = source_replay.pop("_plan_sets_by_revision", {})
         replay_revisions = sorted(replay_adapter._routes_by_revision)
+        _require(
+            set(replay_revisions).issubset(plan_sets_by_revision),
+            "accepted replay revisions are missing immutable C plan resources",
+        )
         replay_routes = []
         for revision in replay_revisions:
+            bound_plan, motion_time_offset_seconds = _bind_replay_revision_plan(
+                replay_adapter,
+                revision,
+                plan_sets_by_revision[revision],
+            )
             replay_routes.append(
                 _route_meta(
                     replay_adapter,
                     revision,
-                    # The v1 snapshot route payload has no C plan ID.  Once
-                    # the strict initial geometry comparison above succeeds,
-                    # bind that first revision to Winter's authoritative ID so
-                    # a matching formal motion set can still be selected.
-                    route_id_override=(
-                        route["route_id"] if revision == replay_revisions[0] else None
-                    ),
+                    plan_override=bound_plan,
+                    motion_time_offset_seconds=motion_time_offset_seconds,
                 )
             )
+        route_candidate_sets = _revision_candidate_sets(
+            plan_sets_by_revision,
+            source_replay.get("plan_revision_resources", []),
+        )
+        snapshots_by_time = {
+            snapshot["simulation_time"]: snapshot
+            for snapshot in replay_adapter.snapshots
+        }
+        for entry in source_replay.get("plan_revision_resources", []):
+            snapshot = snapshots_by_time.get(entry.get("simulation_time"))
+            _require(
+                snapshot is not None,
+                "plan revision has no same-time replay RiskWindow binding",
+            )
+            risk_state = snapshot.get("risk") or {}
+            risk_window_id = risk_state.get("resource_identity")
+            risk_window_digest = risk_state.get("resource_digest")
+            _require(
+                isinstance(risk_window_id, str)
+                and isinstance(risk_window_digest, str),
+                "plan revision replay snapshot lacks RiskWindow identity",
+            )
+            motion_context_by_layer_set[entry["layer_set_id"]] = {
+                "risk_window_id": risk_window_id,
+                "risk_window_digest": risk_window_digest,
+            }
+        _require(
+            route_candidate_sets[0]["route_candidates"] == route_candidates,
+            "initial revision candidate projection differs from authoritative package",
+        )
         replay_events = [
             {
                 "t": event["simulation_time"],
@@ -1584,10 +1890,23 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             }
             for event in replay_adapter._events
         ]
-        route = replay_routes[0]
-        # The strict loader already compared the initial route; subsequent
-        # revisions and pending/superseded state are taken verbatim from the
-        # adapter, never synthesized by the exporter.
+        replay_initial = replay_routes[0]
+        replay_metrics = {
+            key: value
+            for key, value in replay_initial.get("metrics", {}).items()
+            if value is not None
+        }
+        route = {
+            **authoritative_route,
+            **replay_initial,
+            "metrics": {
+                **authoritative_route.get("metrics", {}),
+                **replay_metrics,
+            },
+        }
+        replay_routes[0] = route
+        # Revisions and pending/superseded state come verbatim from the replay.
+        # Publication never extends beyond the last producer snapshot.
     else:
         timeline = _winter_vessel_timeline(recommended, cadence_seconds=args.cadence_seconds)
         replay_routes = [route]
@@ -1596,6 +1915,64 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         # the Viewer will display an explicit unavailable status until a real,
         # identity-bound replay is supplied.
         replay_events = []
+
+    layer_sets = {
+        document.get("layer_set_id"): document
+        for document in plan_sets_by_revision.values()
+    }
+    for motion_path in args.route_motion_set or ():
+        motion_document = _read_json_object(motion_path, label="route motion set")
+        motion_layer_set_id = motion_document.get("layer_set_id")
+        bound_plan_set = layer_sets.get(motion_layer_set_id)
+        _require(
+            bound_plan_set is not None,
+            f"route motion set {motion_path} has no matching replay plan revision",
+        )
+        motion_set = load_bound_route_motion_set(
+            motion_path,
+            plan_set_document=bound_plan_set,
+            replay_routes=replay_routes,
+        )
+        motion_context = motion_context_by_layer_set.get(motion_layer_set_id)
+        _require(
+            motion_context is not None,
+            f"route motion set {motion_path} has no replay RiskWindow binding",
+        )
+        validate_route_motion_context(
+            motion_set,
+            risk_window_id=motion_context["risk_window_id"],
+            risk_window_digest=motion_context["risk_window_digest"],
+            vessel_profile_id=run_context["vessel_profile_id"],
+            vessel_profile_version=run_context["vessel_profile_version"],
+            vessel_profile_digest=run_context["vessel_profile_digest"],
+        )
+        _require(
+            all(
+                existing["motion_set_id"] != motion_set["motion_set_id"]
+                and existing["layer_set_id"] != motion_set["layer_set_id"]
+                for existing in route_motion_sets
+            ),
+            "route motion set ID or layer binding is duplicated",
+        )
+        route_motion_sets.append(motion_set)
+    if formal_motion_required:
+        covered_plan_ids = {
+            record["plan_id"]
+            for motion_set in route_motion_sets
+            for record in motion_set.get("records", [])
+            if record.get("planning_layer") == "full_voyage"
+        }
+        missing_route_ids = [
+            item["route_id"]
+            for item in replay_routes
+            if item.get("effective_adoption_time") is not None
+            and item.get("route_id") not in covered_plan_ids
+        ]
+        _require(
+            not missing_route_ids,
+            "formal motion does not cover adopted replay routes: "
+            + ", ".join(missing_route_ids),
+        )
     risk_explanation_manifest = None
     risk_explanation = None
     risk_store_root = (
@@ -1653,13 +2030,15 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             if route_smoothing_sidecar is not None
             else None
         ),
-        route_motion_set_ids=(
-            [route_motion_set["motion_set_id"]]
-            if route_motion_set is not None
-            else None
-        ),
+        route_motion_set_ids=[item["motion_set_id"] for item in route_motion_sets],
         timeline_source=(
-            "orchestrator.presentation_adapter.causal_replay"
+            (
+                "orchestrator.presentation_adapter.retrospective_dynamic_replay"
+                if source_replay is not None
+                and source_replay.get("scenario_mode")
+                == "retrospective_dynamic_replay"
+                else "orchestrator.presentation_adapter.causal_replay"
+            )
             if replay_adapter is not None
             else "cd.route-plan.v3.waypoints.eta"
         ),
@@ -1667,6 +2046,8 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         risk_explanation_digest=(
             risk_explanation_manifest or {}
         ).get("artifact_sha256"),
+        simulation_start=timeline[0]["t"],
+        simulation_end=timeline[-1]["t"],
     )
     source_files = {
         name: {"path": str(path), "sha256": _sha256_file(path)}
@@ -1677,10 +2058,10 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             "path": str(args.route_smoothing_sidecar),
             "sha256": _sha256_file(args.route_smoothing_sidecar),
         }
-    if args.route_motion_set is not None:
-        source_files["route_motion_set"] = {
-            "path": str(args.route_motion_set),
-            "sha256": _sha256_file(args.route_motion_set),
+    for index, motion_path in enumerate(args.route_motion_set or (), start=1):
+        source_files[f"route_motion_set_{index}"] = {
+            "path": str(motion_path),
+            "sha256": _sha256_file(motion_path),
         }
     if args.winter_replay_manifest is not None:
         source_files["causal_replay_manifest"] = {
@@ -1716,39 +2097,40 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
     bundle = {
         "schema_version": "replay.viewer-bundle.v1",
         "formal_motion_inspection": {
-            "valid": route_motion_set is not None,
+            "valid": bool(route_motion_sets),
             "source": "orchestrator_binding_preflight",
-            "schema_version": (
-                route_motion_set.get("schema_version")
-                if route_motion_set is not None
-                else None
+            "schema_version": "cd.route-motion-set.v1" if route_motion_sets else None,
+            "motion_set_ids": [item["motion_set_id"] for item in route_motion_sets],
+            "set_count": len(route_motion_sets),
+            "record_count": sum(
+                len(item.get("records", [])) for item in route_motion_sets
             ),
-            "motion_set_id": (
-                route_motion_set.get("motion_set_id")
-                if route_motion_set is not None
-                else None
-            ),
-            "record_count": (
-                len(route_motion_set.get("records", []))
-                if route_motion_set is not None
-                else 0
-            ),
-            "record_layers": (
-                [record["planning_layer"] for record in route_motion_set["records"]]
-                if route_motion_set is not None
-                else []
-            ),
-            "reason": (
-                None if route_motion_set is not None else "missing_formal_motion_set"
-            ),
+            "record_layers": [
+                layer
+                for layer in (
+                    "full_voyage",
+                    "main_corridor_24_72h",
+                    "rolling_0_24h",
+                    "executable_0_6h",
+                )
+                if any(
+                    record.get("planning_layer") == layer
+                    for item in route_motion_sets
+                    for record in item.get("records", [])
+                )
+            ],
+            "covered_layer_set_ids": [
+                item["layer_set_id"] for item in route_motion_sets
+            ],
+            "reason": None if route_motion_sets else "missing_formal_motion_set",
         },
         "replay": {
             "replay_id": assembly_id,
             "scenario_id": identity["scenario_id"],
             "scenario_mode": "research_navigation_simulation",
             "identity_kind": "combined_presentation_assembly",
-            "start": route["waypoints"][0]["eta"],
-            "end": route["waypoints"][-1]["eta"],
+            "start": timeline[0]["t"],
+            "end": timeline[-1]["t"],
             "manifest_semantic_digest": assembly_digest,
         },
         "combined_presentation": {
@@ -1766,16 +2148,34 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             "candidate_set_id": identity["candidate_set_id"],
             "selected_candidate_id": identity["selected_candidate_id"],
             "timeline_source": (
-                "orchestrator.presentation_adapter.causal_replay"
+                (
+                    "orchestrator.presentation_adapter.retrospective_dynamic_replay"
+                    if source_replay is not None
+                    and source_replay.get("scenario_mode")
+                    == "retrospective_dynamic_replay"
+                    else "orchestrator.presentation_adapter.causal_replay"
+                )
                 if replay_adapter is not None
                 else "cd.route-plan.v3.waypoints.eta"
             ),
             "replanning_status": (
-                "PUBLISHED_CAUSAL_REPLAY"
+                (
+                    "PUBLISHED_RETROSPECTIVE_DYNAMIC_REPLAY"
+                    if source_replay is not None
+                    and source_replay.get("scenario_mode")
+                    == "retrospective_dynamic_replay"
+                    else "PUBLISHED_CAUSAL_REPLAY"
+                )
                 if replay_adapter is not None
                 else "UNAVAILABLE_IDENTITY_BOUND_CAUSAL_REPLAY_REQUIRED"
             ),
             "source_replay": source_replay,
+            "plan_revision_index": (
+                (source_replay or {}).get("plan_revision_index")
+            ),
+            "plan_revision_resources": (
+                (source_replay or {}).get("plan_revision_resources", [])
+            ),
             "risk_explanation_manifest": (
                 {
                     "artifact_id": risk_explanation_manifest["artifact_id"],
@@ -1797,24 +2197,38 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         },
         "routes": replay_routes,
         "route_candidates": route_candidates,
+        "route_candidate_sets": route_candidate_sets,
         "events": replay_events,
         "timeline": timeline,
         "risk": risk,
         "acceptance_positions": _winter_acceptance_positions(timeline),
     }
-    if route_motion_set is not None:
+    if route_motion_sets:
         bundle["combined_presentation"]["route_motion_set_ids"] = [
-            route_motion_set["motion_set_id"]
+            item["motion_set_id"] for item in route_motion_sets
         ]
         bundle["combined_presentation"]["route_motion_set_bindings"] = [
             {
-                "motion_set_id": route_motion_set["motion_set_id"],
-                "layer_set_id": route_motion_set["layer_set_id"],
-                "risk_window_id": route_motion_set["risk_window_id"],
-                "risk_window_digest": route_motion_set["risk_window_digest"],
+                "motion_set_id": item["motion_set_id"],
+                "layer_set_id": item["layer_set_id"],
+                "risk_window_id": item["risk_window_id"],
+                "risk_window_digest": item["risk_window_digest"],
             }
+            for item in route_motion_sets
         ]
-        bundle["route_motion_sets"] = [route_motion_set]
+        bundle["route_motion_sets"] = route_motion_sets
+    bundle["combined_presentation"]["route_candidate_set_bindings"] = [
+        {
+            "revision": item["revision"],
+            "state": item.get("state"),
+            "layer_set_id": item["route_candidates"]["layer_set_id"],
+            "candidate_set_id": item["route_candidates"]["candidate_set_id"],
+            "selected_candidate_id": item["route_candidates"][
+                "selected_candidate_id"
+            ],
+        }
+        for item in route_candidate_sets
+    ]
     if risk_explanation is not None:
         bundle["risk_explanation"] = risk_explanation
         bundle["risk_explanation_transport"] = {
@@ -1828,7 +2242,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
     bundle["combined_presentation"]["formal_motion_policy"] = {
         "required_for_production_default": True,
         "runtime_failure_fallback": "RAW_WAYPOINT_TIMELINE",
-        "provided": route_motion_set is not None,
+        "provided": bool(route_motion_sets),
     }
     target_output_dir = args.output_dir.resolve()
     _require(
@@ -1857,13 +2271,14 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         json.dumps(plan_set, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    motion_set_transport_path = None
-    if route_motion_set is not None:
-        motion_set_transport_path = output_dir / "route-motion-set.json"
+    motion_set_transport_paths: list[Path] = []
+    for index, route_motion_set in enumerate(route_motion_sets, start=1):
+        motion_set_transport_path = output_dir / f"route-motion-set-r{index}.json"
         motion_set_transport_path.write_text(
             json.dumps(route_motion_set, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+        motion_set_transport_paths.append(motion_set_transport_path)
     preflight_path = output_dir / "replay-viewer-preflight.json"
     preflight_path.write_text(
         json.dumps(
@@ -1877,10 +2292,10 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
                     "risk_window_binding": "PASS",
                     "route_candidate_binding": "PASS",
                     "route_integrity": "PASS",
-                    "timeline_eta_projection": "PASS",
+                    "replay_timeline_boundary": "PASS",
                     "formal_route_motion": (
                         "PASS"
-                        if route_motion_set is not None
+                        if route_motion_sets
                         else "NOT_PROVIDED_OPTIONAL_LEGACY_EXPORT"
                     ),
                 },
@@ -1905,15 +2320,12 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         "timeline_samples": len(timeline),
         "risk_frames": len(risk["frames"]),
         "route_candidates": len(route_candidates["candidates"]),
-        "route_motion_sets": 1 if route_motion_set is not None else 0,
+        "route_candidate_sets": len(route_candidate_sets),
+        "route_motion_sets": len(route_motion_sets),
         "formal_motion_required": formal_motion_required,
         "transport_files": {
             "plan_set": plan_set_transport_path.name,
-            "route_motion_set": (
-                motion_set_transport_path.name
-                if motion_set_transport_path is not None
-                else None
-            ),
+            "route_motion_sets": [path.name for path in motion_set_transport_paths],
             "causal_replay_manifest": (
                 str(args.winter_replay_manifest)
                 if args.winter_replay_manifest is not None
@@ -1938,8 +2350,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         "replay-viewer-preflight.json",
         "winter-combined-viewer-manifest.json",
     ]
-    if motion_set_transport_path is not None:
-        checksum_names.insert(2, motion_set_transport_path.name)
+    checksum_names[2:2] = [path.name for path in motion_set_transport_paths]
     checksums = {
         "schema_version": "presentation.winter-combined-checksums.v1",
         "files": {
@@ -2001,8 +2412,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--route-motion-set",
         type=Path,
-        default=None,
-        help="formally bound cd.route-motion-set.v1 artifact",
+        action="append",
+        default=[],
+        help=(
+            "formally bound cd.route-motion-set.v1 artifact; repeat once for "
+            "each adopted replay revision"
+        ),
     )
     parser.add_argument(
         "--winter-replay-manifest",
@@ -2045,7 +2460,7 @@ def main(argv: list[str] | None = None) -> int:
         return _export_winter_combined(args)
     if args.winter_replay_manifest is not None or args.winter_replay_snapshots_dir is not None:
         parser.error("--winter-replay-manifest requires --winter-plan-set")
-    if args.route_motion_set is not None:
+    if args.route_motion_set:
         parser.error("--route-motion-set currently requires --winter-plan-set binding")
     if args.manifest is None:
         parser.error("manifest is required unless --winter-plan-set is supplied")

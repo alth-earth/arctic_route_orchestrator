@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -138,6 +139,7 @@ def _child_result(
     ]
     return {
         "objective": objective,
+        "worker_pid": os.getpid(),
         "steps": [
             {
                 "node": list(step.node),
@@ -274,6 +276,15 @@ class _ParallelObjectivePlanner:
             "max_expansions": request.max_expansions,
         }
         ordered_objectives = tuple(objectives)
+        telemetry = _active_telemetry
+        telemetry["planning_calls"] = telemetry.get("planning_calls", 0) + 1
+        telemetry["tasks_submitted"] = (
+            telemetry.get("tasks_submitted", 0) + len(ordered_objectives)
+        )
+        telemetry["max_parallel_tasks"] = max(
+            telemetry.get("max_parallel_tasks", 0),
+            min(self.workers, len(ordered_objectives)),
+        )
         active_executor = _active_executor
         if active_executor is not None and self.pool_mode == "persistent":
             executor = active_executor
@@ -309,6 +320,11 @@ class _ParallelObjectivePlanner:
                     future.result(timeout=self.timeout_seconds)
                     for future in futures
                 ]
+        telemetry["worker_pids"].update(
+            int(document["worker_pid"])
+            for document in documents
+            if document.get("worker_pid") is not None
+        )
         results = {
             ObjectiveMode(document["objective"]): _result_from_dict(document)
             for document in documents
@@ -318,12 +334,50 @@ class _ParallelObjectivePlanner:
         return {objective: results[objective] for objective in ordered_objectives}
 
 
-_original_private_planner = None
 _active_paths: dict[str, str] | None = None
 _active_workers = 1
 _active_timeout = 900
 _active_executor: ProcessPoolExecutor | None = None
 _active_pool_mode = "persistent"
+_active_telemetry: dict[str, Any] = {}
+
+
+def _reset_telemetry(*, workers: int, pool_mode: str) -> None:
+    global _active_telemetry
+    _active_telemetry = {
+        "enabled": workers > 1,
+        "requested_workers": workers,
+        "pool_mode": pool_mode,
+        "tasks_submitted": 0,
+        "planning_calls": 0,
+        "max_parallel_tasks": 0,
+        "worker_pids": set(),
+    }
+
+
+def snapshot_telemetry() -> dict[str, Any]:
+    """Return JSON-safe parent-process telemetry for the active install."""
+
+    result = dict(_active_telemetry)
+    result["worker_pids"] = sorted(result.get("worker_pids", set()))
+    result["effective_workers"] = len(result["worker_pids"])
+    result["parallel_active"] = bool(
+        result.get("enabled") and result["effective_workers"] > 0
+    )
+    return result
+
+
+def _validate_install_options(workers: int, pool_mode: str) -> int:
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
+        raise ValueError("planning workers must be a positive integer")
+    if pool_mode not in {"persistent", "percall"}:
+        raise ValueError("parallel pool mode must be persistent or percall")
+    available = os.cpu_count() or 1
+    if workers > available:
+        raise RuntimeError(
+            f"requested {workers} planning workers but only {available} CPUs are available"
+        )
+    return workers
 
 
 @contextlib.contextmanager
@@ -339,10 +393,11 @@ def install(
 ) -> Iterator[None]:
     """Temporarily route C objective searches through worker processes."""
 
-    global _original_private_planner
     global _active_paths, _active_workers, _active_timeout
-    global _active_executor, _active_pool_mode
+    global _active_executor, _active_pool_mode, _active_telemetry
     from arctic_route_planning.ingress import PreparedRiskPlanning
+
+    worker_count = _validate_install_options(workers, pool_mode)
 
     paths = {
         "risk_store_root": str(risk_store_root),
@@ -350,11 +405,16 @@ def install(
         "contracts_config_root": str(contracts_config_root),
         "max_snap_km": str(max_snap_km),
     }
-    if _original_private_planner is None:
-        _original_private_planner = PreparedRiskPlanning._private_planner
+    previous_private_planner = PreparedRiskPlanning._private_planner
+    previous_paths = _active_paths
+    previous_workers = _active_workers
+    previous_timeout = _active_timeout
+    previous_executor = _active_executor
+    previous_pool_mode = _active_pool_mode
+    previous_telemetry = _active_telemetry
 
     def _parallel_private_planner(self, current):
-        serial = _original_private_planner(self, current)
+        serial = previous_private_planner(self, current)
         return _ParallelObjectivePlanner(
             serial,
             commit_id=current.commit_id,
@@ -365,18 +425,28 @@ def install(
         )
 
     _active_paths = paths
-    _active_workers = max(1, int(workers))
+    _active_workers = worker_count
     _active_timeout = timeout_seconds
     _active_pool_mode = pool_mode
+    _reset_telemetry(workers=worker_count, pool_mode=pool_mode)
     PreparedRiskPlanning._private_planner = _parallel_private_planner
     executor = None
-    if pool_mode == "persistent":
-        executor = ProcessPoolExecutor(max_workers=max(1, int(workers)))
-        _active_executor = executor
     try:
+        if pool_mode == "persistent":
+            executor = ProcessPoolExecutor(max_workers=worker_count)
+            _active_executor = executor
         yield
     finally:
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=False)
-            _active_executor = None
-        PreparedRiskPlanning._private_planner = _original_private_planner
+        PreparedRiskPlanning._private_planner = previous_private_planner
+        _active_paths = previous_paths
+        _active_workers = previous_workers
+        _active_timeout = previous_timeout
+        _active_executor = previous_executor
+        _active_pool_mode = previous_pool_mode
+        # Keep the just-completed telemetry available to the caller.  Nested
+        # installs restore their parent's snapshot only after the caller has
+        # had a chance to read it.
+        if previous_telemetry:
+            _active_telemetry = previous_telemetry

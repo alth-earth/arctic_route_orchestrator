@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -108,11 +109,13 @@ def _validate_replay_adoption(
             raise ValueError("route motion record has no samples")
         first_waypoint = waypoints[0]
         first_sample = samples[0]
+        offset_seconds = float(route.get("motion_time_offset_seconds", 0.0))
+        first_sample_eta = _shift_iso(first_sample.get("eta"), offset_seconds)
         if (
             first_sample.get("lon") != first_waypoint.get("lon")
             or first_sample.get("lat") != first_waypoint.get("lat")
-            or first_sample.get("eta") != first_waypoint.get("eta")
-            or first_sample.get("eta") != route.get("effective_adoption_time")
+            or first_sample_eta != first_waypoint.get("eta")
+            or first_sample_eta != route.get("effective_adoption_time")
         ):
             raise ValueError("route motion adoption would teleport from physical route start")
         last_waypoint = waypoints[-1]
@@ -120,11 +123,19 @@ def _validate_replay_adoption(
         if (
             last_sample.get("lon") != last_waypoint.get("lon")
             or last_sample.get("lat") != last_waypoint.get("lat")
-            or last_sample.get("eta") != last_waypoint.get("eta")
+            or _shift_iso(last_sample.get("eta"), offset_seconds)
+            != last_waypoint.get("eta")
         ):
             raise ValueError("route motion endpoint differs from authoritative route")
     if matched == 0:
         raise ValueError("route motion set does not cover any replay route revision")
+
+
+def _shift_iso(value: object, offset_seconds: float) -> str | None:
+    if not isinstance(value, str):
+        return None
+    moment = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+    return (moment + timedelta(seconds=offset_seconds)).isoformat().replace("+00:00", "Z")
 
 
 __all__ = ["load_bound_route_motion_set", "validate_route_motion_context"]

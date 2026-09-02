@@ -270,10 +270,14 @@ def execute_formal_run(
         if heartbeat is not None:
             heartbeat({"event": "stage_start", "stage": stage})
         stage_started = time.perf_counter()
-        initial, initial_plan, plan_documents = _execute_initial(
-            ingress=ingress,
-            request=initial_request,
-            planning_contract=spec.planning_contract,
+        initial, initial_plan, plan_documents, initial_parallel = _execute_with_parallel(
+            spec=spec,
+            paths=paths,
+            operation=lambda: _execute_initial(
+                ingress=ingress,
+                request=initial_request,
+                planning_contract=spec.planning_contract,
+            ),
         )
         timings["c_initial_planning_seconds"] = time.perf_counter() - stage_started
         _append_stage_record(
@@ -368,11 +372,15 @@ def execute_formal_run(
         if heartbeat is not None:
             heartbeat({"event": "stage_start", "stage": stage})
         stage_started = time.perf_counter()
-        replanning, _, replan_documents = _execute_replan(
-            ingress=ingress,
-            request=replan_request,
-            observation=observation,
-            planning_contract=spec.planning_contract,
+        replanning, _, replan_documents, replanning_parallel = _execute_with_parallel(
+            spec=spec,
+            paths=paths,
+            operation=lambda: _execute_replan(
+                ingress=ingress,
+                request=replan_request,
+                observation=observation,
+                planning_contract=spec.planning_contract,
+            ),
         )
         timings["c_replanning_seconds"] = time.perf_counter() - stage_started
         _append_stage_record(
@@ -431,6 +439,10 @@ def execute_formal_run(
             replanning=replanning,
             current_waypoint=current_waypoint,
             timings=timings,
+            parallel_telemetry=_merge_parallel_telemetry(
+                initial_parallel,
+                replanning_parallel,
+            ),
             artifact_paths=tuple(
                 sorted((*documents, "run-report.json", "checksums.json"))
             ),
@@ -468,6 +480,82 @@ def execute_formal_run(
     finally:
         if unsubscribe is not None:
             unsubscribe()
+
+
+def _execute_with_parallel(*, spec: ExecutionSpec, paths: RunPaths, operation):
+    """Run one C planning call with the RC2 objective-level worker profile."""
+
+    if spec.planning_workers <= 1:
+        result = operation()
+        return (*result, _serial_parallel_telemetry(spec))
+
+    from arctic_route_orchestrator.replay import parallel as replay_parallel
+
+    contracts_root = paths.contracts_config_root
+    if contracts_root is None:
+        contracts_root = arctic_route_contracts.default_config_root()
+    with replay_parallel.install(
+        workers=spec.planning_workers,
+        risk_store_root=paths.risk_store_root,
+        c_config_root=paths.c_config_root,
+        contracts_config_root=contracts_root,
+        max_snap_km=spec.max_snap_km,
+        timeout_seconds=max(1, int(spec.per_stage_timeout_seconds)),
+        pool_mode=spec.parallel_pool_mode,
+    ):
+        result = operation()
+        telemetry = replay_parallel.snapshot_telemetry()
+    return (*result, telemetry)
+
+
+def _serial_parallel_telemetry(spec: ExecutionSpec) -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "parallel_active": False,
+        "requested_workers": spec.planning_workers,
+        "effective_workers": 1,
+        "pool_mode": spec.parallel_pool_mode,
+        "planning_calls": 0,
+        "tasks_submitted": 0,
+        "max_parallel_tasks": 1,
+        "worker_pids": [],
+    }
+
+
+def _merge_parallel_telemetry(
+    initial: dict[str, Any], replanning: dict[str, Any]
+) -> dict[str, Any]:
+    worker_pids = sorted(
+        set(initial.get("worker_pids", ())) | set(replanning.get("worker_pids", ()))
+    )
+    requested = max(
+        int(initial.get("requested_workers", 1)),
+        int(replanning.get("requested_workers", 1)),
+    )
+    return {
+        "enabled": bool(initial.get("enabled") or replanning.get("enabled")),
+        "parallel_active": bool(
+            initial.get("parallel_active") or replanning.get("parallel_active")
+        ),
+        "requested_workers": requested,
+        # PIDs are retained as cumulative provenance across the initial and
+        # replan calls; effective capacity is the largest simultaneous pool,
+        # not the number of distinct processes seen over the whole run.
+        "effective_workers": max(
+            int(initial.get("effective_workers", 1)),
+            int(replanning.get("effective_workers", 1)),
+        ),
+        "pool_mode": initial.get("pool_mode", replanning.get("pool_mode", "persistent")),
+        "planning_calls": int(initial.get("planning_calls", 0))
+        + int(replanning.get("planning_calls", 0)),
+        "tasks_submitted": int(initial.get("tasks_submitted", 0))
+        + int(replanning.get("tasks_submitted", 0)),
+        "max_parallel_tasks": max(
+            int(initial.get("max_parallel_tasks", 1)),
+            int(replanning.get("max_parallel_tasks", 1)),
+        ),
+        "worker_pids": worker_pids,
+    }
 
 
 def _execute_initial(*, ingress, request, planning_contract: str):
@@ -841,6 +929,7 @@ def _run_report(
     replanning,
     current_waypoint,
     timings: dict[str, float],
+    parallel_telemetry: dict[str, Any],
     artifact_paths: tuple[str, ...],
 ) -> dict[str, Any]:
     initial_identity, initial_routes = _planning_summary(spec.planning_contract, initial)
@@ -919,6 +1008,7 @@ def _run_report(
         "performance": {
             "timings_seconds": timings,
             "process_peak_rss_bytes": _process_peak_rss_bytes(),
+            "c_objective_parallelism": parallel_telemetry,
         },
         "environment": {
             "python": platform.python_version(),

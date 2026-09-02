@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
 from arctic_route_planning.domain import ReplanReason
 
 from arctic_route_orchestrator.replay.digests import replay_semantic_digest
@@ -16,6 +17,28 @@ from arctic_route_orchestrator.replay.runner import (
 )
 from arctic_route_orchestrator.replay.validation import validate_replay
 from arctic_route_orchestrator.replay.vessel_motion import vessel_state_at
+
+
+def test_frozen_replay_inputs_are_atomic(tmp_path) -> None:
+    start = datetime(2026, 2, 15, tzinfo=UTC)
+    runner = ReplayRunner(
+        replay_id="test-frozen-inputs",
+        scenario_id="s",
+        corridor_id="c",
+        replay_start=start,
+        replay_end=start,
+        tick_cadence_hours=1,
+        a_data_root=tmp_path,
+        manifest_path=tmp_path / "missing.sqlite3",
+        b_config_path=tmp_path / "b.json",
+        c_config_root=tmp_path,
+        contracts_config_root=tmp_path,
+        frozen_run_context_path=tmp_path / "run-context.json",
+        frozen_dataset_bundle_path=tmp_path / "dataset-bundle.json",
+    )
+
+    with pytest.raises(ValueError, match="must be supplied together"):
+        runner.run(output_root=tmp_path / "output")
 
 
 def _nav(status: str = "ACTIVE", revision: int = 3) -> NavigationExecutionState:
@@ -145,6 +168,20 @@ def test_completed_track_is_append_only_across_plan_adoption() -> None:
     assert merged[3]["eta"] == "2026-08-15T16:00:00Z"
 
 
+def test_completed_track_applies_deferred_execution_time_offset() -> None:
+    waypoints = (
+        _Waypoint(14.0, 70.0, datetime(2026, 8, 15, 12, tzinfo=UTC)),
+        _Waypoint(15.0, 70.5, datetime(2026, 8, 15, 14, tzinfo=UTC)),
+    )
+
+    merged = merge_completed_track((), waypoints, eta_offset=timedelta(hours=2))
+
+    assert [item["eta"] for item in merged] == [
+        "2026-08-15T14:00:00Z",
+        "2026-08-15T16:00:00Z",
+    ]
+
+
 def _snapshot(index: int, simulation_time: str, **overrides):
     ship = overrides.pop("ship_state", _nav(revision=index + 3).to_dict())
     document = {
@@ -217,7 +254,7 @@ def test_validate_replay_accepts_active_navigation_and_flags_rewind() -> None:
         _snapshot(1, "2026-08-15T11:00:00Z"),
     ]
     moving = _nav(revision=4).to_dict()
-    moving["current_position"] = {"longitude": 15.0, "latitude": 70.5}
+    moving["current_position"] = {"longitude": 14.2, "latitude": 70.1}
     moving["cumulative_travelled_km"] = 140.0
     snapshots[1]["ship_state"] = moving
     snapshots[1]["snapshot_digest"] = replay_semantic_digest(
@@ -238,6 +275,29 @@ def test_validate_replay_accepts_active_navigation_and_flags_rewind() -> None:
     result = validate_replay([snapshots[0], bad])
     assert result["status"] == "FAIL"
     assert any("navigation_revision moved backwards" in item for item in result["violations"])
+
+
+def test_validate_replay_scales_teleport_gate_with_tick_and_speed() -> None:
+    first = _snapshot(0, "2026-08-15T10:00:00Z")
+    second = _snapshot(1, "2026-08-15T16:00:00Z")
+    moving = _nav(revision=4).to_dict()
+    moving["current_position"] = {"longitude": 15.0, "latitude": 70.5}
+    moving["cumulative_travelled_km"] = 200.0
+    moving["last_distance_delta_km"] = 70.0
+    moving["expected_travel_km"] = 157.8
+    second["ship_state"] = moving
+    second["snapshot_digest"] = replay_semantic_digest(
+        {key: value for key, value in second.items() if key != "snapshot_digest"}
+    )
+    assert validate_replay([first, second])["status"] == "PASS"
+
+    moving["current_position"] = {"longitude": 25.0, "latitude": 75.0}
+    second["snapshot_digest"] = replay_semantic_digest(
+        {key: value for key, value in second.items() if key != "snapshot_digest"}
+    )
+    result = validate_replay([first, second])
+    assert result["status"] == "FAIL"
+    assert any("navigation teleport candidate" in item for item in result["violations"])
 
 
 def test_validate_replay_flags_stationary_vessel() -> None:
@@ -406,3 +466,45 @@ def test_deferred_replan_keeps_physical_position_until_adoption() -> None:
     assert after.position == before.position
     assert after.speed_knots == before.speed_knots
     assert after.executed_distance_km == before.executed_distance_km
+
+
+def test_deferred_adoption_events_use_execution_node_time(monkeypatch) -> None:
+    start = datetime(2026, 8, 15, 10, tzinfo=UTC)
+    runner = ReplayRunner(
+        replay_id="test",
+        scenario_id="s",
+        corridor_id="c",
+        replay_start=start,
+        replay_end=start + timedelta(hours=3),
+        tick_cadence_hours=2,
+        a_data_root=None,
+        manifest_path=None,
+        b_config_path=None,
+        c_config_root=None,
+        contracts_config_root=None,
+        frozen_run_context_path=None,
+    )
+    runner.current_plan = SimpleNamespace()
+    runner.pending_plan = SimpleNamespace()
+    runner.pending_plan_set = SimpleNamespace()
+    runner.pending_plan_kind = "v3_four_layer"
+    runner.pending_decision_time = start + timedelta(minutes=30)
+    runner.pending_adoption_time = start + timedelta(hours=1)
+    runner.pending_revision = 2
+    monkeypatch.setattr(
+        ReplayRunner,
+        "_capture_superseded",
+        lambda _self, moment: {"at": moment},
+    )
+    monkeypatch.setattr(ReplayRunner, "_audit_and_attach_route", lambda _self: None)
+    monkeypatch.setattr(ReplayRunner, "_attach_route_digests", lambda _self: None)
+    events = []
+
+    runner._adopt_pending_if_due(start + timedelta(hours=2), events)
+
+    assert [event.simulation_time for event in events] == [
+        "2026-08-15T11:00:00Z",
+        "2026-08-15T11:00:00Z",
+    ]
+    assert runner.active_plan_time_offset == timedelta(minutes=30)
+    assert runner.superseded_route_payload == {"at": start + timedelta(hours=1)}

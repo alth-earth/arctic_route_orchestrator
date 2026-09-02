@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from arctic_route_orchestrator.replay.digests import replay_semantic_digest
 from arctic_route_orchestrator.replay.validation import (
     validate_manifest,
     validate_replay,
@@ -67,6 +68,25 @@ def test_future_max_issue_fails() -> None:
     result = validate_snapshot(document)
     assert result["status"] == "FAIL"
     assert any("max_source_issue_time" in item for item in result["violations"])
+
+
+def test_retrospective_snapshot_allows_later_fixed_knowledge_cutoff() -> None:
+    document = _snapshot_document("2026-02-15T10:00:00Z", 0)
+    document["scenario_mode"] = "retrospective_dynamic_replay"
+    document["knowledge_as_of"] = "2026-08-25T16:08:12Z"
+    document["snapshot_digest"] = replay_semantic_digest(
+        {key: value for key, value in document.items() if key != "snapshot_digest"}
+    )
+
+    assert validate_snapshot(document)["status"] == "PASS"
+
+    document["knowledge_as_of"] = "2026-02-14T23:59:59Z"
+    document["snapshot_digest"] = replay_semantic_digest(
+        {key: value for key, value in document.items() if key != "snapshot_digest"}
+    )
+    result = validate_snapshot(document)
+    assert result["status"] == "FAIL"
+    assert any("retrospective knowledge_as_of" in item for item in result["violations"])
 
 
 def test_monotonic_sequence_passes_and_backwards_fails() -> None:

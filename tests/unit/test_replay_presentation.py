@@ -267,6 +267,45 @@ def test_t4_arrival_is_stationary_at_goal() -> None:
     assert arrived.vessel.latitude == 62.0
     assert arrived.vessel.speed_mps == 0.0
     assert arrived.vessel.remaining_distance_km == 0.0
+    assert arrived.plan.current_authoritative_segment.index is None
+    assert arrived.plan.current_authoritative_segment.start_eta is None
+    assert arrived.plan.current_authoritative_segment.end_eta is None
+    assert arrived.plan.completed_track[-1] == {
+        "longitude": 12.0,
+        "latitude": 62.0,
+        "eta": "2026-08-15T14:00:00Z",
+    }
+
+
+def test_live_plan_segment_and_track_advance_beyond_last_snapshot() -> None:
+    completed = [
+        {"longitude": 10.0, "latitude": 60.0, "eta": "2026-08-15T10:00:00Z"},
+    ]
+    snapshots = [
+        _snapshot(
+            0,
+            "2026-08-15T10:00:00Z",
+            _ship(
+                time="2026-08-15T10:00:00Z",
+                edge_index=0,
+                completed_track=completed,
+                segment_start_eta="2026-08-15T10:00:00Z",
+                segment_end_eta="2026-08-15T12:00:00Z",
+            ),
+        )
+    ]
+    adapter = PresentationAdapter(_manifest([], 1), snapshots)
+
+    state = adapter.state_at("2026-08-15T13:00:00Z")
+
+    assert state.vessel.current_edge_index == 1
+    assert state.plan.current_authoritative_segment.index == 1
+    assert state.plan.current_authoritative_segment.start_eta == "2026-08-15T12:00:00Z"
+    assert state.plan.current_authoritative_segment.end_eta == "2026-08-15T14:00:00Z"
+    assert state.plan.completed_track == [
+        *completed,
+        {"longitude": 11.0, "latitude": 61.0, "eta": "2026-08-15T12:00:00Z"},
+    ]
 
 
 def test_t5_completed_track_preserves_history_across_plan() -> None:
@@ -385,6 +424,71 @@ def test_t6_deferred_adoption_keeps_old_segment_then_switches() -> None:
     assert after_route.plan.current_authoritative_segment.end_eta == "2026-08-15T14:00:00Z"
     assert after_route.plan.pending_candidate is None
     assert after_route.vessel.status == "UNDERWAY"
+
+
+def test_event_time_adoption_switches_revision_between_coarse_snapshots() -> None:
+    adopted_route = _route(
+        [
+            (10.5, 60.5, "2026-08-15T11:45:00Z"),
+            (11.5, 61.8, "2026-08-15T13:45:00Z"),
+            (12.5, 63.0, "2026-08-15T15:45:00Z"),
+        ],
+        distance_km=333.0,
+    )
+    pending_ship = _ship(
+        time="2026-08-15T11:00:00Z",
+        revision=1,
+        pending_route=adopted_route,
+        adoption_status="PENDING",
+        replan_decision_time="2026-08-15T11:00:00Z",
+        effective_adoption_time="2026-08-15T11:45:00Z",
+        candidate_plan_revision=2,
+    )
+    adopted_ship = _ship(
+        time="2026-08-15T12:00:00Z",
+        revision=2,
+        accepted_route=adopted_route,
+        segment_start_eta="2026-08-15T11:45:00Z",
+        segment_end_eta="2026-08-15T13:45:00Z",
+    )
+    events = [
+        {
+            "type": "REPLAN_DECIDED",
+            "simulation_time": "2026-08-15T11:00:00Z",
+            "revision": "2",
+        },
+        {
+            "type": "REPLAN_ADOPTED",
+            "simulation_time": "2026-08-15T11:45:00Z",
+            "revision": "2",
+        },
+        {
+            "type": "ROUTE_CHANGED",
+            "simulation_time": "2026-08-15T11:45:00Z",
+            "revision": "2",
+        },
+    ]
+    adapter = PresentationAdapter(
+        _manifest(events, 3),
+        [
+            _snapshot(0, "2026-08-15T10:00:00Z", _ship(
+                time="2026-08-15T10:00:00Z", revision=1
+            )),
+            _snapshot(1, "2026-08-15T11:00:00Z", pending_ship),
+            _snapshot(2, "2026-08-15T12:00:00Z", adopted_ship),
+        ],
+    )
+
+    before = adapter.state_at("2026-08-15T11:30:00Z")
+    after = adapter.state_at("2026-08-15T11:50:00Z")
+
+    assert before.plan.accepted_plan_revision == 1
+    assert before.plan.pending_plan_revision == 2
+    assert after.plan.accepted_plan_revision == 2
+    assert after.plan.pending_plan_revision is None
+    assert after.plan.current_authoritative_segment.start_eta == (
+        "2026-08-15T11:45:00Z"
+    )
 
 
 def test_t7_replan_skipped_and_plan_reused_do_not_produce_route_change() -> None:
