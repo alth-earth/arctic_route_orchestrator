@@ -6,7 +6,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from arctic_route_planning.motion import build_route_motion_candidate_set, build_route_motion_set
+from arctic_route_planning.motion import (
+    build_route_motion_candidate_set,
+    build_route_motion_candidate_set_with_evidence,
+    build_route_motion_set,
+    build_route_motion_set_with_evidence,
+)
 from arctic_route_planning.publishing import (
     four_layer_route_plan_set_to_dict,
     route_motion_candidate_set_to_dict,
@@ -61,6 +66,40 @@ def _artifact(tmp_path):
     return path, plan_set, document, replay_route
 
 
+def _artifact_with_evidence(tmp_path):
+    plan_set = _plan_set()
+    motion_set, evidence = build_route_motion_set_with_evidence(
+        plan_set,
+        risk_window_id="risk-window-fixture",
+        risk_window_digest="2" * 64,
+        vessel_profile_digest="3" * 64,
+        producer_digest="4" * 64,
+        generated_at=plan_set.generated_at,
+    )
+    document = route_motion_set_to_dict(motion_set)
+    path = tmp_path / "route-motion-set.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    (tmp_path / "route-motion-qualification-evidence.json").write_text(
+        json.dumps(evidence), encoding="utf-8"
+    )
+    recommended = plan_set.recommended
+    replay_route = {
+        "route_id": recommended.plan_id,
+        "effective_adoption_time": recommended.waypoints[0].eta.isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "waypoints": [
+            {
+                "lon": waypoint.longitude,
+                "lat": waypoint.latitude,
+                "eta": waypoint.eta.isoformat().replace("+00:00", "Z"),
+            }
+            for waypoint in recommended.waypoints
+        ],
+    }
+    return path, plan_set, document, replay_route, evidence
+
+
 def test_formal_motion_is_bound_to_four_recommended_routes_and_adoption(tmp_path) -> None:
     path, plan_set, document, replay_route = _artifact(tmp_path)
 
@@ -73,6 +112,49 @@ def test_formal_motion_is_bound_to_four_recommended_routes_and_adoption(tmp_path
     assert loaded == document
     assert len(loaded["records"]) == 4
     assert loaded["records"][0]["plan_id"] == replay_route["route_id"]
+
+
+def test_formal_motion_validates_adjacent_qualification_evidence(tmp_path) -> None:
+    path, plan_set, _document, replay_route, evidence = _artifact_with_evidence(tmp_path)
+    loaded = load_bound_route_motion_set(
+        path,
+        plan_set_document=four_layer_route_plan_set_to_dict(plan_set),
+        replay_routes=[replay_route],
+    )
+    assert loaded["records"]
+    assert evidence["motion_set_id"] == loaded["motion_set_id"]
+
+    tampered = json.loads(json.dumps(evidence))
+    tampered["records"][0]["details"]["fallback_reason"] = "tampered"
+    (tmp_path / "route-motion-qualification-evidence.json").write_text(
+        json.dumps(tampered), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="evidence digest"):
+        load_bound_route_motion_set(
+            path,
+            plan_set_document=four_layer_route_plan_set_to_dict(plan_set),
+            replay_routes=[replay_route],
+        )
+
+    tampered = json.loads(json.dumps(evidence))
+    tampered["records"][0]["diagnostics"]["qualification_result"] = "tampered"
+    tampered_body = dict(tampered)
+    tampered_body.pop("evidence_id")
+    from arctic_route_planning.publishing import canonical_route_motion_sha256
+
+    tampered["evidence_id"] = (
+        "route-motion-qualification-evidence-sha256-"
+        + canonical_route_motion_sha256(tampered_body)
+    )
+    (tmp_path / "route-motion-qualification-evidence.json").write_text(
+        json.dumps(tampered), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="diagnostics differ"):
+        load_bound_route_motion_set(
+            path,
+            plan_set_document=four_layer_route_plan_set_to_dict(plan_set),
+            replay_routes=[replay_route],
+        )
 
 
 def test_candidate_motion_is_bound_to_all_full_voyage_objectives(tmp_path) -> None:
@@ -108,6 +190,32 @@ def test_candidate_motion_is_bound_to_all_full_voyage_objectives(tmp_path) -> No
             plan_set_document=four_layer_route_plan_set_to_dict(plan_set),
             runtime_candidates_document=tampered,
         )
+
+
+def test_candidate_motion_validates_its_qualification_evidence(tmp_path) -> None:
+    plan_set = _plan_set()
+    candidate_set, evidence = build_route_motion_candidate_set_with_evidence(
+        plan_set,
+        risk_window_id="risk-window-fixture",
+        risk_window_digest="2" * 64,
+        vessel_profile_digest="3" * 64,
+        producer_digest="4" * 64,
+        generated_at=plan_set.generated_at,
+    )
+    path = tmp_path / "route-motion-candidate-set.json"
+    path.write_text(
+        json.dumps(route_motion_candidate_set_to_dict(candidate_set)), encoding="utf-8"
+    )
+    (tmp_path / "route-motion-qualification-evidence.json").write_text(
+        json.dumps(evidence), encoding="utf-8"
+    )
+    runtime = project_runtime_route_candidates(plan_set)
+    loaded = load_bound_route_motion_candidate_set(
+        path,
+        plan_set_document=four_layer_route_plan_set_to_dict(plan_set),
+        runtime_candidates_document=runtime,
+    )
+    assert loaded["motion_candidate_set_id"] == candidate_set.motion_candidate_set_id
 
 
 def test_formal_motion_accepts_declared_uniform_deferred_adoption_offset(tmp_path) -> None:

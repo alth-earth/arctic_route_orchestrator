@@ -118,6 +118,14 @@ motion set；默认生产导出拒绝发布，已运行 bundle 在 D 运行时�
 waypoint/timeline。本路径只代表工程仿真正式合同，
 不声明实船校准、导航级 corridor 或 UKC。
 
+2026-09-02 起，C 可在同目录发布可选的
+`c.route-motion-qualification-evidence.v1`。本包在加载 motion set 或 objective candidate
+set 时校验 sidecar 的 canonical evidence identity、artifact/producer/RiskWindow digest、
+记录 cardinality、plan/objective binding 及每条 `details_digest`；缺少 sidecar 的旧 v1
+motion artifact 继续可读。Orchestrator 只做 transport/adoption validation，不重算 C 的
+风险、走廊、ETA、any-angle 或 B-spline；D 仍只消费 C 的正式 `motion_samples`，失败时
+使用 authoritative raw waypoint/timeline。
+
 ## Research Validation role（2026-08-21 23:18）
 
 The Orchestrator is the Pipeline / Artifact / Presentation Adapter. It owns

@@ -38,6 +38,14 @@ def load_bound_route_motion_set(
     if not isinstance(document, dict):
         raise ValueError("route motion set must be a JSON object")
     motion_set = route_motion_set_from_dict(document)
+    _validate_optional_qualification_evidence(
+        location,
+        artifact_kind="motion_set",
+        artifact_id=motion_set.motion_set_id,
+        producer_digest=motion_set.producer_digest,
+        risk_window_digest=motion_set.risk_window_digest,
+        records=motion_set.records,
+    )
     plan_set = four_layer_route_plan_set_from_dict(plan_set_document)
     for name in (
         "layer_set_id", "run_id", "scenario_id", "corridor_id", "generation_id",
@@ -113,6 +121,14 @@ def load_bound_route_motion_candidate_set(
     if not isinstance(document, dict):
         raise ValueError("route motion candidate set must be a JSON object")
     candidate_set = route_motion_candidate_set_from_dict(document)
+    _validate_optional_qualification_evidence(
+        location,
+        artifact_kind="motion_candidate_set",
+        artifact_id=candidate_set.motion_candidate_set_id,
+        producer_digest=candidate_set.producer_digest,
+        risk_window_digest=candidate_set.risk_window_digest,
+        records=candidate_set.records,
+    )
     plan_set = four_layer_route_plan_set_from_dict(plan_set_document)
     validate_runtime_route_candidates(runtime_candidates_document)
     if candidate_set.layer_set_id != plan_set.layer_set_id:
@@ -208,6 +224,105 @@ def _validate_replay_adoption(
             raise ValueError("route motion endpoint differs from authoritative route")
     if matched == 0:
         raise ValueError("route motion set does not cover any replay route revision")
+
+
+def _validate_optional_qualification_evidence(
+    motion_location: Path,
+    *,
+    artifact_kind: str,
+    artifact_id: str,
+    producer_digest: str,
+    risk_window_digest: str,
+    records: Sequence[Any],
+) -> None:
+    """Validate a new C evidence sidecar while keeping old v1 artifacts readable."""
+
+    location = motion_location.with_name("route-motion-qualification-evidence.json")
+    if not location.exists():
+        return
+    try:
+        evidence = json.loads(location.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"cannot read route motion qualification evidence {location}: {exc}"
+        ) from exc
+    if not isinstance(evidence, Mapping):
+        raise ValueError("route motion qualification evidence must be an object")
+    if evidence.get("schema_version") != "c.route-motion-qualification-evidence.v1":
+        raise ValueError("unsupported route motion qualification evidence schema")
+    evidence_id = evidence.get("evidence_id")
+    if (
+        not isinstance(evidence_id, str)
+        or not evidence_id.startswith("route-motion-qualification-evidence-sha256-")
+    ):
+        raise ValueError("route motion qualification evidence identity is invalid")
+    evidence_body = dict(evidence)
+    evidence_body.pop("evidence_id", None)
+    expected_evidence_id = (
+        "route-motion-qualification-evidence-sha256-"
+        + canonical_route_motion_sha256(evidence_body)
+    )
+    if evidence_id != expected_evidence_id:
+        raise ValueError("route motion qualification evidence digest does not match content")
+    if evidence.get("producer_digest") != producer_digest:
+        raise ValueError("route motion qualification evidence producer digest differs")
+    if evidence.get("risk_window_digest") != risk_window_digest:
+        raise ValueError("route motion qualification evidence risk window digest differs")
+    identity_field = (
+        "motion_set_id" if artifact_kind == "motion_set" else "motion_candidate_set_id"
+    )
+    if evidence.get(identity_field) != artifact_id:
+        raise ValueError("route motion qualification evidence artifact identity differs")
+    entries = evidence.get("records")
+    if not isinstance(entries, list):
+        raise ValueError("route motion qualification evidence records must be an array")
+    matching = [
+        entry
+        for entry in entries
+        if isinstance(entry, Mapping) and entry.get("artifact_kind") == artifact_kind
+    ]
+    if len(matching) != len(records):
+        raise ValueError("route motion qualification evidence record cardinality differs")
+    expected_records = {
+        (item.record if hasattr(item, "record") else item).plan_id: item
+        for item in records
+    }
+    if len(matching) != len({entry.get("plan_id") for entry in matching}):
+        raise ValueError("route motion qualification evidence plan ids are not unique")
+    for entry in matching:
+        plan_id = entry.get("plan_id")
+        item = expected_records.get(plan_id)
+        if item is None:
+            raise ValueError("route motion qualification evidence plan id differs")
+        record = item.record if hasattr(item, "record") else item
+        expected_objective = (
+            item.objective_mode.value if hasattr(item, "objective_mode") else None
+        )
+        if (
+            entry.get("artifact_id") != artifact_id
+            or entry.get("objective_mode") != expected_objective
+            or entry.get("planning_layer") != record.planning_layer.value
+            or entry.get("mode") != record.mode.value
+            or entry.get("fallback_reason") != record.fallback_reason
+            or entry.get("raw_route_digest") != record.raw_route_digest
+            or entry.get("details_digest") != record.qualification.details_digest
+        ):
+            raise ValueError("route motion qualification evidence record differs")
+        details = entry.get("details")
+        if not isinstance(details, Mapping):
+            raise ValueError("route motion qualification evidence details must be an object")
+        if canonical_route_motion_sha256(details) != record.qualification.details_digest:
+            raise ValueError("route motion qualification evidence details digest differs")
+        diagnostics = entry.get("diagnostics")
+        if not isinstance(diagnostics, Mapping):
+            raise ValueError("route motion qualification evidence diagnostics are missing")
+        if (
+            diagnostics.get("schema_version")
+            != "c.route-motion-qualification-evidence.v1"
+            or diagnostics.get("details_digest") != record.qualification.details_digest
+            or diagnostics.get("qualification_result") != record.qualification.result
+        ):
+            raise ValueError("route motion qualification evidence diagnostics differ")
 
 
 def _shift_iso(value: object, offset_seconds: float) -> str | None:

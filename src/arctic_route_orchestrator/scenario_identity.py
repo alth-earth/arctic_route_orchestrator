@@ -73,14 +73,19 @@ def verify_viewer_identity(
     """
     contract = load_scenario_contract(contracts_config_root, scenario_id)
 
-    _require(run_context.get("schema_version") == RUNCONTEXT_SCHEMA, "RunContext is not run-context.v2")
+    _require(
+        run_context.get("schema_version") == RUNCONTEXT_SCHEMA,
+        "RunContext is not run-context.v2",
+    )
     _require(
         run_context.get("scenario_id") == scenario_id,
         f"RunContext scenario {run_context.get('scenario_id')!r} != requested {scenario_id!r}",
     )
     _require(
         run_context.get("corridor_id") == contract["corridor_id"],
-        f"RunContext corridor {run_context.get('corridor_id')!r} != scenario contract {contract['corridor_id']!r}",
+        "RunContext corridor "
+        f"{run_context.get('corridor_id')!r} != scenario contract "
+        f"{contract['corridor_id']!r}",
     )
     if contract["simulation_start"] and contract["simulation_end"]:
         _require(
@@ -100,13 +105,22 @@ def verify_viewer_identity(
     )
 
     # --- RiskWindow commit + frame index ---
-    _require(risk_commit.get("schema_version") == RISK_COMMIT_SCHEMA, "risk window is not bc.risk-window-commit.v1")
+    _require(
+        risk_commit.get("schema_version") == RISK_COMMIT_SCHEMA,
+        "risk window is not bc.risk-window-commit.v1",
+    )
     _require(risk_commit.get("scenario_id") == scenario_id, "RiskWindow scenario mismatch")
     risk_window_id = risk_commit.get("commit_id")
     risk_window_digest = risk_commit.get("content_digest")
-    _require(risk_index.get("status") == "FORMAL_VALIDATED", "RiskFrame index is not FORMAL_VALIDATED")
+    _require(
+        risk_index.get("status") == "FORMAL_VALIDATED",
+        "RiskFrame index is not FORMAL_VALIDATED",
+    )
     _require(risk_index.get("scenario_id") == scenario_id, "RiskFrame index scenario mismatch")
-    _require(risk_index.get("commit_id") == risk_window_id, "RiskFrame index commit differs from RiskWindow")
+    _require(
+        risk_index.get("commit_id") == risk_window_id,
+        "RiskFrame index commit differs from RiskWindow",
+    )
     _require(
         risk_index.get("content_digest") == risk_window_digest,
         "RiskFrame index content digest differs from RiskWindow",
@@ -116,23 +130,36 @@ def verify_viewer_identity(
         and risk_index.get("dataset_bundle_digest") == bundle_digest,
         "RiskFrame index does not bind the supplied DatasetBundle",
     )
-    commit_frame_ids = [f.get("risk_id") for f in risk_commit.get("frames", []) if isinstance(f, dict)]
+    commit_frame_ids = [
+        f.get("risk_id")
+        for f in risk_commit.get("frames", [])
+        if isinstance(f, dict)
+    ]
     _require(
         commit_frame_ids == risk_index.get("frame_ids"),
         "RiskFrame index order differs from RiskWindow commit",
     )
 
     # --- C plan set + route candidates ---
-    _require(plan_set.get("schema_version") == PLAN_SET_SCHEMA, "plan set is not cd.four-layer-route-plan-set.v3")
+    _require(
+        plan_set.get("schema_version") == PLAN_SET_SCHEMA,
+        "plan set is not cd.four-layer-route-plan-set.v3",
+    )
     _require(plan_set.get("scenario_id") == scenario_id, "plan set scenario mismatch")
     layer_set_id = plan_set.get("layer_set_id")
     _require(
         route_candidates.get("schema_version") == CANDIDATE_SCHEMA,
         "route candidates is not presentation.route-candidates.v1",
     )
-    _require(route_candidates.get("layer_set_id") == layer_set_id, "route candidate layer_set differs from plan set")
+    _require(
+        route_candidates.get("layer_set_id") == layer_set_id,
+        "route candidate layer_set differs from plan set",
+    )
     candidates = route_candidates.get("candidates")
-    _require(isinstance(candidates, list) and len(candidates) == 12, "route candidates must contain exactly 12 routes")
+    _require(
+        isinstance(candidates, list) and len(candidates) == 12,
+        "route candidates must contain exactly 12 routes",
+    )
     candidate_scenarios = {
         c.get("provenance", {}).get("scenario_id") for c in candidates if isinstance(c, dict)
     }
