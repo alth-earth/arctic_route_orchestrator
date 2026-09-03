@@ -19,6 +19,7 @@ arctic-route-planning = { path = "../work_package_c", editable = true }
 
 [project.scripts]
 arctic-route-orchestrator = "arctic_route_orchestrator.cli:main"
+arctic-route-publish-viewer = "arctic_route_orchestrator.viewer_package:main"
 
 [dependency-groups]
 dev = [
@@ -33,6 +34,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/arctic_route_orchestrator"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"scripts/replay_viewer_export.py" = "arctic_route_orchestrator/_scripts/replay_viewer_export.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

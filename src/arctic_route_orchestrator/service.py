@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -14,10 +15,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import arctic_route_contracts
-import arctic_route_data
-import arctic_route_planning
-import arctic_route_risk
 import numpy as np
 
 try:
@@ -26,13 +23,11 @@ except ImportError:  # pragma: no cover - resource is unavailable on Windows.
     resource = None
 
 from arctic_route_contracts import run_context_to_dict
-from arctic_route_planning import (
-    RiskSourcePlanningIngress,
-    ServicePlanningRequest,
-    map_corridor_endpoints,
-)
+from arctic_route_contracts.config import default_config_root
 from arctic_route_planning.config import load_configuration
 from arctic_route_planning.contracts import ProvenanceKind, risk_frame_content_digest
+from arctic_route_planning.endpoints import map_corridor_endpoints
+from arctic_route_planning.ingress import RiskSourcePlanningIngress
 from arctic_route_planning.publishing import (
     four_layer_route_plan_set_semantic_digest,
     four_layer_route_plan_set_to_dict,
@@ -41,13 +36,11 @@ from arctic_route_planning.publishing import (
     route_plan_to_geojson,
 )
 from arctic_route_planning.replanning import ReplanObservation
-from arctic_route_risk import (
-    BInputEnvelope,
-    PersistentRiskStore,
-    RiskBuildRequest,
-    RiskBuildService,
-    load_risk_build_configuration,
-)
+from arctic_route_planning.service import ServicePlanningRequest
+from arctic_route_risk.config import load_risk_build_configuration
+from arctic_route_risk.context import BInputEnvelope
+from arctic_route_risk.publishing import PersistentRiskStore
+from arctic_route_risk.service import RiskBuildRequest, RiskBuildService
 
 from arctic_route_orchestrator.errors import OrchestrationError
 from arctic_route_orchestrator.intake import ArtifactIntake
@@ -493,7 +486,7 @@ def _execute_with_parallel(*, spec: ExecutionSpec, paths: RunPaths, operation):
 
     contracts_root = paths.contracts_config_root
     if contracts_root is None:
-        contracts_root = arctic_route_contracts.default_config_root()
+        contracts_root = default_config_root()
     with replay_parallel.install(
         workers=spec.planning_workers,
         risk_store_root=paths.risk_store_root,
@@ -1014,10 +1007,10 @@ def _run_report(
             "python": platform.python_version(),
             "prefix": sys.prefix,
             "packages": {
-                "arctic_route_contracts": arctic_route_contracts.__version__,
-                "work_package_a": arctic_route_data.__version__,
-                "work_package_b": arctic_route_risk.__version__,
-                "work_package_c": arctic_route_planning.__version__,
+                "arctic_route_contracts": importlib.metadata.version("arctic-route-contracts"),
+                "work_package_a": importlib.metadata.version("arctic-route-data"),
+                "work_package_b": importlib.metadata.version("arctic-route-risk"),
+                "work_package_c": importlib.metadata.version("arctic-route-planning"),
             },
             "lock_sha256": _lockfile_hashes(),
         },

@@ -64,6 +64,29 @@ def _run_paths_to_dict(paths: RunPaths) -> dict[str, str]:
     }
 
 
+def _default_worker_command(
+    spec_path: Path,
+    paths_json: str,
+    result_path: Path,
+) -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [
+            sys.executable,
+            "--orchestrator-stage-worker",
+            str(spec_path),
+            paths_json,
+            str(result_path),
+        ]
+    return [
+        sys.executable,
+        "-m",
+        "arctic_route_orchestrator.stage_worker",
+        str(spec_path),
+        paths_json,
+        str(result_path),
+    ]
+
+
 def run_with_timeout(
     spec: ExecutionSpec,
     paths: RunPaths,
@@ -86,14 +109,7 @@ def run_with_timeout(
             json.dumps(spec.to_document(), sort_keys=True), encoding="utf-8"
         )
         def worker_cmd_factory(_result: Path) -> list[str]:
-            return [
-                sys.executable,
-                "-m",
-                "arctic_route_orchestrator.stage_worker",
-                str(spec_path),
-                paths_json,
-                str(_result),
-            ]
+            return _default_worker_command(spec_path, paths_json, _result)
     worker_cmd = worker_cmd_factory(result_path)
 
     heartbeat_events: list[dict[str, Any]] = []

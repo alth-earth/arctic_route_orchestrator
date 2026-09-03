@@ -49,6 +49,11 @@ from arctic_route_orchestrator.route_presentation import (
     project_route_candidates,
     project_runtime_route_candidates,
 )
+from arctic_route_orchestrator.strict_json import (
+    loads_strict_json,
+    read_strict_json,
+    read_strict_json_object,
+)
 
 SEA_RGB = (46, 102, 150)
 LAND_RGB = (108, 132, 98)
@@ -124,15 +129,13 @@ def _route_candidates_package(
 def _write_png(path: Path, width: int, height: int, pixels: bytes) -> None:
     def chunk(tag: bytes, data: bytes) -> bytes:
         body = tag + data
-        return struct.pack(">I", len(data)) + body + struct.pack(
-            ">I", zlib.crc32(body) & 0xFFFFFFFF
+        return (
+            struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
         )
 
     rowbytes = width * 3
     raw = b"".join(
-        b"\x00"
-        + pixels[rowbytes * row : rowbytes * row + rowbytes]
-        for row in range(height)
+        b"\x00" + pixels[rowbytes * row : rowbytes * row + rowbytes] for row in range(height)
     )
     with path.open("wb") as handle:
         handle.write(b"\x89PNG\r\n\x1a\n")
@@ -506,10 +509,7 @@ def _risk_frame_summary(frame: dict) -> dict:
     reasons = [str(value or "NONE") for value in frame["hard_reasons"]]
     total = len(levels)
     level_counts = {str(level): levels.count(level) for level in range(1, 6)}
-    reason_counts = {
-        reason: reasons.count(reason)
-        for reason in sorted(set(reasons))
-    }
+    reason_counts = {reason: reasons.count(reason) for reason in sorted(set(reasons))}
     return {
         "total_cells": total,
         "risk_level_counts": level_counts,
@@ -610,8 +610,8 @@ def _presentation_risk(
     frames_by_valid_time: dict[str, dict] = {}
     for path in sorted((risk_store_root / "frames").glob("risk-sha256-*.json")):
         try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            document = read_strict_json_object(path, label="risk frame")
+        except ValueError as exc:
             raise ValueError(f"cannot read risk frame {path}: {exc}") from exc
         if document.get("schema_version") != "bc.risk-frame.v2":
             continue
@@ -642,10 +642,7 @@ def _presentation_risk(
             # producer-side attributes in some formal builds.  Preserve the
             # exact hard-mask cells for D, but never invent a physical cause.
             hard_reasons = [
-                [
-                    "HARD_MASK_REASON_UNAVAILABLE" if bool(value) else "NONE"
-                    for value in row
-                ]
+                ["HARD_MASK_REASON_UNAVAILABLE" if bool(value) else "NONE" for value in row]
                 for row in hard_mask
             ]
         if not all(
@@ -661,8 +658,7 @@ def _presentation_risk(
         ):
             raise ValueError(f"risk frame {path} is missing spatial arrays")
         if any(
-            len(matrix) != len(latitudes)
-            or any(len(row) != len(longitudes) for row in matrix)
+            len(matrix) != len(latitudes) or any(len(row) != len(longitudes) for row in matrix)
             for matrix in (
                 hard_reasons,
                 hard_mask,
@@ -734,9 +730,7 @@ def _presentation_risk(
             "schema_version": "bc.risk-frame.v2",
             "risk_store_root": str(risk_store_root),
             "scenario_id": scenario_id,
-            "provenance": sorted(
-                {str(frame["provenance"]) for frame in frames}
-            ),
+            "provenance": sorted({str(frame["provenance"]) for frame in frames}),
             "run_id": first.get("run_id"),
             "corridor_id": first.get("corridor_id"),
             "vessel_profile_id": first.get("vessel_profile_id"),
@@ -770,7 +764,9 @@ def _build_basemap(
         },
         width=width,
         height=height,
-        source=str(land_mask_path),
+        # Published Viewer metadata must be portable. The content digest and
+        # basemap version carry identity; a build-host absolute path does not.
+        source=land_mask_path.name,
         version=version,
         provenance={
             "product_id": "GEBCO_2026",
@@ -791,13 +787,7 @@ def _build_basemap(
 
 
 def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read {label} {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ValueError(f"{label} must be a JSON object")
-    return value
+    return read_strict_json_object(path, label=label)
 
 
 def _load_v2_route_smoothing_sidecar(
@@ -807,10 +797,7 @@ def _load_v2_route_smoothing_sidecar(
 ) -> dict[str, Any]:
     """Validate and bind an R1 v2 sidecar without changing the formal route."""
 
-    coordinates = [
-        [waypoint["lon"], waypoint["lat"]]
-        for waypoint in route.get("waypoints", [])
-    ]
+    coordinates = [[waypoint["lon"], waypoint["lat"]] for waypoint in route.get("waypoints", [])]
     expected_route_digest = _canonical_sha256(coordinates)
     validation = validate_research_route_sidecar(
         sidecar,
@@ -818,8 +805,7 @@ def _load_v2_route_smoothing_sidecar(
     )
     _require(
         validation.valid,
-        "route smoothing sidecar v2 validation failed: "
-        f"{validation.reason or 'unknown_reason'}",
+        f"route smoothing sidecar v2 validation failed: {validation.reason or 'unknown_reason'}",
     )
     normalized = normalize_research_route_sidecar(
         sidecar,
@@ -933,10 +919,7 @@ def _load_route_smoothing_sidecar(
         authoritative.get("route_digest") == sidecar.get("raw_route_digest"),
         "route smoothing authoritative digest is inconsistent",
     )
-    coordinates = [
-        [waypoint["lon"], waypoint["lat"]]
-        for waypoint in route.get("waypoints", [])
-    ]
+    coordinates = [[waypoint["lon"], waypoint["lat"]] for waypoint in route.get("waypoints", [])]
     _require(
         _canonical_sha256(coordinates) == sidecar.get("raw_route_digest"),
         "route smoothing sidecar does not bind the Winter route",
@@ -1003,8 +986,8 @@ def _load_risk_explanation_manifest(
     """
 
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        manifest = read_strict_json_object(manifest_path, label="risk explanation manifest")
+    except ValueError as exc:
         raise ValueError(
             f"risk explanation manifest is missing or invalid: {manifest_path}"
         ) from exc
@@ -1043,8 +1026,8 @@ def _load_risk_explanation_manifest(
         "risk explanation artifact identity mismatch",
     )
     try:
-        sidecar = json.loads(artifact_bytes)
-    except json.JSONDecodeError as exc:
+        sidecar = loads_strict_json(artifact_bytes, label="risk explanation artifact")
+    except ValueError as exc:
         raise ValueError("risk explanation artifact is invalid JSON") from exc
     _require(
         isinstance(sidecar, dict)
@@ -1103,8 +1086,10 @@ def _load_causal_replay_source(
     _require(isinstance(entries, list) and entries, "causal replay snapshots are missing")
     snapshots = []
     for entry in entries:
-        _require(isinstance(entry, dict) and isinstance(entry.get("resource"), str),
-                 "causal replay snapshot resource is invalid")
+        _require(
+            isinstance(entry, dict) and isinstance(entry.get("resource"), str),
+            "causal replay snapshot resource is invalid",
+        )
         resource = Path(entry["resource"])
         # Runner manifests use ``snapshots/0000.json`` relative to the
         # manifest directory.  A caller may instead pass a copied snapshots
@@ -1112,8 +1097,7 @@ def _load_causal_replay_source(
         # the resolved file inside the selected source root.
         relative = (
             Path(*resource.parts[1:])
-            if resource.parts
-            and resource.parts[0] in {"snapshots", snapshots_root.name}
+            if resource.parts and resource.parts[0] in {"snapshots", snapshots_root.name}
             else resource
         )
         snapshot_path = (snapshots_root / relative).resolve()
@@ -1139,12 +1123,9 @@ def _load_causal_replay_source(
                 isinstance(declared_digest, str)
                 and snapshot_digest == declared_digest
                 and replay_semantic_digest(
-                    {
-                        key: value
-                        for key, value in snapshot.items()
-                        if key != "snapshot_digest"
-                    }
-                ) == snapshot_digest,
+                    {key: value for key, value in snapshot.items() if key != "snapshot_digest"}
+                )
+                == snapshot_digest,
                 "causal replay snapshot digest mismatch",
             )
         snapshots.append(snapshot)
@@ -1170,8 +1151,7 @@ def _load_causal_replay_source(
     )
     events = manifest.get("events") or []
     observed_events = [
-        event for event in events
-        if isinstance(event, dict) and event.get("observed") is True
+        event for event in events if isinstance(event, dict) and event.get("observed") is True
     ]
     types = [event.get("type") for event in observed_events]
     _require(
@@ -1186,17 +1166,18 @@ def _load_causal_replay_source(
         (
             initial.get("route_id") in (None, expected_route.get("route_id"))
             and [
-            {key: point[key] for key in ("lon", "lat", "eta")}
-            for point in initial.get("waypoints", [])
-            ] == [
-            {"lon": point["lon"], "lat": point["lat"], "eta": point["eta"]}
-            for point in expected_route["waypoints"]
+                {key: point[key] for key in ("lon", "lat", "eta")}
+                for point in initial.get("waypoints", [])
+            ]
+            == [
+                {"lon": point["lon"], "lat": point["lat"], "eta": point["eta"]}
+                for point in expected_route["waypoints"]
             ]
         ),
         "causal replay initial route differs from Winter authoritative route",
     )
     source = {
-        "manifest_path": str(manifest_path),
+        "manifest_path": manifest_path.name,
         "manifest_sha256": _sha256_file(manifest_path),
         "replay_id": manifest.get("replay_id"),
         "scenario_mode": scenario_mode,
@@ -1213,9 +1194,7 @@ def _load_causal_replay_source(
     if revision_index is not None:
         source.update(revision_index)
     elif scenario_mode == "retrospective_dynamic_replay":
-        raise ValueError(
-            "retrospective dynamic replay has no immutable plan revision index"
-        )
+        raise ValueError("retrospective dynamic replay has no immutable plan revision index")
     provenance = manifest.get("provenance") or {}
     source["knowledge_as_of"] = provenance.get("knowledge_as_of")
     return adapter, source, manifest_path
@@ -1360,8 +1339,7 @@ def _bind_replay_revision_plan(
         for point in replay_route.get("waypoints", ())
     ]
     plan_points = [
-        (point.get("longitude"), point.get("latitude"))
-        for point in plan.get("waypoints", ())
+        (point.get("longitude"), point.get("latitude")) for point in plan.get("waypoints", ())
     ]
     _require(
         replay_points == plan_points,
@@ -1392,10 +1370,7 @@ def _revision_candidate_sets(
     plan_sets_by_revision: dict[int, dict[str, Any]],
     revision_entries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    states = {
-        int(entry["plan_revision"]): entry.get("state")
-        for entry in revision_entries
-    }
+    states = {int(entry["plan_revision"]): entry.get("state") for entry in revision_entries}
     result = []
     for revision in sorted(plan_sets_by_revision):
         package = project_route_candidates(
@@ -1417,10 +1392,7 @@ def _revision_runtime_candidate_sets(
 ) -> list[dict[str, Any]]:
     """Project authoritative C waypoint/ETA candidates for every replay revision."""
 
-    states = {
-        int(entry["plan_revision"]): entry.get("state")
-        for entry in revision_entries
-    }
+    states = {int(entry["plan_revision"]): entry.get("state") for entry in revision_entries}
     result = []
     for revision in sorted(plan_sets_by_revision):
         package = project_runtime_route_candidates(
@@ -1556,16 +1528,13 @@ def _validate_winter_identity(
         and selected_candidate.get("travel_hours") == metrics.get("eta_hours")
         and candidate_metrics.get("average_risk") == metrics.get("avg_risk")
         and candidate_metrics.get("maximum_risk") == metrics.get("max_risk")
-        and candidate_metrics.get("integrated_risk_hours")
-        == metrics.get("integrated_risk_hours"),
+        and candidate_metrics.get("integrated_risk_hours") == metrics.get("integrated_risk_hours"),
         "selected route candidate metrics differ from C plan",
     )
     candidate_ids = {
         candidate.get("candidate_id") for candidate in route_candidates.get("candidates", [])
     }
-    integrity_ids = {
-        item.get("route_id") for item in route_integrity if isinstance(item, dict)
-    }
+    integrity_ids = {item.get("route_id") for item in route_integrity if isinstance(item, dict)}
     _require(
         len(candidate_ids) == 12 and integrity_ids == candidate_ids,
         "route integrity evidence does not cover all 12 published candidates",
@@ -1796,12 +1765,10 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
     dataset_bundle = _read_json_object(required_paths["dataset_bundle"], label="DatasetBundle")
     run_context = _read_json_object(required_paths["run_context"], label="RunContext")
     risk_index = _read_json_object(required_paths["risk_frame_index"], label="RiskFrame index")
-    risk_commit = _read_json_object(
-        required_paths["risk_window_commit"], label="RiskWindow commit"
-    )
+    risk_commit = _read_json_object(required_paths["risk_window_commit"], label="RiskWindow commit")
     plan_set = _read_json_object(required_paths["plan_set"], label="C plan set")
     route_candidates = load_route_candidates(required_paths["route_candidates"])
-    integrity_value = json.loads(required_paths["route_integrity"].read_text(encoding="utf-8"))
+    integrity_value = read_strict_json(required_paths["route_integrity"], label="route integrity")
     _require(isinstance(integrity_value, list), "route integrity evidence must be a list")
     identity = _validate_winter_identity(
         dataset_bundle=dataset_bundle,
@@ -1831,9 +1798,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         }
     ]
     plan_sets_by_revision: dict[int, dict[str, Any]] = {1: plan_set}
-    runtime_route_candidate_sets = _revision_runtime_candidate_sets(
-        plan_sets_by_revision, []
-    )
+    runtime_route_candidate_sets = _revision_runtime_candidate_sets(plan_sets_by_revision, [])
     route_smoothing_sidecar = None
     if args.route_smoothing_sidecar is not None:
         route_smoothing_sidecar = _load_route_smoothing_sidecar(
@@ -1860,8 +1825,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         )
         final_state = replay_adapter.state_at(replay_adapter.replay_end)
         _require(
-            final_state.vessel.status == "ARRIVED"
-            and final_state.plan.pending_candidate is None,
+            final_state.vessel.status == "ARRIVED" and final_state.plan.pending_candidate is None,
             "published dynamic replay must run through ARRIVED with no pending "
             "adoption; ETA-only timeline extension is prohibited",
         )
@@ -1896,8 +1860,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             source_replay.get("plan_revision_resources", []),
         )
         snapshots_by_time = {
-            snapshot["simulation_time"]: snapshot
-            for snapshot in replay_adapter.snapshots
+            snapshot["simulation_time"]: snapshot for snapshot in replay_adapter.snapshots
         }
         for entry in source_replay.get("plan_revision_resources", []):
             snapshot = snapshots_by_time.get(entry.get("simulation_time"))
@@ -1909,8 +1872,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             risk_window_id = risk_state.get("resource_identity")
             risk_window_digest = risk_state.get("resource_digest")
             _require(
-                isinstance(risk_window_id, str)
-                and isinstance(risk_window_digest, str),
+                isinstance(risk_window_id, str) and isinstance(risk_window_digest, str),
                 "plan revision replay snapshot lacks RiskWindow identity",
             )
             motion_context_by_layer_set[entry["layer_set_id"]] = {
@@ -1970,8 +1932,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
     )
 
     layer_sets = {
-        document.get("layer_set_id"): document
-        for document in plan_sets_by_revision.values()
+        document.get("layer_set_id"): document for document in plan_sets_by_revision.values()
     }
     for motion_path in args.route_motion_set or ():
         motion_document = _read_json_object(motion_path, label="route motion set")
@@ -2010,9 +1971,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         route_motion_sets.append(motion_set)
 
     for motion_path in getattr(args, "route_motion_candidate_set", ()) or ():
-        motion_document = _read_json_object(
-            motion_path, label="route motion candidate set"
-        )
+        motion_document = _read_json_object(motion_path, label="route motion candidate set")
         motion_layer_set_id = motion_document.get("layer_set_id")
         runtime_entry = runtime_by_layer_set.get(motion_layer_set_id)
         bound_plan_set = layer_sets.get(motion_layer_set_id)
@@ -2062,14 +2021,12 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         ]
         _require(
             not missing_route_ids,
-            "formal motion does not cover adopted replay routes: "
-            + ", ".join(missing_route_ids),
+            "formal motion does not cover adopted replay routes: " + ", ".join(missing_route_ids),
         )
     risk_explanation_manifest = None
     risk_explanation = None
     risk_store_root = (
-        args.risk_store_root
-        or required_paths["risk_frame_index"].parent / "risk-store"
+        args.risk_store_root or required_paths["risk_frame_index"].parent / "risk-store"
     )
     risk = _presentation_risk(
         risk_store_root=risk_store_root,
@@ -2134,57 +2091,53 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             (
                 "orchestrator.presentation_adapter.retrospective_dynamic_replay"
                 if source_replay is not None
-                and source_replay.get("scenario_mode")
-                == "retrospective_dynamic_replay"
+                and source_replay.get("scenario_mode") == "retrospective_dynamic_replay"
                 else "orchestrator.presentation_adapter.causal_replay"
             )
             if replay_adapter is not None
             else "cd.route-plan.v3.waypoints.eta"
         ),
         source_replay_digest=(source_replay or {}).get("manifest_sha256"),
-        risk_explanation_digest=(
-            risk_explanation_manifest or {}
-        ).get("artifact_sha256"),
+        risk_explanation_digest=(risk_explanation_manifest or {}).get("artifact_sha256"),
         simulation_start=timeline[0]["t"],
         simulation_end=timeline[-1]["t"],
     )
     source_files = {
-        name: {"path": str(path), "sha256": _sha256_file(path)}
+        name: {"path": path.name, "sha256": _sha256_file(path)}
         for name, path in required_paths.items()
     }
     if args.route_smoothing_sidecar is not None:
         source_files["route_smoothing_sidecar"] = {
-            "path": str(args.route_smoothing_sidecar),
+            "path": args.route_smoothing_sidecar.name,
             "sha256": _sha256_file(args.route_smoothing_sidecar),
         }
     for index, motion_path in enumerate(args.route_motion_set or (), start=1):
         source_files[f"route_motion_set_{index}"] = {
-            "path": str(motion_path),
+            "path": motion_path.name,
             "sha256": _sha256_file(motion_path),
         }
     for index, motion_path in enumerate(
         getattr(args, "route_motion_candidate_set", ()) or (), start=1
     ):
         source_files[f"route_motion_candidate_set_{index}"] = {
-            "path": str(motion_path),
+            "path": motion_path.name,
             "sha256": _sha256_file(motion_path),
         }
     if args.winter_replay_manifest is not None:
         source_files["causal_replay_manifest"] = {
-            "path": str(args.winter_replay_manifest),
+            "path": args.winter_replay_manifest.name,
             "sha256": _sha256_file(args.winter_replay_manifest),
         }
     if args.risk_explanation_manifest is not None:
         source_files["risk_explanation_manifest"] = {
-            "path": str(args.risk_explanation_manifest),
+            "path": args.risk_explanation_manifest.name,
             "sha256": _sha256_file(args.risk_explanation_manifest),
         }
         artifact_path = (
-            args.risk_explanation_manifest.parent
-            / risk_explanation_manifest["artifact_path"]
+            args.risk_explanation_manifest.parent / risk_explanation_manifest["artifact_path"]
         )
         source_files["risk_explanation_artifact"] = {
-            "path": str(artifact_path),
+            "path": artifact_path.name,
             "sha256": risk_explanation_manifest["artifact_sha256"],
         }
     research_validation = {
@@ -2209,9 +2162,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             "schema_version": "cd.route-motion-set.v1" if route_motion_sets else None,
             "motion_set_ids": [item["motion_set_id"] for item in route_motion_sets],
             "set_count": len(route_motion_sets),
-            "record_count": sum(
-                len(item.get("records", [])) for item in route_motion_sets
-            ),
+            "record_count": sum(len(item.get("records", [])) for item in route_motion_sets),
             "record_layers": [
                 layer
                 for layer in (
@@ -2226,9 +2177,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
                     for record in item.get("records", [])
                 )
             ],
-            "covered_layer_set_ids": [
-                item["layer_set_id"] for item in route_motion_sets
-            ],
+            "covered_layer_set_ids": [item["layer_set_id"] for item in route_motion_sets],
             "reason": None if route_motion_sets else "missing_formal_motion_set",
         },
         "replay": {
@@ -2258,8 +2207,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
                 (
                     "orchestrator.presentation_adapter.retrospective_dynamic_replay"
                     if source_replay is not None
-                    and source_replay.get("scenario_mode")
-                    == "retrospective_dynamic_replay"
+                    and source_replay.get("scenario_mode") == "retrospective_dynamic_replay"
                     else "orchestrator.presentation_adapter.causal_replay"
                 )
                 if replay_adapter is not None
@@ -2269,25 +2217,20 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
                 (
                     "PUBLISHED_RETROSPECTIVE_DYNAMIC_REPLAY"
                     if source_replay is not None
-                    and source_replay.get("scenario_mode")
-                    == "retrospective_dynamic_replay"
+                    and source_replay.get("scenario_mode") == "retrospective_dynamic_replay"
                     else "PUBLISHED_CAUSAL_REPLAY"
                 )
                 if replay_adapter is not None
                 else "UNAVAILABLE_IDENTITY_BOUND_CAUSAL_REPLAY_REQUIRED"
             ),
             "source_replay": source_replay,
-            "plan_revision_index": (
-                (source_replay or {}).get("plan_revision_index")
-            ),
-            "plan_revision_resources": (
-                (source_replay or {}).get("plan_revision_resources", [])
-            ),
+            "plan_revision_index": ((source_replay or {}).get("plan_revision_index")),
+            "plan_revision_resources": ((source_replay or {}).get("plan_revision_resources", [])),
             "risk_explanation_manifest": (
                 {
                     "artifact_id": risk_explanation_manifest["artifact_id"],
                     "artifact_sha256": risk_explanation_manifest["artifact_sha256"],
-                    "manifest_path": str(args.risk_explanation_manifest),
+                    "manifest_path": args.risk_explanation_manifest.name,
                 }
                 if risk_explanation_manifest is not None
                 else None
@@ -2347,9 +2290,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             "runtime_candidate_set_id": item["runtime_route_candidates"][
                 "runtime_candidate_set_id"
             ],
-            "selected_candidate_id": item["runtime_route_candidates"][
-                "selected_candidate_id"
-            ],
+            "selected_candidate_id": item["runtime_route_candidates"]["selected_candidate_id"],
         }
         for item in runtime_route_candidate_sets
     ]
@@ -2363,9 +2304,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             "state": item.get("state"),
             "layer_set_id": item["route_candidates"]["layer_set_id"],
             "candidate_set_id": item["route_candidates"]["candidate_set_id"],
-            "selected_candidate_id": item["route_candidates"][
-                "selected_candidate_id"
-            ],
+            "selected_candidate_id": item["route_candidates"]["selected_candidate_id"],
         }
         for item in route_candidate_sets
     ]
@@ -2374,7 +2313,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         bundle["risk_explanation_transport"] = {
             "schema_version": "risk-explanation-transport.v1",
             "status": "PUBLISHED",
-            "manifest_path": str(args.risk_explanation_manifest),
+            "manifest_path": args.risk_explanation_manifest.name,
             "manifest_sha256": _sha256_file(args.risk_explanation_manifest),
             "artifact_id": risk_explanation_manifest["artifact_id"],
             "artifact_sha256": risk_explanation_manifest["artifact_sha256"],
@@ -2426,9 +2365,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
             output_dir / f"route-motion-candidate-set-r{index}.json"
         )
         motion_candidate_set_transport_path.write_text(
-            json.dumps(
-                motion_candidate_set, ensure_ascii=False, indent=2, sort_keys=True
-            ),
+            json.dumps(motion_candidate_set, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
         motion_candidate_set_transport_paths.append(motion_candidate_set_transport_path)
@@ -2447,9 +2384,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
                     "route_integrity": "PASS",
                     "replay_timeline_boundary": "PASS",
                     "formal_route_motion": (
-                        "PASS"
-                        if route_motion_sets
-                        else "NOT_PROVIDED_OPTIONAL_LEGACY_EXPORT"
+                        "PASS" if route_motion_sets else "NOT_PROVIDED_OPTIONAL_LEGACY_EXPORT"
                     ),
                 },
             },
@@ -2464,7 +2399,7 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         "status": "PASS",
         "assembly_id": assembly_id,
         "assembly_digest": assembly_digest,
-        "bundle_path": str(target_output_dir / "bundle.json"),
+        "bundle_path": "bundle.json",
         "bundle_sha256": _sha256_file(bundle_path),
         "basemap_sha256": _sha256_file(output_dir / "gebco_basemap.png"),
         "preflight_sha256": _sha256_file(preflight_path),
@@ -2485,12 +2420,12 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
                 path.name for path in motion_candidate_set_transport_paths
             ],
             "causal_replay_manifest": (
-                str(args.winter_replay_manifest)
+                args.winter_replay_manifest.name
                 if args.winter_replay_manifest is not None
                 else None
             ),
             "risk_explanation_manifest": (
-                str(args.risk_explanation_manifest)
+                args.risk_explanation_manifest.name
                 if args.risk_explanation_manifest is not None
                 else None
             ),
@@ -2509,14 +2444,10 @@ def _export_winter_combined(args: argparse.Namespace) -> int:
         "winter-combined-viewer-manifest.json",
     ]
     checksum_names[2:2] = [path.name for path in motion_set_transport_paths]
-    checksum_names[2:2] = [
-        path.name for path in motion_candidate_set_transport_paths
-    ]
+    checksum_names[2:2] = [path.name for path in motion_candidate_set_transport_paths]
     checksums = {
         "schema_version": "presentation.winter-combined-checksums.v1",
-        "files": {
-            name: _sha256_file(output_dir / name) for name in checksum_names
-        },
+        "files": {name: _sha256_file(output_dir / name) for name in checksum_names},
     }
     (output_dir / "checksums.json").write_text(
         json.dumps(checksums, ensure_ascii=False, indent=2, sort_keys=True),
@@ -2634,17 +2565,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.route_motion_set:
         parser.error("--route-motion-set currently requires --winter-plan-set binding")
     if args.route_motion_candidate_set:
-        parser.error(
-            "--route-motion-candidate-set currently requires --winter-plan-set binding"
-        )
+        parser.error("--route-motion-candidate-set currently requires --winter-plan-set binding")
     if args.manifest is None:
         parser.error("manifest is required unless --winter-plan-set is supplied")
 
-    manifest_doc = json.loads(args.manifest.read_text(encoding="utf-8"))
+    manifest_doc = read_strict_json_object(args.manifest, label="replay manifest")
     snapshots_dir = args.snapshots_dir or args.manifest.parent / "snapshots"
     risk_store_root = args.risk_store_root or args.manifest.parent / "risk-store"
     snapshots = [
-        json.loads((snapshots_dir / f"{entry['index']:04d}.json").read_text(encoding="utf-8"))
+        read_strict_json_object(
+            snapshots_dir / f"{entry['index']:04d}.json", label="replay snapshot"
+        )
         for entry in manifest_doc["snapshots"]
     ]
 
@@ -2731,8 +2662,7 @@ def main(argv: list[str] | None = None) -> int:
         "presentation": VIEWER_PRESENTATION,
         "gates": gates,
         "routes": [
-            _route_meta(adapter, revision)
-            for revision in sorted(adapter._routes_by_revision)
+            _route_meta(adapter, revision) for revision in sorted(adapter._routes_by_revision)
         ],
         "route_candidates": route_candidates,
         "events": [
@@ -2752,7 +2682,7 @@ def main(argv: list[str] | None = None) -> int:
         bundle["risk_explanation_transport"] = {
             "schema_version": "risk-explanation-transport.v1",
             "status": "PUBLISHED",
-            "manifest_path": str(args.risk_explanation_manifest),
+            "manifest_path": args.risk_explanation_manifest.name,
             "manifest_sha256": _sha256_file(args.risk_explanation_manifest),
             "artifact_id": risk_explanation_manifest["artifact_id"],
             "artifact_sha256": risk_explanation_manifest["artifact_sha256"],

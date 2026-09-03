@@ -10,10 +10,22 @@ from pathlib import Path
 
 import pytest
 
+from arctic_route_orchestrator import timeout_runner
 from arctic_route_orchestrator.errors import OrchestrationError
 from arctic_route_orchestrator.models import ExecutionSpec
 from arctic_route_orchestrator.service import RunPaths
 from arctic_route_orchestrator.timeout_runner import StageTimeoutError, run_with_timeout
+
+
+def test_default_worker_command_uses_frozen_executable_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(timeout_runner.sys, "frozen", True, raising=False)
+    command = timeout_runner._default_worker_command(
+        tmp_path / "spec.json", "{}", tmp_path / "result.json"
+    )
+    assert command[:2] == [timeout_runner.sys.executable, "--orchestrator-stage-worker"]
 
 
 def _spec(per_stage_timeout: float) -> ExecutionSpec:

@@ -36,7 +36,7 @@ from arctic_route_planning.planners import (
     TimeDependentAStar,
 )
 from arctic_route_planning.risk import RiskSampler
-from arctic_route_risk import PersistentRiskStore
+from arctic_route_risk.publishing import PersistentRiskStore
 
 _WORKER_COMPONENT_CACHE: dict[str, dict[str, Any]] = {}
 
