@@ -226,6 +226,334 @@ def _validate_replay_adoption(
         raise ValueError("route motion set does not cover any replay route revision")
 
 
+def validate_initial_candidates_and_adopted_motion(
+    *,
+    plan_sets_by_revision: Mapping[int, Mapping[str, Any]],
+    replay_routes: Sequence[Mapping[str, Any]],
+    route_motion_sets: Sequence[Mapping[str, Any]],
+    route_motion_candidate_sets: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Validate the Viewer ``initial-candidates-and-adopted`` motion strategy.
+
+    C emits two sibling transports with deliberately different scopes:
+
+    * the initial revision exposes all three full-voyage objectives so the
+      operator can choose a route before playback; and
+    * every replay revision that can become authoritative must have its
+      four-layer recommended ``RouteMotionSet``.
+
+    Every replay revision carries a candidate set.  Candidate sets for later
+    revisions are useful for the research comparison panel even though the
+    runtime chooser starts from the initial revision; their recommended record
+    must agree with the corresponding formal full-voyage record.  This prevents
+    a Viewer from showing one motion mode for a candidate card and silently
+    using a different motion source after adoption.
+
+    This function intentionally checks the producer's declared motion policy,
+    not a new safety policy: ``CURVE`` must be fully qualified by the C
+    contract, while ``RAW_PASSTHROUGH`` must retain an explicit producer
+    fallback reason.  RAW therefore remains truthful and usable as the
+    approved pre-production fallback; it is never upgraded to CURVE here.
+    """
+
+    if not plan_sets_by_revision:
+        raise ValueError("motion strategy has no v3 plan revisions")
+
+    revision_to_layer_set: dict[int, str] = {}
+    layer_set_to_revision: dict[str, int] = {}
+    for revision, plan_set in plan_sets_by_revision.items():
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise ValueError("motion strategy plan revision is invalid")
+        if not isinstance(plan_set, Mapping):
+            raise ValueError("motion strategy plan set is malformed")
+        if plan_set.get("schema_version") != "cd.four-layer-route-plan-set.v3":
+            raise ValueError("motion strategy plan set is not C v3")
+        layer_set_id = plan_set.get("layer_set_id")
+        if not isinstance(layer_set_id, str) or not layer_set_id:
+            raise ValueError("motion strategy plan layer_set_id is missing")
+        if revision in revision_to_layer_set or layer_set_id in layer_set_to_revision:
+            raise ValueError("motion strategy plan revisions or layer bindings are duplicated")
+        revision_to_layer_set[revision] = layer_set_id
+        layer_set_to_revision[layer_set_id] = revision
+
+    route_by_revision: dict[int, Mapping[str, Any]] = {}
+    for route in replay_routes:
+        if not isinstance(route, Mapping):
+            raise ValueError("motion strategy replay route is malformed")
+        revision = route.get("revision")
+        route_id = route.get("route_id")
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 1
+            or not isinstance(route_id, str)
+            or not route_id
+        ):
+            raise ValueError("motion strategy replay route identity is invalid")
+        if revision in route_by_revision:
+            raise ValueError("motion strategy replay route revisions are duplicated")
+        if revision not in revision_to_layer_set:
+            raise ValueError(f"motion strategy replay route revision is not published: {revision}")
+        route_by_revision[revision] = route
+    if not route_by_revision:
+        raise ValueError("motion strategy has no replay route revisions")
+
+    def _index_sets(
+        values: Sequence[Mapping[str, Any]],
+        *,
+        identity_field: str,
+        label: str,
+    ) -> dict[str, Mapping[str, Any]]:
+        indexed: dict[str, Mapping[str, Any]] = {}
+        for value in values:
+            if not isinstance(value, Mapping):
+                raise ValueError(f"{label} is malformed")
+            layer_set_id = value.get("layer_set_id")
+            artifact_id = value.get(identity_field)
+            if (
+                not isinstance(layer_set_id, str)
+                or layer_set_id not in layer_set_to_revision
+                or not isinstance(artifact_id, str)
+                or not artifact_id
+            ):
+                raise ValueError(f"{label} is not bound to a published plan revision")
+            if layer_set_id in indexed or artifact_id in {
+                item.get(identity_field) for item in indexed.values()
+            }:
+                raise ValueError(f"{label} identities or layer bindings are duplicated")
+            indexed[layer_set_id] = value
+        return indexed
+
+    motion_by_layer_set = _index_sets(
+        route_motion_sets,
+        identity_field="motion_set_id",
+        label="formal route motion set",
+    )
+    candidate_by_layer_set = _index_sets(
+        route_motion_candidate_sets,
+        identity_field="motion_candidate_set_id",
+        label="route motion candidate set",
+    )
+
+    expected_revisions = sorted(route_by_revision)
+    unexpected_motion_revisions = sorted(
+        layer_set_to_revision[layer_set_id]
+        for layer_set_id in motion_by_layer_set
+        if layer_set_to_revision[layer_set_id] not in expected_revisions
+    )
+    if unexpected_motion_revisions:
+        raise ValueError(
+            "formal route motion set has an unconsumed replay revision: "
+            + ", ".join(str(item) for item in unexpected_motion_revisions)
+        )
+    unexpected_candidate_revisions = sorted(
+        layer_set_to_revision[layer_set_id]
+        for layer_set_id in candidate_by_layer_set
+        if layer_set_to_revision[layer_set_id] not in expected_revisions
+    )
+    if unexpected_candidate_revisions:
+        raise ValueError(
+            "route motion candidate set has an unconsumed replay revision: "
+            + ", ".join(str(item) for item in unexpected_candidate_revisions)
+        )
+    missing_candidate_revisions = sorted(
+        set(expected_revisions)
+        - {layer_set_to_revision[layer_set_id] for layer_set_id in candidate_by_layer_set}
+    )
+    if missing_candidate_revisions:
+        missing_label = (
+            "initial route motion candidate set"
+            if min(expected_revisions) in missing_candidate_revisions
+            else "route motion candidate set"
+        )
+        raise ValueError(
+            f"{missing_label} is missing for replay revision: "
+            + ", ".join(str(item) for item in missing_candidate_revisions)
+        )
+
+    def _records(value: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        records = value.get("records")
+        if not isinstance(records, list):
+            raise ValueError("motion artifact records are missing")
+        if any(not isinstance(record, Mapping) for record in records):
+            raise ValueError("motion artifact records are malformed")
+        return list(records)
+
+    def _assert_declared_motion_policy(record: Mapping[str, Any], *, label: str) -> str:
+        mode = record.get("mode")
+        fallback_reason = record.get("fallback_reason")
+        qualification = record.get("qualification")
+        if not isinstance(qualification, Mapping):
+            raise ValueError(f"{label} qualification is missing")
+        result = qualification.get("result")
+        if mode == "CURVE":
+            if fallback_reason is not None or result != "QUALIFIED_ENGINEERING_REFERENCE":
+                raise ValueError(f"{label} CURVE qualification is incomplete")
+        elif mode == "RAW_PASSTHROUGH":
+            if not isinstance(fallback_reason, str) or not fallback_reason.strip():
+                raise ValueError(f"{label} RAW_PASSTHROUGH fallback reason is missing")
+            if result != "RAW_FALLBACK":
+                raise ValueError(f"{label} RAW_PASSTHROUGH qualification is inconsistent")
+        else:
+            raise ValueError(f"{label} has unsupported motion mode")
+        return str(mode)
+
+    def _record_for_layer(
+        value: Mapping[str, Any],
+        *,
+        planning_layer: str,
+        label: str,
+    ) -> Mapping[str, Any]:
+        matches = [
+            record
+            for record in _records(value)
+            if record.get("planning_layer") == planning_layer
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"{label} must contain exactly one {planning_layer} record")
+        return matches[0]
+
+    def _candidate_record(
+        value: Mapping[str, Any], *, objective: str, label: str
+    ) -> Mapping[str, Any]:
+        matches = [
+            item.get("record")
+            for item in _records(value)
+            if item.get("objective_mode") == objective
+            and isinstance(item.get("record"), Mapping)
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"{label} must contain exactly one {objective} record")
+        return matches[0]
+
+    # The initial candidate transport is the only source used by the runtime
+    # route chooser before playback.  Make its presence and revision explicit;
+    # a candidate set from an adopted revision must never become the initial
+    # chooser merely because it happened to be listed first.
+    initial_revision = min(expected_revisions)
+    initial_layer_set_id = revision_to_layer_set[initial_revision]
+    initial_candidates = candidate_by_layer_set.get(initial_layer_set_id)
+    if initial_candidates is None:
+        raise ValueError(
+            "initial route motion candidate set is missing for replay revision "
+            f"{initial_revision}"
+        )
+    initial_motion = motion_by_layer_set.get(initial_layer_set_id)
+    if initial_motion is None:
+        raise ValueError(
+            "initial formal route motion set is missing for replay revision "
+            f"{initial_revision}"
+        )
+
+    candidate_modes: dict[str, str] = {}
+    for objective in ("fastest", "low_risk", "recommended"):
+        record = _candidate_record(
+            initial_candidates,
+            objective=objective,
+            label="initial route motion candidate set",
+        )
+        candidate_modes[objective] = _assert_declared_motion_policy(
+            record,
+            label=f"initial candidate {objective}",
+        )
+
+    def _assert_recommended_pair(
+        motion_set: Mapping[str, Any],
+        candidate_set: Mapping[str, Any],
+        *,
+        revision: int,
+    ) -> None:
+        formal_record = _record_for_layer(
+            motion_set,
+            planning_layer="full_voyage",
+            label=f"formal route motion set R{revision}",
+        )
+        candidate_record = _candidate_record(
+            candidate_set,
+            objective="recommended",
+            label=f"route motion candidate set R{revision}",
+        )
+        _assert_declared_motion_policy(
+            formal_record,
+            label=f"adopted formal motion R{revision}",
+        )
+        _assert_declared_motion_policy(
+            candidate_record,
+            label=f"candidate recommended motion R{revision}",
+        )
+        for field in (
+            "plan_id",
+            "raw_route_digest",
+            "mode",
+            "fallback_reason",
+            "curve_digest",
+            "motion_digest",
+        ):
+            if formal_record.get(field) != candidate_record.get(field):
+                raise ValueError(
+                    f"R{revision} formal and candidate recommended motion differ: {field}"
+                )
+
+    _assert_recommended_pair(initial_motion, initial_candidates, revision=initial_revision)
+
+    adopted_motion: list[dict[str, Any]] = []
+    for revision in expected_revisions:
+        layer_set_id = revision_to_layer_set[revision]
+        motion_set = motion_by_layer_set.get(layer_set_id)
+        if motion_set is None:
+            raise ValueError(
+                "formal route motion set is missing for replay revision "
+                f"{revision}"
+            )
+        route = route_by_revision[revision]
+        route_id = route["route_id"]
+        records = _records(motion_set)
+        matching = [record for record in records if record.get("plan_id") == route_id]
+        if len(matching) != 1:
+            raise ValueError(
+                f"formal route motion set R{revision} does not bind replay route {route_id}"
+            )
+        mode = _assert_declared_motion_policy(
+            matching[0],
+            label=f"adopted formal motion R{revision}",
+        )
+        if revision != initial_revision:
+            adopted_motion.append(
+                {
+                    "revision": revision,
+                    "layer_set_id": layer_set_id,
+                    "plan_id": route_id,
+                    "mode": mode,
+                    "fallback_reason": matching[0].get("fallback_reason"),
+                }
+            )
+
+        candidate_set = candidate_by_layer_set[layer_set_id]
+        _assert_recommended_pair(
+            candidate_set=candidate_set,
+            motion_set=motion_set,
+            revision=revision,
+        )
+
+    return {
+        "strategy": "initial_candidates_and_adopted_revisions",
+        "initial_revision": initial_revision,
+        "initial_layer_set_id": initial_layer_set_id,
+        "initial_candidate_set_id": initial_candidates.get("motion_candidate_set_id"),
+        "candidate_revisions": sorted(
+            layer_set_to_revision[layer_set_id] for layer_set_id in candidate_by_layer_set
+        ),
+        "motion_revisions": expected_revisions,
+        "candidate_modes": candidate_modes,
+        "initial_motion_mode": _record_for_layer(
+            initial_motion,
+            planning_layer="full_voyage",
+            label=f"formal route motion set R{initial_revision}",
+        ).get("mode"),
+        "adopted_motion": adopted_motion,
+    }
+
+
 def _validate_optional_qualification_evidence(
     motion_location: Path,
     *,
@@ -335,5 +663,6 @@ def _shift_iso(value: object, offset_seconds: float) -> str | None:
 __all__ = [
     "load_bound_route_motion_candidate_set",
     "load_bound_route_motion_set",
+    "validate_initial_candidates_and_adopted_motion",
     "validate_route_motion_context",
 ]

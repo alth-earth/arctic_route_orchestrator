@@ -39,7 +39,16 @@ def validate_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     ):
         violations.append("max_source_issue_time > knowledge_as_of")
     prediction_as_of = risk.get("prediction_as_of")
-    if prediction_as_of and _parse_utc(prediction_as_of) > knowledge_as_of:
+    # A retrospective post-hoc projection may consume a RiskWindow produced
+    # after the replay's frozen visibility cutoff.  That is precisely why the
+    # snapshot is labelled retrospective rather than causal.  Keep the strict
+    # prediction/knowledge ordering for causal replay, while allowing the
+    # later producer timestamp in retrospective mode to remain truthful.
+    if (
+        mode == "causal_replay"
+        and prediction_as_of
+        and _parse_utc(prediction_as_of) > knowledge_as_of
+    ):
         violations.append("prediction_as_of > knowledge_as_of")
     planning_as_of = planning.get("planning_as_of")
     if planning_as_of and _parse_utc(planning_as_of) > knowledge_as_of:

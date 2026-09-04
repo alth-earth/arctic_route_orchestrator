@@ -63,15 +63,19 @@ def _child_result(
     cache_key = (
         f"{commit_id}:{commit.get('config_digest', '')}:"
         f"{commit.get('model_config_digest', '')}:"
-        f"{paths['c_config_root']}:{paths['contracts_config_root']}"
+        f"{paths['c_config_root']}:{paths['contracts_config_root']}:"
+        f"{paths.get('planner_name', 'default')}:"
+        f"{paths.get('replanning_name', 'default')}:"
+        f"{paths.get('planner_config_digest', '')}"
     )
     cached = _WORKER_COMPONENT_CACHE.get(cache_key)
     if cached is None:
-        configuration = load_configuration(
-            paths["c_config_root"],
-            commit["scenario_id"],
-            shared_config_root=Path(paths["contracts_config_root"]),
-        )
+        configuration = _load_worker_configuration(paths, commit["scenario_id"])
+        expected_digest = paths.get("planner_config_digest")
+        if expected_digest and configuration.planner_config_digest != expected_digest:
+            raise RuntimeError(
+                "worker planner configuration digest differs from replay parent"
+            )
         from arctic_route_planning.contracts import RiskWindowQuery
 
         query = RiskWindowQuery(
@@ -227,6 +231,27 @@ def _result_from_dict(document: dict[str, Any]) -> PlanningResult:
             reopened_states=metrics["reopened_states"],
             max_time_index=metrics["max_time_index"],
         ),
+    )
+
+
+def _load_worker_configuration(
+    paths: dict[str, str],
+    scenario_id: str,
+):
+    """Load the exact named C profiles selected by the replay parent.
+
+    ``paths`` is a serialized worker envelope, not a filesystem-only
+    structure.  Keeping the selectors in that envelope prevents persistent
+    workers from silently falling back to ``default`` when a replay requests a
+    dedicated Winter planner or replanning policy.
+    """
+
+    return load_configuration(
+        paths["c_config_root"],
+        scenario_id,
+        shared_config_root=Path(paths["contracts_config_root"]),
+        planner_name=paths.get("planner_name", "default"),
+        replanning_name=paths.get("replanning_name", "default"),
     )
 
 
@@ -390,6 +415,9 @@ def install(
     max_snap_km: float = 30.0,
     timeout_seconds: int = 900,
     pool_mode: str = "persistent",
+    planner_name: str = "default",
+    replanning_name: str = "default",
+    planner_config_digest: str | None = None,
 ) -> Iterator[None]:
     """Temporarily route C objective searches through worker processes."""
 
@@ -404,6 +432,9 @@ def install(
         "c_config_root": str(c_config_root),
         "contracts_config_root": str(contracts_config_root),
         "max_snap_km": str(max_snap_km),
+        "planner_name": planner_name,
+        "replanning_name": replanning_name,
+        "planner_config_digest": planner_config_digest or "",
     }
     previous_private_planner = PreparedRiskPlanning._private_planner
     previous_paths = _active_paths

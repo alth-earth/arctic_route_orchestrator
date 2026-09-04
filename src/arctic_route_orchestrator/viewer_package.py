@@ -345,6 +345,17 @@ def _finalize_and_validate_package(
         ),
         "route motion candidate binding list drifted",
     )
+    motion_layer_set_ids = {
+        item.get("layer_set_id") for item in motion_sets if isinstance(item, dict)
+    }
+    candidate_layer_set_ids = {
+        item.get("layer_set_id") for item in motion_candidates if isinstance(item, dict)
+    }
+    _require(
+        len(motion_candidates) == len(motion_sets)
+        and candidate_layer_set_ids == motion_layer_set_ids,
+        "route motion candidate sets must cover every formal motion revision",
+    )
     _require(
         manifest.get("formal_motion_required") is True,
         "Viewer manifest must require formal motion",

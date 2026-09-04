@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
 from arctic_route_orchestrator.replay.models import (
     DataVisibilitySummary,
     PlanningStateSummary,
@@ -10,6 +13,10 @@ from arctic_route_orchestrator.replay.models import (
     ReplayManifest,
     RiskStateSummary,
     SimulationSnapshot,
+)
+from arctic_route_orchestrator.replay.runner import (
+    ReplayRunner,
+    _configuration_audit,
 )
 
 
@@ -88,3 +95,78 @@ def test_manifest_shape() -> None:
     document = manifest.to_dict()
     assert document["semantic_digest"]
     assert document["snapshot_count"] == 1
+
+
+@dataclass(frozen=True)
+class _PlannerProfile:
+    schema_version: str = "planner-config.v1"
+    operational_speed_reserve_fraction: float = 0.05
+
+
+@dataclass(frozen=True)
+class _ReplanningProfile:
+    schema_version: str = "replanning-config.v1"
+    route_switch_gain_threshold: float = 0.01
+
+
+@dataclass(frozen=True)
+class _Configuration:
+    planner_config_digest: str = "a" * 64
+    planner: _PlannerProfile = _PlannerProfile()
+    replanning: _ReplanningProfile = _ReplanningProfile()
+
+
+def test_configuration_audit_contains_named_profiles_and_no_paths() -> None:
+    document = _configuration_audit(
+        _Configuration(),
+        planner_name="winter_motion_reserve_5pct",
+        replanning_name="winter_viewer_dynamic",
+    )
+
+    assert document == {
+        "planner_name": "winter_motion_reserve_5pct",
+        "replanning_name": "winter_viewer_dynamic",
+        "planner_config_digest": "a" * 64,
+        "planner": {
+            "schema_version": "planner-config.v1",
+            "operational_speed_reserve_fraction": 0.05,
+        },
+        "replanning": {
+            "schema_version": "replanning-config.v1",
+            "route_switch_gain_threshold": 0.01,
+        },
+    }
+    assert not any("/" in str(value) for value in document.values())
+
+
+def test_checkpoint_configuration_mismatch_is_fail_closed(tmp_path) -> None:
+    runner = ReplayRunner(
+        replay_id="test",
+        scenario_id="s",
+        corridor_id="c",
+        replay_start=datetime(2026, 2, 15, tzinfo=UTC),
+        replay_end=datetime(2026, 2, 15, 1, tzinfo=UTC),
+        tick_cadence_hours=1,
+        a_data_root=tmp_path,
+        manifest_path=tmp_path / "manifest.sqlite3",
+        b_config_path=tmp_path / "b.json",
+        c_config_root=tmp_path / "c-config",
+        contracts_config_root=tmp_path / "contracts-config",
+        frozen_run_context_path=tmp_path / "run-context.json",
+        planner_name="winter_motion_reserve_5pct",
+        replanning_name="winter_viewer_dynamic",
+    )
+    runner.configuration = _Configuration()
+
+    try:
+        runner._validate_checkpoint_configuration(
+            {
+                "planner_name": "default",
+                "replanning_name": "winter_viewer_dynamic",
+                "planner_config_digest": "a" * 64,
+            }
+        )
+    except ValueError as exc:
+        assert "planner_name" in str(exc)
+    else:  # pragma: no cover - assertion makes a silent acceptance impossible
+        raise AssertionError("configuration mismatch was accepted")

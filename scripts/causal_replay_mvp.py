@@ -90,6 +90,22 @@ def main(argv: list[str] | None = None) -> int:
         default=_workspace_root() / "work_package_c" / "configs",
     )
     parser.add_argument(
+        "--planner-name",
+        default="default",
+        help=(
+            "named C planner TOML profile under c-config-root/planner; "
+            "the selected name is propagated to every replay worker"
+        ),
+    )
+    parser.add_argument(
+        "--replanning-name",
+        default="default",
+        help=(
+            "named C replanning TOML profile under c-config-root/replanning; "
+            "the selected name is propagated to every replay worker"
+        ),
+    )
+    parser.add_argument(
         "--contracts-config-root",
         type=Path,
         default=_workspace_root() / "arctic_route_contracts" / "configs",
@@ -163,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
         manifest_path=args.manifest,
         b_config_path=args.b_config,
         c_config_root=args.c_config_root,
+        planner_name=args.planner_name,
+        replanning_name=args.replanning_name,
         contracts_config_root=args.contracts_config_root,
         frozen_run_context_path=args.frozen_run_context,
         frozen_dataset_bundle_path=args.frozen_dataset_bundle,

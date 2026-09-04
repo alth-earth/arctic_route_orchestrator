@@ -23,6 +23,7 @@ from arctic_route_orchestrator.output import publish_output_directory
 from arctic_route_orchestrator.route_motion import (
     load_bound_route_motion_candidate_set,
     load_bound_route_motion_set,
+    validate_initial_candidates_and_adopted_motion,
     validate_route_motion_context,
 )
 from arctic_route_orchestrator.route_presentation import project_runtime_route_candidates
@@ -298,6 +299,54 @@ def test_formal_motion_binds_risk_window_and_vessel_context(tmp_path) -> None:
         validate_route_motion_context(
             document,
             **{**expected, "vessel_profile_version": "stale"},
+        )
+
+
+def test_initial_candidates_and_adopted_motion_requires_initial_candidate_set() -> None:
+    plan_set = _plan_set()
+    plan_document = four_layer_route_plan_set_to_dict(plan_set)
+    formal = build_route_motion_set(
+        plan_set,
+        risk_window_id="risk-window-fixture",
+        risk_window_digest="2" * 64,
+        vessel_profile_digest="3" * 64,
+        producer_digest="4" * 64,
+        generated_at=plan_set.generated_at,
+    )
+    candidate = build_route_motion_candidate_set(
+        plan_set,
+        risk_window_id="risk-window-fixture",
+        risk_window_digest="2" * 64,
+        vessel_profile_digest="3" * 64,
+        producer_digest="4" * 64,
+        generated_at=plan_set.generated_at,
+    )
+    route = {
+        "revision": 1,
+        "route_id": plan_set.recommended.plan_id,
+        "effective_adoption_time": plan_set.recommended.waypoints[0].eta.isoformat().replace(
+            "+00:00", "Z"
+        ),
+    }
+    summary = validate_initial_candidates_and_adopted_motion(
+        plan_sets_by_revision={1: plan_document},
+        replay_routes=[route],
+        route_motion_sets=[route_motion_set_to_dict(formal)],
+        route_motion_candidate_sets=[route_motion_candidate_set_to_dict(candidate)],
+    )
+    assert summary["initial_revision"] == 1
+    assert summary["candidate_modes"] == {
+        "fastest": "RAW_PASSTHROUGH",
+        "low_risk": "RAW_PASSTHROUGH",
+        "recommended": "RAW_PASSTHROUGH",
+    }
+
+    with pytest.raises(ValueError, match="initial route motion candidate set"):
+        validate_initial_candidates_and_adopted_motion(
+            plan_sets_by_revision={1: plan_document},
+            replay_routes=[route],
+            route_motion_sets=[route_motion_set_to_dict(formal)],
+            route_motion_candidate_sets=[],
         )
 
 

@@ -89,6 +89,21 @@ def test_retrospective_snapshot_allows_later_fixed_knowledge_cutoff() -> None:
     assert any("retrospective knowledge_as_of" in item for item in result["violations"])
 
 
+def test_retrospective_snapshot_allows_posthoc_prediction_timestamp() -> None:
+    document = _snapshot_document("2026-02-15T10:00:00Z", 0)
+    document["scenario_mode"] = "retrospective_dynamic_replay"
+    document["knowledge_as_of"] = "2026-09-02T17:20:41.878201Z"
+    document["risk"]["prediction_as_of"] = "2026-09-03T00:00:00Z"
+    document["snapshot_digest"] = replay_semantic_digest(
+        {key: value for key, value in document.items() if key != "snapshot_digest"}
+    )
+
+    result = validate_snapshot(document)
+
+    assert result["status"] == "PASS"
+    assert result["violations"] == []
+
+
 def test_monotonic_sequence_passes_and_backwards_fails() -> None:
     documents = [
         _snapshot_document("2026-08-15T10:00:00Z", 0),

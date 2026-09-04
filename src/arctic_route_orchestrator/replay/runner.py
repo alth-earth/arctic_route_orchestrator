@@ -27,8 +27,9 @@ import traceback
 from collections import Counter
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -139,6 +140,14 @@ def _iso(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _parse_optional_utc(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("optional UTC timestamp must be a non-empty string")
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+
+
 def _atomic_write(path: Path, payload: str) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(payload, encoding="utf-8")
@@ -200,6 +209,11 @@ class ReplayRunner:
     c_config_root: Path
     contracts_config_root: Path
     frozen_run_context_path: Path
+    # Explicit named C profiles.  Defaults preserve the historical CLI/API
+    # behaviour while allowing a replay package to prove which planner and
+    # switch policy every process used.
+    planner_name: str = "default"
+    replanning_name: str = "default"
     frozen_dataset_bundle_path: Path | None = None
     frozen_risk_store_root: Path | None = None
     frozen_risk_commit_id: str | None = None
@@ -329,6 +343,8 @@ class ReplayRunner:
             self.c_config_root,
             self.scenario_id,
             shared_config_root=self.contracts_config_root,
+            planner_name=self.planner_name,
+            replanning_name=self.replanning_name,
         )
         if self.replay_mode == "retrospective_dynamic_replay":
             self._knowledge_as_of = max(
@@ -368,7 +384,21 @@ class ReplayRunner:
             self._restore(checkpoint)
         tick = self.replay_start + timedelta(hours=start_index * self.tick_cadence_hours)
         index = start_index
-        previous_visible: tuple[SourceRecord, ...] = ()
+        if start_index:
+            previous_tick = self.replay_start + timedelta(
+                hours=(start_index - 1) * self.tick_cadence_hours
+            )
+            previous_visible = (
+                self.records
+                if self.replay_mode == "retrospective_dynamic_replay"
+                else tuple(
+                    record
+                    for record in self.records
+                    if record.issue_time <= previous_tick
+                )
+            )
+        else:
+            previous_visible = ()
         while tick <= self.replay_end:
             tick_started = time.perf_counter()
             visible = (
@@ -645,6 +675,11 @@ class ReplayRunner:
                     else None
                 ),
                 "c_objective_parallelism": self.planning_parallelism,
+                "configuration": _configuration_audit(
+                    self.configuration,
+                    planner_name=self.planner_name,
+                    replanning_name=self.replanning_name,
+                ),
             },
         )
         _write_json(self.paths.manifest_path, manifest.to_dict())
@@ -690,6 +725,11 @@ class ReplayRunner:
                 else None
             ),
             "c_objective_parallelism": self.planning_parallelism,
+            "configuration": _configuration_audit(
+                self.configuration,
+                planner_name=self.planner_name,
+                replanning_name=self.replanning_name,
+            ),
             "route_semantic_digests": self.route_semantic_digests,
             "events": [event.to_dict() for event in self.events],
             "total_elapsed_seconds": round(time.perf_counter() - started, 1),
@@ -1107,6 +1147,9 @@ class ReplayRunner:
             max_snap_km=self.max_snap_km,
             timeout_seconds=self.c_attempt_timeout_seconds,
             pool_mode=self.parallel_pool_mode,
+            planner_name=self.planner_name,
+            replanning_name=self.replanning_name,
+            planner_config_digest=self.configuration.planner_config_digest,
         ):
             operation(tick, events)
             # ``install`` restores the parent's global state on exit.  Capture
@@ -1280,6 +1323,23 @@ class ReplayRunner:
             self.last_replan_reasons = ()
             return
         origin = adoption_spec["origin_node"]
+        # A deferred replan can reach the final route edge before the next
+        # observation tick.  The next waypoint is then the authoritative goal
+        # node; asking C to plan from goal to goal violates the planning
+        # request contract and cannot produce a meaningful replan.  Let the
+        # current route finish and keep the event stream honest.
+        if origin == self.endpoint_mapping.goal.node:
+            events.append(
+                ReplayEvent(
+                    type="PLAN_REUSED",
+                    simulation_time=_iso(tick),
+                    revision=str(self.plan_revision),
+                    description="vessel is on final edge; no further replan origin",
+                    observed=True,
+                )
+            )
+            self.last_replan_reasons = ()
+            return
         self.observation_sequence += 1
         self.input_revision = self.observation_sequence
         request = self._planning_request(
@@ -2421,11 +2481,45 @@ class ReplayRunner:
                 "current_plan_set_resource": self._current_plan_set_resource,
                 "pending_plan_set_resource": self._pending_plan_set_resource,
                 "superseded_plan_set_resource": self._superseded_plan_set_resource,
+                "plan_kind": self.plan_kind,
+                "supported_layers": list(self.supported_layers),
+                "unsupported_layers": list(self.unsupported_layers),
+                "planning_blockers": list(self.planning_blockers),
+                "pending_plan_kind": self.pending_plan_kind,
+                "pending_decision_time": (
+                    _iso(self.pending_decision_time)
+                    if self.pending_decision_time is not None
+                    else None
+                ),
+                "pending_adoption_time": (
+                    _iso(self.pending_adoption_time)
+                    if self.pending_adoption_time is not None
+                    else None
+                ),
+                "pending_revision": self.pending_revision,
+                "pending_origin_node": (
+                    list(self.pending_origin_node)
+                    if self.pending_origin_node is not None
+                    else None
+                ),
+                "pending_origin_adjustment_km": self.pending_origin_adjustment_km,
+                "pending_decision_position": self.pending_decision_position,
+                "last_visible_digest": self._last_visible_digest,
+                "last_relevant_digest": self._last_relevant_digest,
+                "last_data_revision": self._last_data_revision,
                 "c_objective_parallelism": self.planning_parallelism,
+                "planner_name": self.planner_name,
+                "replanning_name": self.replanning_name,
+                "planner_config_digest": (
+                    self.configuration.planner_config_digest
+                    if self.configuration is not None
+                    else None
+                ),
             },
         )
 
     def _restore(self, checkpoint: dict[str, Any]) -> None:
+        self._validate_checkpoint_configuration(checkpoint)
         self.data_revision = int(checkpoint.get("data_revision", 0))
         self.b_input_revision = int(checkpoint.get("b_input_revision", 0))
         self.risk_revision = int(checkpoint.get("risk_revision", 0))
@@ -2488,24 +2582,182 @@ class ReplayRunner:
             if isinstance(superseded_resource, dict)
             else None
         )
+        self.plan_kind = str(checkpoint.get("plan_kind", ""))
+        self.supported_layers = tuple(checkpoint.get("supported_layers", ()))
+        self.unsupported_layers = tuple(
+            checkpoint.get(
+                "unsupported_layers",
+                (
+                    "executable_0_6h",
+                    "rolling_0_24h",
+                    "main_corridor_24_72h",
+                    "full_voyage",
+                ),
+            )
+        )
+        self.planning_blockers = tuple(checkpoint.get("planning_blockers", ()))
+        self.pending_plan_kind = str(checkpoint.get("pending_plan_kind", ""))
+        self.pending_decision_time = _parse_optional_utc(
+            checkpoint.get("pending_decision_time")
+        )
+        self.pending_adoption_time = _parse_optional_utc(
+            checkpoint.get("pending_adoption_time")
+        )
+        self.pending_revision = int(checkpoint.get("pending_revision", 0))
+        pending_origin = checkpoint.get("pending_origin_node")
+        self.pending_origin_node = (
+            (int(pending_origin[0]), int(pending_origin[1]))
+            if pending_origin is not None
+            else None
+        )
+        self.pending_origin_adjustment_km = checkpoint.get(
+            "pending_origin_adjustment_km"
+        )
+        pending_position = checkpoint.get("pending_decision_position")
+        self.pending_decision_position = (
+            dict(pending_position) if isinstance(pending_position, dict) else None
+        )
         parallelism = checkpoint.get("c_objective_parallelism")
         self.planning_parallelism = (
             dict(parallelism) if isinstance(parallelism, dict) else {}
         )
-        self.pending_plan = None
-        self.pending_plan_set = None
-        self.pending_plan_kind = ""
-        self.pending_decision_time = None
-        self.pending_adoption_time = None
-        self.pending_revision = 0
-        self.pending_origin_node = None
-        self.pending_origin_adjustment_km = None
-        self.pending_decision_position = None
-        self._last_visible_digest = ""
-        self._last_relevant_digest = ""
-        self._last_data_revision = 0
+        self._last_visible_digest = str(checkpoint.get("last_visible_digest", ""))
+        self._last_relevant_digest = str(checkpoint.get("last_relevant_digest", ""))
+        self._last_data_revision = int(
+            checkpoint.get("last_data_revision", self.data_revision)
+        )
         self._initial_plan_attempted = int(checkpoint.get("plan_revision", 0)) > 0
+        self._restore_plan_objects()
+        self._restore_history()
         self._restore_runtime(checkpoint)
+
+    def _restore_plan_objects(self) -> None:
+        """Reload current/pending C plan sets referenced by a checkpoint."""
+
+        from arctic_route_planning.publishing import four_layer_route_plan_set_from_dict
+
+        def load_resource(resource: dict[str, Any] | None):
+            if resource is None:
+                return None
+            relative_value = resource.get("resource")
+            if not isinstance(relative_value, str):
+                raise ValueError("checkpoint plan resource path is invalid")
+            relative = Path(relative_value)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("checkpoint plan resource path is unsafe")
+            root = self.paths.output_root.resolve()
+            path = (root / relative).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError as exc:
+                raise ValueError("checkpoint plan resource escapes replay root") from exc
+            if not path.is_file():
+                raise ValueError(f"checkpoint plan resource is missing: {relative}")
+            document = json.loads(path.read_text(encoding="utf-8"))
+            expected_digest = resource.get("digest")
+            if expected_digest is not None and canonical_sha256(document) != expected_digest:
+                raise ValueError(f"checkpoint plan resource digest mismatch: {relative}")
+            return four_layer_route_plan_set_from_dict(document)
+
+        self.current_plan_set = load_resource(self._current_plan_set_resource)
+        self.current_plan = (
+            self.current_plan_set.recommended
+            if self.current_plan_set is not None
+            else None
+        )
+        self.pending_plan_set = load_resource(self._pending_plan_set_resource)
+        self.pending_plan = (
+            self.pending_plan_set.recommended
+            if self.pending_plan_set is not None
+            else None
+        )
+
+    def _restore_history(self) -> None:
+        """Reload completed snapshot index entries and their event history."""
+
+        checkpoint = json.loads(self.paths.checkpoint_path.read_text(encoding="utf-8"))
+        completed = int(checkpoint.get("last_completed_tick", -1))
+        self.snapshots = []
+        self.events = []
+        last_document: dict[str, Any] | None = None
+        for index in range(completed + 1):
+            path = self.paths.snapshots_dir / f"{index:04d}.json"
+            if not path.is_file():
+                raise ValueError(f"checkpoint snapshot is missing: {path.name}")
+            document = json.loads(path.read_text(encoding="utf-8"))
+            last_document = document
+            if document.get("snapshot_index") != index:
+                raise ValueError(f"checkpoint snapshot index mismatch: {path.name}")
+            digest = document.get("snapshot_digest")
+            if not isinstance(digest, str) or not digest:
+                raise ValueError(f"checkpoint snapshot digest is missing: {path.name}")
+            self.snapshots.append(
+                {
+                    "index": index,
+                    "simulation_time": document.get("simulation_time"),
+                    "resource": f"snapshots/{index:04d}.json",
+                    "digest": digest,
+                }
+            )
+            for event in document.get("events", ()):
+                if isinstance(event, dict):
+                    self.events.append(
+                        ReplayEvent(
+                            type=str(event.get("type", "")),
+                            simulation_time=str(event.get("simulation_time", "")),
+                            revision=event.get("revision"),
+                            description=str(event.get("description", "")),
+                            observed=bool(event.get("observed", False)),
+                        )
+                    )
+
+        if last_document is not None:
+            visibility = last_document.get("visibility") or {}
+            if not self._last_visible_digest:
+                self._last_visible_digest = str(
+                    visibility.get("visible_record_set_digest", "")
+                )
+            if not self._last_relevant_digest:
+                self._last_relevant_digest = str(
+                    visibility.get("b_relevant_input_digest", "")
+                )
+            if "last_data_revision" not in checkpoint:
+                self._last_data_revision = int(
+                    visibility.get("data_revision", self.data_revision)
+                )
+
+    def _validate_checkpoint_configuration(self, checkpoint: dict[str, Any]) -> None:
+        """Reject resuming a replay with a different named C configuration.
+
+        Older checkpoints predate explicit profile provenance and are accepted
+        when these fields are absent.  Once present, names and the resolved
+        content digest are immutable replay inputs; silently resuming with a
+        changed planner would make the revision/event history unauditable.
+        """
+
+        mismatches: list[str] = []
+        checkpoint_planner = checkpoint.get("planner_name")
+        if checkpoint_planner is not None and checkpoint_planner != self.planner_name:
+            mismatches.append("planner_name")
+        checkpoint_replanning = checkpoint.get("replanning_name")
+        if (
+            checkpoint_replanning is not None
+            and checkpoint_replanning != self.replanning_name
+        ):
+            mismatches.append("replanning_name")
+        checkpoint_digest = checkpoint.get("planner_config_digest")
+        current_digest = (
+            self.configuration.planner_config_digest
+            if self.configuration is not None
+            else None
+        )
+        if checkpoint_digest is not None and checkpoint_digest != current_digest:
+            mismatches.append("planner_config_digest")
+        if mismatches:
+            raise ValueError(
+                "replay checkpoint configuration mismatch: "
+                + ", ".join(mismatches)
+            )
 
     def _restore_runtime(self, checkpoint: dict[str, Any]) -> None:
         """Re-attach committed risk store and C endpoints after a restart."""
@@ -2532,6 +2784,7 @@ class ReplayRunner:
         self.risk_valid_start = window.start
         self.risk_valid_end = window.end
         self.prediction_as_of = window.as_of
+        self._model_config_digest = window.model_config_digest
         self.ingress = RiskSourcePlanningIngress(
             source=store,
             configuration=self.configuration,
@@ -2646,6 +2899,62 @@ def _default_output_root(replay_id: str) -> Path:
 def _replay_run_id(replay_id: str) -> str:
     suffix = hashlib.sha256(replay_id.encode("utf-8")).hexdigest()[:12]
     return f"run-00000000-0000-4000-8000-{suffix}"
+
+
+def _json_safe_configuration(value: Any) -> Any:
+    """Serialize a C configuration without leaking filesystem locations.
+
+    Planner and replanning TOML profiles contain only scalar values and cost
+    weights, but walking dataclasses explicitly keeps this audit record stable
+    if a future profile adds an enum or nested dataclass.  This helper is
+    intentionally limited to configuration values; callers never pass paths,
+    credentials, or runtime objects here.
+    """
+
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value):
+        return {
+            item.name: _json_safe_configuration(getattr(value, item.name))
+            for item in fields(value)
+        }
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe_configuration(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_configuration(item) for item in value]
+    return value
+
+
+def _configuration_audit(
+    configuration: Any,
+    *,
+    planner_name: str,
+    replanning_name: str,
+) -> dict[str, Any]:
+    """Return portable, content-addressed C profile provenance.
+
+    Names are the only profile selectors written to replay artifacts.  The
+    resolved values and planner digest make the worker/profile choice
+    independently auditable without embedding the build machine's config
+    root path.
+    """
+
+    result: dict[str, Any] = {
+        "planner_name": planner_name,
+        "replanning_name": replanning_name,
+        "planner_config_digest": None,
+        "planner": None,
+        "replanning": None,
+    }
+    if configuration is None:
+        return result
+    result["planner_config_digest"] = configuration.planner_config_digest
+    result["planner"] = _json_safe_configuration(configuration.planner)
+    result["replanning"] = _json_safe_configuration(configuration.replanning)
+    return result
 
 
 def _corridor_bbox(configuration) -> tuple[float, float, float, float]:
