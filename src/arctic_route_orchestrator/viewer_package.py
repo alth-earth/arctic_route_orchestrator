@@ -205,6 +205,10 @@ def _write_json(path: Path, value: object) -> None:
 
 
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+_MOTION_TRANSPORT_NAME = re.compile(r"^route-motion-set-r[1-9][0-9]*\.json$")
+_CANDIDATE_MOTION_TRANSPORT_NAME = re.compile(
+    r"^route-motion-candidate-set-r[1-9][0-9]*\.json$"
+)
 
 
 def _require_portable_json_value(value: object, *, location: str = "$") -> None:
@@ -216,10 +220,12 @@ def _require_portable_json_value(value: object, *, location: str = "$") -> None:
     elif isinstance(value, list):
         for index, item in enumerate(value):
             _require_portable_json_value(item, location=f"{location}[{index}]")
-    elif isinstance(value, str) and (
-        value.startswith(("/", "file://")) or _WINDOWS_ABSOLUTE_PATH.match(value)
-    ):
-        raise ValueError(f"Viewer metadata contains a build-host absolute path at {location}")
+    elif isinstance(value, str):
+        normalized = value.replace("\\", "/")
+        if value.startswith(("/", "file://")) or _WINDOWS_ABSOLUTE_PATH.match(value):
+            raise ValueError(f"Viewer metadata contains a build-host absolute path at {location}")
+        if normalized == ".." or normalized.startswith("../") or "/../" in normalized:
+            raise ValueError(f"Viewer metadata contains an unsafe parent path at {location}")
 
 
 def _finalize_and_validate_package(
@@ -258,6 +264,172 @@ def _finalize_and_validate_package(
                 item["path"] = Path(item["path"]).name
     _write_json(package_dir / "winter-combined-viewer-manifest.json", manifest)
     _write_json(package_dir / "publish-summary.json", summary)
+
+    # A current-standard package must carry the additive C motion candidate
+    # transport.  Without it the Viewer can render cards but cannot validate
+    # or lock the selected runtime route.  The exporter already validates the
+    # detailed bindings; this finalizer makes the requirement fail-closed at
+    # the immutable package boundary as well.
+    presentation = bundle.get("combined_presentation") or {}
+    candidates = bundle.get("route_candidates") or {}
+    motion = bundle.get("formal_motion_inspection") or {}
+    motion_sets = bundle.get("route_motion_sets")
+    _require(
+        isinstance(motion_sets, list) and motion_sets,
+        "Viewer must contain formal route motion sets",
+    )
+    motion_set_ids = []
+    for item in motion_sets:
+        _require(isinstance(item, dict), "formal route motion set is malformed")
+        _require(
+            item.get("schema_version") == "cd.route-motion-set.v1",
+            "unsupported formal route motion set schema",
+        )
+        motion_set_id = item.get("motion_set_id")
+        _require(
+            isinstance(motion_set_id, str) and motion_set_id,
+            "formal route motion identity is missing",
+        )
+        motion_set_ids.append(motion_set_id)
+    _require(
+        len(set(motion_set_ids)) == len(motion_set_ids),
+        "formal route motion identities are duplicated",
+    )
+    _require(
+        presentation.get("route_motion_set_ids") == motion_set_ids,
+        "formal route motion identity binding drifted",
+    )
+    motion_bindings = presentation.get("route_motion_set_bindings")
+    _require(
+        isinstance(motion_bindings, list) and len(motion_bindings) == len(motion_set_ids),
+        "formal route motion bindings are missing",
+    )
+    _require(
+        all(
+            isinstance(item, dict) and item.get("motion_set_id") == expected
+            for item, expected in zip(motion_bindings, motion_set_ids, strict=True)
+        ),
+        "formal route motion binding list drifted",
+    )
+    motion_candidates = bundle.get("route_motion_candidate_sets")
+    _require(
+        isinstance(motion_candidates, list) and motion_candidates,
+        "Viewer must contain route motion candidate sets",
+    )
+    candidate_ids = []
+    for item in motion_candidates:
+        _require(isinstance(item, dict), "route motion candidate set is malformed")
+        _require(
+            item.get("schema_version") == "cd.route-motion-candidate-set.v1",
+            "unsupported route motion candidate set schema",
+        )
+        candidate_id = item.get("motion_candidate_set_id")
+        _require(
+            isinstance(candidate_id, str) and candidate_id,
+            "route motion candidate identity is missing",
+        )
+        candidate_ids.append(candidate_id)
+    _require(
+        len(set(candidate_ids)) == len(candidate_ids),
+        "route motion candidate identities are duplicated",
+    )
+    bound_ids = presentation.get("route_motion_candidate_set_ids")
+    _require(bound_ids == candidate_ids, "route motion candidate identity binding drifted")
+    bindings = presentation.get("route_motion_candidate_set_bindings")
+    _require(isinstance(bindings, list), "route motion candidate bindings are missing")
+    _require(
+        len(bindings) == len(candidate_ids)
+        and all(
+            isinstance(item, dict) and item.get("motion_candidate_set_id") == expected
+            for item, expected in zip(bindings, candidate_ids, strict=True)
+        ),
+        "route motion candidate binding list drifted",
+    )
+    _require(
+        manifest.get("formal_motion_required") is True,
+        "Viewer manifest must require formal motion",
+    )
+    _require(
+        manifest.get("route_motion_candidate_sets") == len(motion_candidates),
+        "Viewer manifest route motion candidate count drifted",
+    )
+
+    transport = manifest.get("transport_files")
+    _require(isinstance(transport, dict), "Viewer manifest transport_files is missing")
+
+    plan_name = transport.get("plan_set")
+    _require(
+        plan_name == "four-layer-route-plan-set-v3.json"
+        and (package_dir / plan_name).is_file(),
+        "Viewer manifest plan-set transport is missing or unsafe",
+    )
+
+    def _transport_names(key: str, pattern: re.Pattern[str]) -> list[str]:
+        value = transport.get(key)
+        _require(isinstance(value, list), f"Viewer manifest transport_files.{key} is malformed")
+        names: list[str] = []
+        for name in value:
+            _require(
+                isinstance(name, str)
+                and Path(name).name == name
+                and "\\" not in name
+                and "/" not in name,
+                f"unsafe Viewer transport entry: {name}",
+            )
+            _require(name not in {"", ".", ".."}, f"unsafe Viewer transport entry: {name}")
+            _require(
+                pattern.fullmatch(name) is not None,
+                f"unsupported Viewer transport entry: {name}",
+            )
+            names.append(name)
+            _require((package_dir / name).is_file(), f"Viewer transport file is missing: {name}")
+        _require(
+            len(names) == len(set(names)),
+            f"Viewer manifest transport_files.{key} is duplicated",
+        )
+        return names
+
+    motion_names = _transport_names("route_motion_sets", _MOTION_TRANSPORT_NAME)
+    candidate_motion_names = _transport_names(
+        "route_motion_candidate_sets", _CANDIDATE_MOTION_TRANSPORT_NAME
+    )
+    _require(
+        len(motion_names) == len(motion_sets),
+        "formal route motion transport count drifted",
+    )
+    _require(
+        manifest.get("route_motion_sets") == len(motion_sets),
+        "Viewer manifest formal route motion count drifted",
+    )
+    _require(candidate_motion_names, "Viewer manifest has no route motion candidate transport")
+    _require(
+        len(candidate_motion_names) == len(motion_candidates),
+        "route motion candidate transport count drifted",
+    )
+
+    fixed_names = {
+        "bundle.json",
+        "gebco_basemap.png",
+        "basemap_metadata.json",
+        "replay-viewer-preflight.json",
+        "winter-combined-viewer-manifest.json",
+        "publish-summary.json",
+        "checksums.json",
+        "four-layer-route-plan-set-v3.json",
+    }
+    allowed_names = fixed_names | set(motion_names) | set(candidate_motion_names)
+    entries = list(package_dir.iterdir())
+    _require(
+        all(entry.is_file() for entry in entries),
+        "Viewer package contains an unexpected directory",
+    )
+    actual_names = {entry.name for entry in entries}
+    unexpected = sorted(actual_names - allowed_names)
+    _require(not unexpected, "Viewer package contains unauthorized files: " + ", ".join(unexpected))
+    _require(
+        actual_names == allowed_names,
+        "Viewer package file allowlist is incomplete",
+    )
     for json_path in sorted(package_dir.glob("*.json")):
         _require_portable_json_value(_read_json(json_path, json_path.name))
     checksums = _read_json(package_dir / "checksums.json", "Viewer checksums")
@@ -268,19 +440,32 @@ def _finalize_and_validate_package(
         "winter-combined-viewer-manifest.json",
     }
     for name in checksum_names:
-        _require(Path(name).name == name, f"unsafe Viewer checksum entry: {name}")
+        _require(
+            isinstance(name, str)
+            and Path(name).name == name
+            and "\\" not in name
+            and "/" not in name
+            and name not in {"", ".", ".."},
+            f"unsafe Viewer checksum entry: {name}",
+        )
         _require((package_dir / name).is_file(), f"checksum target is missing: {name}")
     checksums["files"] = {name: _sha256_file(package_dir / name) for name in sorted(checksum_names)}
     _write_json(package_dir / "checksums.json", checksums)
     checked = _read_json(package_dir / "checksums.json", "final Viewer checksums")["files"]
+    _require(
+        set(checked) == allowed_names - {"checksums.json"},
+        "Viewer checksum map does not cover the exact package allowlist",
+    )
     for name, expected in checked.items():
         _require(_sha256_file(package_dir / name) == expected, f"checksum mismatch: {name}")
-    presentation = bundle.get("combined_presentation") or {}
-    candidates = bundle.get("route_candidates") or {}
-    motion = bundle.get("formal_motion_inspection") or {}
     _require(presentation.get("status") == "PUBLISHED", "Viewer presentation is not published")
     _require(len(candidates.get("candidates") or []) == 12, "Viewer must contain 12 routes")
     _require(motion.get("valid") is True, "Viewer formal motion validation is not PASS")
+    _require(
+        summary.get("assembly_id") == presentation.get("assembly_id")
+        and summary.get("assembly_digest") == presentation.get("assembly_digest"),
+        "publish summary assembly identity drifted",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -421,9 +606,15 @@ def main(argv: list[str] | None = None) -> int:
             # operator logs, never in its immutable metadata.
             "output_dir": ".",
             "identity": identity,
+            "assembly_id": presentation.get("assembly_id"),
+            "assembly_digest": presentation.get("assembly_digest"),
             "candidate_set_id": candidates_doc.get("candidate_set_id"),
             "route_motion_sets": [
                 item.get("motion_set_id") for item in (bundle.get("route_motion_sets") or [])
+            ],
+            "route_motion_candidate_sets": [
+                item.get("motion_candidate_set_id")
+                for item in (bundle.get("route_motion_candidate_sets") or [])
             ],
             "dynamic_replay": args.winter_replay_manifest is not None,
         }

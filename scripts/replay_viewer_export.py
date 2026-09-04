@@ -728,7 +728,12 @@ def _presentation_risk(
         "status": "PASS",
         "source": {
             "schema_version": "bc.risk-frame.v2",
-            "risk_store_root": str(risk_store_root),
+            # The risk store is an upstream producer directory, not a
+            # published Viewer resource.  Keep only a logical, portable
+            # reference here; the committed window identity below is the
+            # authoritative provenance pointer.  Never expose a build-host
+            # absolute path in immutable presentation metadata.
+            "risk_store_root": risk_store_root.name or "risk-store",
             "scenario_id": scenario_id,
             "provenance": sorted({str(frame["provenance"]) for frame in frames}),
             "run_id": first.get("run_id"),

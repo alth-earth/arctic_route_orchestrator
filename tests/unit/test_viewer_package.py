@@ -20,6 +20,33 @@ def _sha256(path: Path) -> str:
 
 def _fake_package(output: Path, bundle: dict, identity: dict) -> None:
     output.mkdir()
+    presentation = bundle.setdefault("combined_presentation", {})
+    presentation.setdefault("assembly_id", "assembly-a")
+    presentation.setdefault("assembly_digest", "a" * 64)
+    candidate_set = {
+        "schema_version": "cd.route-motion-candidate-set.v1",
+        "motion_candidate_set_id": "route-motion-candidate-set-sha256-" + "b" * 64,
+    }
+    bundle.setdefault("route_motion_candidate_sets", [candidate_set])
+    candidate_ids = [
+        item["motion_candidate_set_id"] for item in bundle["route_motion_candidate_sets"]
+    ]
+    presentation.setdefault("route_motion_candidate_set_ids", candidate_ids)
+    presentation.setdefault(
+        "route_motion_candidate_set_bindings",
+        [{"motion_candidate_set_id": item} for item in candidate_ids],
+    )
+    motion_set = {
+        "schema_version": "cd.route-motion-set.v1",
+        "motion_set_id": "route-motion-set-sha256-" + "c" * 64,
+    }
+    bundle.setdefault("route_motion_sets", [motion_set])
+    motion_ids = [item["motion_set_id"] for item in bundle["route_motion_sets"]]
+    presentation.setdefault("route_motion_set_ids", motion_ids)
+    presentation.setdefault(
+        "route_motion_set_bindings",
+        [{"motion_set_id": item} for item in motion_ids],
+    )
     _write(output / "bundle.json", bundle)
     (output / "gebco_basemap.png").write_bytes(b"png")
     _write(output / "basemap_metadata.json", {})
@@ -30,9 +57,19 @@ def _fake_package(output: Path, bundle: dict, identity: dict) -> None:
             "status": "PASS",
             "identity": {**identity, "risk_frame_count": 145},
             "bundle_path": str(output / "bundle.json"),
+            "formal_motion_required": True,
+            "route_motion_sets": len(motion_ids),
+            "route_motion_candidate_sets": len(candidate_ids),
+            "transport_files": {
+                "plan_set": "four-layer-route-plan-set-v3.json",
+                "route_motion_sets": ["route-motion-set-r1.json"],
+                "route_motion_candidate_sets": ["route-motion-candidate-set-r1.json"],
+            },
         },
     )
     _write(output / "four-layer-route-plan-set-v3.json", {})
+    _write(output / "route-motion-set-r1.json", motion_set)
+    _write(output / "route-motion-candidate-set-r1.json", candidate_set)
     names = [
         "bundle.json",
         "gebco_basemap.png",
@@ -40,6 +77,8 @@ def _fake_package(output: Path, bundle: dict, identity: dict) -> None:
         "replay-viewer-preflight.json",
         "winter-combined-viewer-manifest.json",
         "four-layer-route-plan-set-v3.json",
+        "route-motion-set-r1.json",
+        "route-motion-candidate-set-r1.json",
     ]
     _write(output / "checksums.json", {"files": {name: _sha256(output / name) for name in names}})
 
@@ -95,9 +134,12 @@ def test_strict_json_rejects_duplicate_keys_and_non_finite(tmp_path: Path) -> No
         viewer_package._read_json(non_finite, "test")
 
 
-@pytest.mark.parametrize("value", ["/root/build/input.json", "C:\\build\\input.json", "file:///tmp/x"])
+@pytest.mark.parametrize(
+    "value",
+    ["/root/build/input.json", "C:\\build\\input.json", "file:///tmp/x", "../risk-store/frames"],
+)
 def test_portable_viewer_metadata_rejects_absolute_paths(value: str) -> None:
-    with pytest.raises(ValueError, match="absolute path"):
+    with pytest.raises(ValueError, match=r"(absolute path|parent path)"):
         viewer_package._require_portable_json_value({"nested": [value]})
 
 
@@ -145,7 +187,6 @@ def test_post_export_identity_failure_leaves_no_visible_package(
                 "candidate_set_id": "candidate-set-a",
                 "selected_candidate_id": "route-a",
             },
-            "route_motion_sets": [],
             "formal_motion_inspection": {"valid": True},
             "route_candidates": {"candidates": [{}] * 12},
         }
@@ -186,7 +227,6 @@ def test_success_is_atomically_promoted_after_full_identity_check(
                 "candidate_set_id": "candidate-set-a",
                 "selected_candidate_id": "route-a",
             },
-            "route_motion_sets": [],
             "formal_motion_inspection": {"valid": True},
             "route_candidates": {"candidates": [{}] * 12},
         }
@@ -203,6 +243,48 @@ def test_success_is_atomically_promoted_after_full_identity_check(
     checksums = json.loads((published / "checksums.json").read_text())["files"]
     assert "publish-summary.json" in checksums
     assert checksums["publish-summary.json"] == _sha256(published / "publish-summary.json")
+    assert not list(tmp_path.glob(".*.staging"))
+
+
+def test_current_standard_export_rejects_missing_motion_candidate_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = _inputs(tmp_path)
+    _write(inputs["candidates"], {"candidate_set_id": "candidate-set-a"})
+    identity = {
+        "corridor_id": "corridor-a",
+        "dataset_bundle_id": "bundle-a",
+        "risk_window_id": "risk-a",
+        "layer_set_id": "layer-a",
+        "selected_candidate_id": "route-a",
+    }
+    monkeypatch.setattr(viewer_package, "verify_viewer_identity", lambda **_: identity)
+
+    def fake_export(**kwargs):
+        bundle = {
+            "replay": {"scenario_id": "scenario-a"},
+            "combined_presentation": {
+                "status": "PUBLISHED",
+                "dataset_bundle_id": "bundle-a",
+                "risk_window_id": "risk-a",
+                "layer_set_id": "layer-a",
+                "candidate_set_id": "candidate-set-a",
+                "selected_candidate_id": "route-a",
+                "assembly_id": "assembly-a",
+                "assembly_digest": "a" * 64,
+            },
+            "formal_motion_inspection": {"valid": True},
+            "route_candidates": {"candidates": [{}] * 12},
+        }
+        _fake_package(kwargs["output_dir"], bundle, identity)
+        bundle["route_motion_candidate_sets"] = []
+        return bundle
+
+    monkeypatch.setattr(viewer_package, "_export_viewer", fake_export)
+    with pytest.raises(ValueError, match="route motion candidate sets"):
+        viewer_package.main(_argv(tmp_path, inputs))
+    assert not (tmp_path / "published").exists()
     assert not list(tmp_path.glob(".*.staging"))
 
 
@@ -283,7 +365,6 @@ def test_manifest_only_dynamic_replay_is_allowed_before_export(
                 "selected_candidate_id": "route-a",
                 "replanning_status": "PUBLISHED_CAUSAL_REPLAY",
             },
-            "route_motion_sets": [],
             "formal_motion_inspection": {"valid": True},
             "route_candidates": {"candidates": [{}] * 12},
         }
